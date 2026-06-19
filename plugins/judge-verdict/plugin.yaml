@@ -1,0 +1,9 @@
+name: judge-verdict
+version: "0.1.0"
+description: >
+  Adversarial third-model adjudication for the Claunker loop. Exposes a
+  judge_verdict tool that takes an executor's output plus the original task
+  spec and acceptance criteria, routes a one-shot structured completion through
+  a pinned judge model (Gemini), and returns accept / revise / escalate with
+  rationale. Decorrelated from the architect (Claude) and executor (Ollama/
+  stand-in) by design — a different model family is the entire point.

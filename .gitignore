@@ -1,0 +1,27 @@
+# --- Secrets: never commit ---
+.env
+*.env
+auth.json
+auth.lock
+*secret*
+*.key
+*.pem
+
+# --- Live runtime config (use config.example.yaml) ---
+config.yaml
+
+# --- Backups & build artifacts ---
+*.bak
+*.bak.*
+__pycache__/
+*.pyc
+*.pyo
+
+# --- Runtime state / sandboxes (if this tree is ever used as a hermes home) ---
+sandboxes/
+sessions/
+logs/
+cache/
+*.db
+*.db-shm
+*.db-wal
