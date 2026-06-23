@@ -664,3 +664,40 @@ plugins:
         - gemini
         allowed_models:
         - gemini-2.5-flash
+
+# ── Claunker deterministic dispatch classifier (Phase 2 Step 2a) ────────────
+# Optional config-authorized OVERRIDE surface for the deterministic tiering core
+# in hermes_cli/claunker_classifier.py. Mirrors the judge-verdict trust gate
+# above: fail-closed by default, and config may only EXTEND / RAISE the hardcoded
+# floor — it can NEVER lower a hardcoded default or touch the apex lock
+# (`terminal`, `execute_code` stay Tier 4 no matter what). Read verbatim by
+# load_classifier_config() under claunker.classifier.{tool_classes,
+# sensitive_paths, enforce}. Omit this whole block to run pure hardcoded defaults.
+claunker:
+  classifier:
+    # Observe-only by default: the pre_tool_call hook computes and LOGS the tier
+    # for every call but does not change execution. Set true to route a computed
+    # Tier-4 (human) call through the hook's existing block path. Leave false
+    # until the full judge/sign-off routing is wired.
+    enforce: false
+
+    # Per-tool capability-class overrides. class ∈ {read, mutate, dual, apex}.
+    # RAISE-ONLY: the effective class is max(hardcoded_default, override), so an
+    # override can never lower a tool below its hardcoded class. Unmapped tools
+    # fail closed to apex (Tier 4); an override here is the ONLY way to authorize
+    # a *lower* class for an unmapped tool. 'delegate' is NOT assignable (it is
+    # intrinsic to delegate_task). Apex-locked tools ignore this entirely.
+    #   tool_classes:
+    #     internal_readonly_probe: read    # authorize an unmapped tool as Read
+    #     house_writer: mutate
+    tool_classes: {}
+
+    # EXTRA sensitive-path regex patterns, APPENDED to the hardcoded set
+    # (`.env`, `~/.ssh/*`, `/config/*`, `*crontab*`). A Mutate call whose
+    # path/target argument matches ANY pattern hard-jumps to Tier 4 (human) and
+    # can never be down-tiered. Advisory-on-top only: entries here add matches,
+    # they never remove a hardcoded one.
+    #   sensitive_paths:
+    #     - ".*/secrets/.*"
+    #     - ".*\\.pem$"
+    sensitive_paths: []
