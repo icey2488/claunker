@@ -69,6 +69,73 @@ def test_unknown_tool_fails_closed_to_tier4():
     assert c.tier == TIER_HUMAN, c
 
 
+# ── Card-shaped MCP server: assert the tier OUTCOME ────────────────────────
+def test_board_get_is_tier1_self_accept():
+    c = classify_tool_call("board_get", {"board_id": "b-1"}, cfg=EMPTY)
+    assert c.tier == TIER_SELF_ACCEPT, c
+
+
+def test_card_list_is_tier1_self_accept():
+    c = classify_tool_call("card_list", {"column_id": "col-1"}, cfg=EMPTY)
+    assert c.tier == TIER_SELF_ACCEPT, c
+
+
+def test_escalation_list_is_tier1_self_accept():
+    c = classify_tool_call("escalation_list", {"status": "open"}, cfg=EMPTY)
+    assert c.tier == TIER_SELF_ACCEPT, c
+
+
+def test_card_create_is_tier2_single_judge():
+    c = classify_tool_call("card_create", {"title": "T", "column_id": "col-1"}, cfg=EMPTY)
+    assert c.tier == TIER_SINGLE_JUDGE, c
+    assert c.sensitive_match is None, c
+
+
+def test_card_update_is_tier2_single_judge():
+    c = classify_tool_call("card_update", {"card_id": "c-1", "title": "T2"}, cfg=EMPTY)
+    assert c.tier == TIER_SINGLE_JUDGE, c
+
+
+def test_card_move_is_tier2_single_judge():
+    c = classify_tool_call("card_move", {"card_id": "c-1", "column_id": "col-2"}, cfg=EMPTY)
+    assert c.tier == TIER_SINGLE_JUDGE, c
+
+
+def test_card_delete_is_tier2_single_judge():
+    # Soft-delete per spec → Mutate (single judge), NOT Apex/human.
+    c = classify_tool_call("card_delete", {"card_id": "c-1"}, cfg=EMPTY)
+    assert c.tier == TIER_SINGLE_JUDGE, c
+
+
+def test_escalation_resolve_is_tier4_human():
+    # Resolving an escalation IS the human sign-off → always Tier 4.
+    c = classify_tool_call("escalation_resolve", {"escalation_id": "esc-1"}, cfg=EMPTY)
+    assert c.tier == TIER_HUMAN, c
+
+
+def test_unmapped_card_tool_fails_closed_to_tier4():
+    # column_*/tag_*/artifact_* and any other unmapped card tool stay fail-closed.
+    c = classify_tool_call("card_frobnicate", {"card_id": "c-1"}, cfg=EMPTY)
+    assert c.tier == TIER_HUMAN, c
+
+
+def test_card_create_with_sensitive_strings_in_fields_is_still_tier2():
+    """The sensitive-path hard-jump is scoped to a file tool's PATH arg, not
+    arbitrary card string fields. A card whose title/description merely contains
+    '.env', '/config/', or 'crontab' is a normal Mutate → Tier 2, never bumped."""
+    c = classify_tool_call(
+        "card_create",
+        {
+            "title": "rotate prod .env secrets",
+            "description": "see /config/ and the crontab",
+            "column_id": "col-1",
+        },
+        cfg=EMPTY,
+    )
+    assert c.tier == TIER_SINGLE_JUDGE, c
+    assert c.sensitive_match is None, c
+
+
 def test_delegate_without_toolsets_fails_closed_to_tier4():
     # No child scope and no known parent reachable set → fail-closed Apex.
     c = classify_tool_call("delegate_task", {"goal": "do a thing"}, cfg=EMPTY)
@@ -93,6 +160,26 @@ def test_apex_floor_is_load_bearing_RED_when_removed():
     assert naive_unsafe_tier == TIER_SELF_ACCEPT
     assert green.tier != naive_unsafe_tier, (
         "the apex guard did not change the unsafe outcome — control is dead", green
+    )
+
+
+def test_escalation_resolve_signoff_is_load_bearing_RED_when_removed():
+    """escalation_resolve IS the human sign-off — an agent must NEVER resolve an
+    escalation autonomously. GREEN: the real classifier ignores a hostile config
+    that tries to drop it to read and keeps Tier 4 (apex-lock + 'config can never
+    lower a hardcoded default'). RED-demo: an unguarded, config-trusting classifier
+    would honor escalation_resolve→read and self-accept at Tier 1 — the divergence
+    proves the apex pin is what holds it at human."""
+    hostile = ClassifierConfig(tool_class_overrides={"escalation_resolve": "read"})
+
+    green = classify_tool_call("escalation_resolve", {"escalation_id": "esc-1"}, cfg=hostile)
+    assert green.tier == TIER_HUMAN, ("escalation sign-off lowered by config!", green)
+
+    # What an unguarded, config-trusting classifier would have produced:
+    naive_unsafe_tier = _CLASS_TO_TIER[hostile.tool_class_overrides["escalation_resolve"]]
+    assert naive_unsafe_tier == TIER_SELF_ACCEPT
+    assert green.tier != naive_unsafe_tier, (
+        "the apex pin did not change the unsafe outcome — control is dead", green
     )
 
 

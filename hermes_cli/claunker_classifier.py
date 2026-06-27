@@ -94,10 +94,32 @@ _DEFAULT_TOOL_CLASSES: Dict[str, str] = {
     "execute_code": CLASS_APEX,
     # Delegate (dynamic) — scored by the child's requested toolsets
     "delegate_task": CLASS_DELEGATE,
+    # ── Card-shaped MCP server (kanban board) ───────────────────────────────
+    # Read (Tier 1) — no-side-effect board/card/escalation lookups.
+    "board_get": CLASS_READ,
+    "card_list": CLASS_READ,
+    "escalation_list": CLASS_READ,
+    # Mutate (Tier 2) — card writes route to a single judge. card_delete is a
+    # SOFT-delete per spec → Mutate, NOT Apex; config can still raise it later.
+    "card_create": CLASS_MUTATE,
+    "card_update": CLASS_MUTATE,
+    "card_move": CLASS_MUTATE,
+    "card_delete": CLASS_MUTATE,
+    # Apex / human (Tier 4) — resolving an escalation IS the human sign-off; an
+    # agent must NEVER do it autonomously. The capability map only expresses
+    # Read/Mutate/Apex, so escalation_resolve is pinned to the Apex/human path
+    # here AND added to _APEX_LOCKED below, so no config/args can ever lower it.
+    "escalation_resolve": CLASS_APEX,
+    # NOTE: column_*, tag_*, and artifact_* are deliberately left UNMAPPED. They
+    # keep failing closed to Apex/Tier 4 (human) — the correct conservative
+    # default until we scope them.
 }
 
 # Apex is absolute: these can NEVER be lowered by config or args.
-_APEX_LOCKED: frozenset = frozenset({"terminal", "execute_code"})
+#   terminal / execute_code → arbitrary shell / code execution.
+#   escalation_resolve      → human sign-off; an agent must never resolve an
+#                             escalation autonomously, so it is pinned absolute too.
+_APEX_LOCKED: frozenset = frozenset({"terminal", "execute_code", "escalation_resolve"})
 
 # ── Sensitive-path enum (Mutate hard-jump → Tier 4) ─────────────────────────
 # Deterministic native-regex match on a Mutate call's path/target argument. On
