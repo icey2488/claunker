@@ -1,11 +1,12 @@
-"""Tests for the Claunker Spine data core (read-slice foundation).
+"""Tests for the Claunker Spine data core (locked v1 architecture).
 
-Covers the converged design's required cases — round-trip (events → reduce →
-project), soft-delete omission, ordering (append reflected in LexoRank order),
-version opacity (string, stable for unchanged state, changes on mutation), and
-gate_status == "COMMITTED" — plus the supporting controls (lifecycle→column,
-tier→tag, escalated→badge, actor refs, tombstone immutability, and the two-phase
-version-stamp consistency).
+Covers the new model's required surface — per-entity store round-trip across all
+four tables, soft-delete omission (list_live + projection), opaque equality-only
+versions, LexoRank ordering, the two Mutation Invariants (MI-1 no late children on
+a tombstoned task; MI-2 resolve-escalation as a single-field write), the one-to-one
+state→column projection, the unresolved-escalation→badge rule (and its absence for
+resolved/tombstoned escalations), and the dump/load blob round-trip — adapting the
+surface the old event-sourced suite covered.
 
 Run (pytest):
     uv run --with pytest --python 3.11 python -m pytest tests/spine/ -q
@@ -15,107 +16,111 @@ Run (no pytest — pure-python fallback):
 
 import os
 import sys
+import tempfile
 
 # Make ``spine`` importable when this file is run directly (python tests/spine/x.py
 # puts THIS dir on sys.path, not the repo root). Harmless under pytest.
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 
 from spine import (  # noqa: E402
-    Actor,
-    EventStore,
-    EventType,
-    Lifecycle,
+    ARTIFACT_KINDS,
+    SCHEMA_VERSION,
+    STATES,
+    Artifact,
+    ArtifactKind,
+    Escalation,
+    GATE_STATUS_COMMITTED,
     MAX_RANK_LENGTH,
+    Project,
     Spine,
+    State,
+    Store,
+    Task,
     append_rank,
-    lifecycle_to_column,
     make_version,
     project,
     rank_between,
     rebalance,
-    reduce,
-    reduce_all,
     to_card,
 )
 
-# Fixed timestamps so reductions (and thus version tokens) are deterministic.
+# Fixed timestamps so created_at-derived content (and version hashes) are stable.
 T = [f"2026-06-28T0{i}:00:00+00:00" for i in range(9)]
 
-
-# ── round-trip: append events → reduce → project → assert the card set ────────
-def test_round_trip_events_reduce_project():
-    store = EventStore()
-    a, b, c = "task-A", "task-B", "task-C"
-
-    # A: a full mutation history.
-    store.append_event(a, EventType.CREATED, {"title": "build core", "order": "i",
-                       "lifecycle_state": Lifecycle.CREATED}, Actor.OPERATOR, created_at=T[0])
-    store.append_event(a, EventType.TITLE_CHANGED, {"title": "build the spine core"},
-                       Actor.CLAUDE, created_at=T[1])
-    store.append_event(a, EventType.COLUMN_CHANGED, {"lifecycle_state": Lifecycle.EXECUTING},
-                       Actor.CLAUDE, created_at=T[2])
-    store.append_event(a, EventType.TIER_ASSIGNED, {"tier": 2}, Actor.CLAUDE, created_at=T[3])
-    store.append_event(a, EventType.ESCALATION_RAISED, {"ref": "esc-1"}, Actor.OLLAMA, created_at=T[4])
-
-    # B: a plain queued task.
-    store.append_event(b, EventType.CREATED, {"title": "second", "order": "r",
-                       "lifecycle_state": Lifecycle.QUEUED}, Actor.OPERATOR, created_at=T[5])
-
-    # C: created then soft-deleted (must be omitted from projection).
-    store.append_event(c, EventType.CREATED, {"title": "third", "order": "v"},
-                       Actor.OPERATOR, created_at=T[6])
-    store.append_event(c, EventType.DELETED, {}, Actor.OPERATOR, created_at=T[7])
-
-    entities = reduce_all(store.read_all_events())
-    cards = project(list(entities.values()))
-    by_id = {card["id"]: card for card in cards}
-
-    # The soft-deleted C is absent; A and B remain.
-    assert set(by_id) == {a, b}, by_id
-
-    card_a = by_id[a]
-    assert card_a["title"] == "build the spine core"          # last TITLE_CHANGED won
-    assert card_a["column_id"] == "executing"                 # executing → its own column
-    assert card_a["tags"] == ["tier:2"]                       # tier → a tag
-    assert card_a["badge"] == "escalated"                     # escalated → a badge
-    assert card_a["gate_status"] == "COMMITTED"
-    assert card_a["order"] == "i"                             # order passes through
-    assert card_a["version"] == entities[a].version           # version passes through
-    assert card_a["created_by"] == {"type": "human", "id": "operator"}
-    assert card_a["updated_by"] == {"type": "agent", "id": "ollama"}  # last actor
-
-    card_b = by_id[b]
-    assert card_b["column_id"] == "queued"                    # queued → its own column
-    assert card_b["tags"] == []                               # no tier assigned
-    assert card_b["badge"] is None                            # not escalated
-
-    # Ordering: A ("i") sorts before B ("r") in the projected list.
-    assert [card["id"] for card in cards] == [a, b]
+_CONTROL_DIFF = {"control_id": "net.egress", "old_value": "deny", "new_value": "allow", "reduces_control": True}
 
 
-# ── soft-delete omission ──────────────────────────────────────────────────────
-def test_soft_delete_omitted_from_projection_but_present_in_reduce():
-    store = EventStore()
-    c = "c"
-    store.append_event(c, EventType.CREATED, {"title": "x", "order": "i"}, Actor.OPERATOR, created_at=T[0])
-    store.append_event(c, EventType.DELETED, {}, Actor.OPERATOR, created_at=T[1])
-
-    entity = reduce(store.read_events(c))
-    assert entity is not None
-    assert entity.deleted_at == T[1]          # reduce still surfaces the tombstone
-    assert to_card(entity) is None            # but the lens omits it
-    assert project([entity]) == []
+def _card_for(spine, task_id):
+    """The single projected card for ``task_id`` (raises if absent/omitted)."""
+    return next(c for c in spine.cards() if c["id"] == task_id)
 
 
-# ── ordering: append order reflected in LexoRank order ────────────────────────
-def test_creation_order_reflected_in_lexorank_order():
+def _assert_raises(fn, exc=Exception):
+    raised = False
+    try:
+        fn()
+    except exc:
+        raised = True
+    assert raised, f"expected {fn} to raise {exc.__name__}"
+
+
+# ── per-entity store round-trip across all four tables ─────────────────────────
+def test_per_entity_store_round_trip_all_four_tables():
+    store = Store()
+    p = Project(id="p1", name="Proj", created_at=T[0])
+    t = Task(id="t1", project_id="p1", title="task", state=State.TIERED, tier=2,
+             acceptance_criteria=["compiles", "tests pass"], order="i", created_at=T[1])
+    a = Artifact(id="a1", task_id="t1", kind=ArtifactKind.DIFF, ref="patch://1", created_at=T[2])
+    e = Escalation(id="e1", task_id="t1", reason="needs human", control_diff=_CONTROL_DIFF, created_at=T[3])
+
+    store.projects.put(p)
+    store.tasks.put(t)
+    store.artifacts.put(a)
+    store.escalations.put(e)
+
+    # Each blob round-trips byte-for-byte through (id, data) — version stamped by put.
+    assert store.projects.get("p1").to_dict() == p.to_dict()
+    assert store.tasks.get("t1").to_dict() == t.to_dict()
+    assert store.artifacts.get("a1").to_dict() == a.to_dict()
+    assert store.escalations.get("e1").to_dict() == e.to_dict()
+
+    # Semantic fields survived the JSON round-trip (incl. nested control_diff).
+    assert store.tasks.get("t1").acceptance_criteria == ["compiles", "tests pass"]
+    assert store.escalations.get("e1").control_diff == _CONTROL_DIFF
+
+    # list_all sees each table's single row; a miss is None.
+    for sub in (store.projects, store.tasks, store.artifacts, store.escalations):
+        assert len(sub.list_all()) == 1
+    assert store.projects.get("nope") is None
+
+
+# ── soft-delete: omitted from list_live AND projection, retained in list_all ───
+def test_soft_delete_omitted_from_list_live_and_projection():
     spine = Spine()
-    a = spine.create_task("a", Actor.OPERATOR)
-    b = spine.create_task("b", Actor.OPERATOR)
-    c = spine.create_task("c", Actor.OPERATOR)
+    p = spine.create_project("p")
+    t = spine.create_task(p.id, "x", created_at=T[0])
+
+    assert len(spine.store.tasks.list_live()) == 1
+    assert len(spine.cards()) == 1
+
+    spine.soft_delete_task(t.id)
+
+    assert spine.store.tasks.list_live() == []          # gone from the live view
+    assert len(spine.store.tasks.list_all()) == 1       # tombstone retained
+    assert spine.store.tasks.list_all()[0].deleted_at is not None
+    assert spine.cards() == []                          # and omitted from the board
+    assert to_card(spine.store.tasks.get(t.id)) is None  # the lens omits a tombstone
+
+
+# ── ordering: creation order reflected in LexoRank order + projection order ────
+def test_creation_order_reflected_in_lexorank_projection_order():
+    spine = Spine()
+    p = spine.create_project("p")
+    a = spine.create_task(p.id, "a", created_at=T[0])
+    b = spine.create_task(p.id, "b", created_at=T[1])
+    c = spine.create_task(p.id, "c", created_at=T[2])
 
     assert a.order < b.order < c.order, (a.order, b.order, c.order)
-    # The projected board reflects creation order.
     assert [card["title"] for card in spine.cards()] == ["a", "b", "c"]
 
 
@@ -139,95 +144,30 @@ def test_rebalance_is_sorted_compact_and_total():
     assert all(len(r) <= MAX_RANK_LENGTH for r in ranks)
 
 
-# ── version opacity: string, stable for unchanged state, changes on mutation ──
-def test_version_is_opaque_string_stable_then_changes_on_mutation():
-    store = EventStore()
-    e = "e"
-    store.append_event(e, EventType.CREATED, {"title": "t", "order": "i"}, Actor.OPERATOR, created_at=T[0])
-
-    v1 = reduce(store.read_events(e)).version
-    v1_again = reduce(store.read_events(e)).version
+# ── version: opaque, equality-only, changes on every put ───────────────────────
+def test_version_is_opaque_string_and_changes_on_mutation():
+    store = Store()
+    t = Task(id="t1", project_id="p", title="t", created_at=T[0])
+    store.tasks.put(t)
+    v1 = t.version
     assert isinstance(v1, str) and ":" in v1            # opaque {seq}:{hash} string
-    assert v1 == v1_again                                # stable for unchanged state
+    assert store.tasks.get("t1").version == v1          # stored == returned (put consistency)
 
-    store.append_event(e, EventType.TITLE_CHANGED, {"title": "t2"}, Actor.CLAUDE, created_at=T[1])
-    v2 = reduce(store.read_events(e)).version
-    assert v2 != v1                                      # changes on mutation
-    assert isinstance(v2, str)
-
-
-def test_event_version_column_matches_reduced_version():
-    """Two-phase stamp consistency: the version stamped on the row equals the
-    reducer-derived token, and it moves on every mutation."""
-    spine = Spine()
-    created = spine.create_task("a", Actor.OPERATOR)
-    events = spine.store.read_events(created.id)
-    assert events[-1].version == created.version
-
-    updated = spine.change_title(created.id, "a2")
-    events2 = spine.store.read_events(created.id)
-    assert events2[-1].version == updated.version
-    assert events2[-1].version != events[-1].version
+    t.title = "t2"
+    store.tasks.put(t)
+    assert t.version != v1                               # changes on mutation
+    assert isinstance(t.version, str)
 
 
-# ── gate_status == "COMMITTED" on every projected card ────────────────────────
-def test_every_projected_card_is_gate_status_committed():
-    spine = Spine()
-    spine.create_task("a", Actor.OPERATOR)
-    spine.create_task("b", Actor.CLAUDE)
-    cards = spine.cards()
-    assert cards
-    assert all(card["gate_status"] == "COMMITTED" for card in cards)
-
-
-# ── supporting controls ───────────────────────────────────────────────────────
-def test_lifecycle_maps_one_to_one_to_own_column_with_passthrough():
-    assert lifecycle_to_column(Lifecycle.CREATED) == "created"
-    assert lifecycle_to_column(Lifecycle.QUEUED) == "queued"
-    assert lifecycle_to_column(Lifecycle.EXECUTING) == "executing"
-    assert lifecycle_to_column(Lifecycle.JUDGING) == "judging"
-    assert lifecycle_to_column(Lifecycle.DELIVERED) == "delivered"
-    assert lifecycle_to_column(Lifecycle.FAILED) == "failed"
-    # Unknown lifecycle passes through (→ Kanbantt fallback tray), never dropped.
-    assert lifecycle_to_column("some_custom_state") == "some_custom_state"
-
-
-def test_escalation_raise_then_resolve_clears_badge():
-    spine = Spine()
-    e = spine.create_task("a", Actor.OPERATOR)
-    spine.raise_escalation(e.id, "esc-9", Actor.CLAUDE)
-    card = next(c for c in spine.cards() if c["id"] == e.id)
-    assert card["badge"] == "escalated"
-
-    resolved = spine.resolve_escalation(e.id, Actor.OPERATOR)
-    assert resolved.escalated is False
-    assert resolved.escalation_ref is None
-    card2 = next(c for c in spine.cards() if c["id"] == e.id)
-    assert card2["badge"] is None
-
-
-def test_soft_deleted_entity_is_immutable():
-    spine = Spine()
-    e = spine.create_task("a", Actor.OPERATOR)
-    spine.soft_delete(e.id)
-    # The tombstone is immutable: any further mutation must raise.
-    raised = False
-    try:
-        spine.change_title(e.id, "nope")
-    except ValueError:
-        raised = True
-    assert raised, "expected a soft-deleted entity to reject mutation"
-
-
-def test_event_before_created_raises():
-    store = EventStore()
-    store.append_event("z", EventType.TITLE_CHANGED, {"title": "t"}, Actor.CLAUDE, created_at=T[0])
-    raised = False
-    try:
-        reduce(store.read_events("z"))
-    except ValueError:
-        raised = True
-    assert raised, "expected reduce to reject an event stream not starting with CREATED"
+def test_put_mints_a_fresh_token_every_put():
+    """Every put bumps the monotonic seq, so even re-putting identical content
+    yields a new token (the equality-only contract: a put is a change event)."""
+    store = Store()
+    t = Task(id="t1", project_id="p", title="t", created_at=T[0])
+    store.tasks.put(t)
+    first = t.version
+    store.tasks.put(t)                                   # same content, new seq
+    assert t.version != first
 
 
 def test_make_version_is_deterministic_and_seq_sensitive():
@@ -235,6 +175,171 @@ def test_make_version_is_deterministic_and_seq_sensitive():
     assert make_version(1, content) == make_version(1, content)   # deterministic
     assert make_version(1, content) != make_version(2, content)   # seq prefix moves it
     assert make_version(1, content) != make_version(1, {"id": "x", "title": "u"})
+
+
+# ── projection: gate_status, state→column, tier→tag, null attribution ──────────
+def test_every_projected_card_is_gate_status_committed_with_null_attribution():
+    spine = Spine()
+    p = spine.create_project("p")
+    spine.create_task(p.id, "a", created_at=T[0])
+    spine.create_task(p.id, "b", created_at=T[1])
+    cards = spine.cards()
+    assert cards
+    for card in cards:
+        assert card["gate_status"] == GATE_STATUS_COMMITTED
+        # v1 entities carry no actor/update metadata → these project as null.
+        assert card["created_by"] is None
+        assert card["updated_by"] is None
+        assert card["updated_at"] is None
+
+
+def test_state_maps_one_to_one_to_column():
+    spine = Spine()
+    p = spine.create_project("p")
+    for st in STATES:
+        spine.create_task(p.id, st, state=st, created_at=T[0])
+    column_by_title = {c["title"]: c["column_id"] for c in spine.cards()}
+    # All six states map to a column of the same id (no collapsing).
+    for st in STATES:
+        assert column_by_title[st] == st
+    # The two cases the spec calls out explicitly.
+    assert column_by_title["judged"] == "judged"
+    assert column_by_title["failed"] == "failed"
+
+
+def test_tier_projects_to_a_tag():
+    spine = Spine()
+    p = spine.create_project("p")
+    untiered = spine.create_task(p.id, "untiered", created_at=T[0])
+    tiered = spine.create_task(p.id, "tiered", tier=4, created_at=T[1])
+    assert _card_for(spine, untiered.id)["tags"] == []
+    assert _card_for(spine, tiered.id)["tags"] == ["tier:4"]
+
+
+# ── escalation → badge (orthogonal to the state column) ────────────────────────
+def test_unresolved_escalation_badges_card_and_keeps_it_in_state_column():
+    spine = Spine()
+    p = spine.create_project("p")
+    t = spine.create_task(p.id, "x", state=State.DISPATCHED, created_at=T[0])
+
+    e = spine.create_escalation(t.id, "weakens egress control", control_diff=_CONTROL_DIFF, created_at=T[1])
+    card = _card_for(spine, t.id)
+    # Badge present and carrying the approval-queue fields…
+    assert card["badge"] is not None
+    assert card["badge"]["id"] == e.id
+    assert card["badge"]["reason"] == "weakens egress control"
+    assert card["badge"]["control_diff"]["reduces_control"] is True
+    # …and the card STAYS in its state column (escalation is not a column).
+    assert card["column_id"] == "dispatched"
+
+    # Resolving the escalation clears the badge (column unchanged).
+    spine.resolve_escalation(e.id)
+    cleared = _card_for(spine, t.id)
+    assert cleared["badge"] is None
+    assert cleared["column_id"] == "dispatched"
+
+
+def test_resolved_and_tombstoned_escalations_yield_no_badge():
+    spine = Spine()
+    p = spine.create_project("p")
+    t = spine.create_task(p.id, "x", state=State.JUDGED, created_at=T[0])
+
+    # A resolved escalation → no badge.
+    resolved = spine.create_escalation(t.id, "r", created_at=T[1])
+    spine.resolve_escalation(resolved.id, resolved_at=T[2])
+    assert _card_for(spine, t.id)["badge"] is None
+
+    # A live unresolved one badges it…
+    live = spine.create_escalation(t.id, "live", created_at=T[3])
+    assert _card_for(spine, t.id)["badge"]["id"] == live.id
+    # …and tombstoning that escalation clears the badge too.
+    spine.store.escalations.soft_delete(live.id)
+    assert _card_for(spine, t.id)["badge"] is None
+
+
+# ── MI-1: no late children on a tombstoned task (BOTH child kinds rejected) ────
+def test_mi1_rejects_artifact_and_escalation_on_tombstoned_task():
+    spine = Spine()
+    p = spine.create_project("p")
+    t = spine.create_task(p.id, "x", created_at=T[0])
+
+    # While live, both child kinds are admitted.
+    spine.create_artifact(t.id, ArtifactKind.FILE, "f://1")
+    spine.create_escalation(t.id, "ok")
+
+    spine.soft_delete_task(t.id)
+
+    # Tombstoned → BOTH an Artifact and an Escalation are rejected (MI-1).
+    _assert_raises(lambda: spine.create_artifact(t.id, ArtifactKind.DIFF, "f://2"), ValueError)
+    _assert_raises(lambda: spine.create_escalation(t.id, "late"), ValueError)
+
+    # Referential hygiene: an absent parent is rejected the same way.
+    _assert_raises(lambda: spine.create_artifact("ghost", ArtifactKind.DIFF, "f://3"), ValueError)
+
+
+# ── MI-2: resolving an escalation is a single-field write ───────────────────────
+def test_mi2_resolve_escalation_is_single_field_write():
+    spine = Spine()
+    p = spine.create_project("p")
+    t = spine.create_task(p.id, "x", created_at=T[0])
+    e = spine.create_escalation(t.id, "why", control_diff=_CONTROL_DIFF, created_at=T[1])
+    assert e.resolved_at is None
+    before = e.to_dict()
+
+    resolved = spine.resolve_escalation(e.id, resolved_at=T[5])
+
+    # Only resolved_at (and the version stamp) changed — no other field touched.
+    assert resolved.resolved_at == T[5]
+    after = resolved.to_dict()
+    changed = {k for k in after if after[k] != before[k]}
+    assert changed == {"resolved_at", "version"}, changed
+
+    # And NO paired Task.state transition (escalated is not a state).
+    assert spine.get_task(t.id).state == State.CREATED
+
+
+# ── dump / load: whole-blob sync seam round-trips losslessly ───────────────────
+def test_dump_load_blob_round_trip():
+    spine = Spine()
+    p = spine.create_project("p", created_at=T[0])
+    t = spine.create_task(p.id, "task", state=State.TIERED, tier=1, created_at=T[1])
+    a = spine.create_artifact(t.id, ArtifactKind.VERDICT, "v://1", created_at=T[2])
+    e = spine.create_escalation(t.id, "why", control_diff=_CONTROL_DIFF, created_at=T[3])
+
+    blob = spine.store.dump()
+    assert blob["schema_version"] == SCHEMA_VERSION
+    assert blob["seq"] == spine.store.seq
+    assert {len(blob[k]) for k in ("projects", "tasks", "artifacts", "escalations")} == {1}
+
+    # Load into a fresh store: versions preserved (no re-stamp), seq restored.
+    other = Store()
+    other.load(blob)
+    assert other.seq == spine.store.seq
+    assert other.projects.get(p.id).to_dict() == spine.get_project(p.id).to_dict()
+    assert other.tasks.get(t.id).to_dict() == spine.get_task(t.id).to_dict()
+    assert other.artifacts.get(a.id).to_dict() == spine.get_artifact(a.id).to_dict()
+    assert other.escalations.get(e.id).to_dict() == spine.get_escalation(e.id).to_dict()
+
+    # The projection is identical from the reloaded store.
+    assert project(other.tasks.list_all(), other.escalations.list_all()) == spine.cards()
+
+
+# ── WAL: a file-backed store opens in WAL journal mode ─────────────────────────
+def test_wal_mode_enabled_on_file_db():
+    tmpdir = tempfile.mkdtemp()
+    path = os.path.join(tmpdir, "spine.db")
+    store = Store(path)
+    try:
+        mode = store._conn.execute("PRAGMA journal_mode").fetchone()[0]
+        assert mode.lower() == "wal"
+    finally:
+        store.close()
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                os.remove(path + suffix)
+            except OSError:
+                pass
+        os.rmdir(tmpdir)
 
 
 # ── pure-python fallback runner (no pytest) ───────────────────────────────────

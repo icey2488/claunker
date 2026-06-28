@@ -1,131 +1,194 @@
-"""``Spine`` — the facade that ties the event log, reducer, ordering, and
-projection together behind semantic write paths.
+"""``Spine`` — the facade tying the four-table store, ordering, and projection
+together behind semantic write paths, and the home of the server write-admission
+checks (the Mutation Invariants).
 
-Each write helper reduces the entity's current state, enforces the immutability
-of tombstones (the one policy the pure reducer leaves to the write layer), appends
-the event, then stamps the resulting version token onto the row (two-phase: append
-→ reduce → ``set_event_version``). The reducer is the single source of truth for
-that token; the stamp just makes the log self-describing.
+The ``Store`` / ``EntityStore`` layer is dumb persistence: it stamps versions and
+writes blobs, no cross-entity policy. The Spine is the "server" boundary that
+admits or rejects writes:
 
-Reads return reduced ``TaskEntity`` objects; ``cards()`` returns the projected,
-soft-delete-omitting Card view.
+    MI-1  No late children on a tombstoned parent. ``create_artifact`` /
+          ``create_escalation`` reject a ``task_id`` that resolves to a
+          soft-deleted Task (and, as referential hygiene, an absent Task).
+    MI-2  Resolving an escalation sets ``resolved_at`` in a single put — one
+          write, no paired Task.state transition (escalation is not a state).
+
+(There is no MI-3 — it dissolved when 'escalated' left the state enum.)
+
+Reads return entity objects; ``cards()`` returns the projected, soft-delete-
+omitting, escalation-badged Card view.
 """
 
 from __future__ import annotations
 
 import uuid
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
-from .entity import Actor, Lifecycle, TaskEntity
-from .events import EventStore, EventType
+from .entity import (
+    ARTIFACT_KINDS,
+    STATES,
+    Artifact,
+    Escalation,
+    Project,
+    Task,
+    State,
+)
 from .ordering import append_rank
 from .projection import project
-from .reducer import reduce, reduce_all
+from .storage import Store, utcnow_iso
 
 
 class Spine:
-    def __init__(self, store: Optional[EventStore] = None) -> None:
-        self.store = store or EventStore()
+    def __init__(self, store: Optional[Store] = None) -> None:
+        self.store = store or Store()
 
     # ── reads ────────────────────────────────────────────────────────────────
-    def get(self, entity_id: str) -> Optional[TaskEntity]:
-        events = self.store.read_events(entity_id)
-        return reduce(events) if events else None
+    def get_project(self, project_id: str) -> Optional[Project]:
+        return self.store.projects.get(project_id)
 
-    def _all_entities(self) -> List[TaskEntity]:
-        entities = list(reduce_all(self.store.read_all_events()).values())
-        entities.sort(key=lambda e: (e.order, e.id))
-        return entities
+    def get_task(self, task_id: str) -> Optional[Task]:
+        return self.store.tasks.get(task_id)
 
-    def list_entities(self, include_deleted: bool = False) -> List[TaskEntity]:
-        entities = self._all_entities()
-        if include_deleted:
-            return entities
-        return [e for e in entities if e.deleted_at is None]
+    def get_artifact(self, artifact_id: str) -> Optional[Artifact]:
+        return self.store.artifacts.get(artifact_id)
 
-    def cards(self) -> List[dict]:
-        """The projected board view (soft-deleted entities omitted by the lens)."""
-        return project(self._all_entities())
+    def get_escalation(self, escalation_id: str) -> Optional[Escalation]:
+        return self.store.escalations.get(escalation_id)
 
-    # ── write internals ──────────────────────────────────────────────────────
-    def _commit(self, entity_id: str, event_type: str, payload: dict, actor: str) -> TaskEntity:
-        seq = self.store.append_event(entity_id, event_type, payload, actor)
-        entity = reduce(self.store.read_events(entity_id))
-        assert entity is not None  # we just appended at least one event
-        self.store.set_event_version(seq, entity.version)
-        return entity
+    def cards(self) -> List[Dict[str, Any]]:
+        """The projected board view: soft-deleted tasks omitted, unresolved
+        escalations rendered as approval badges (orthogonal to the column)."""
+        return project(self.store.tasks.list_all(), self.store.escalations.list_all())
 
-    def _require_live(self, entity_id: str) -> TaskEntity:
-        current = self.get(entity_id)
-        if current is None:
-            raise KeyError(f"unknown entity {entity_id!r}")
-        if current.deleted_at is not None:
-            raise ValueError(f"entity {entity_id!r} is soft-deleted (tombstone is immutable)")
-        return current
+    # ── project / task writes ──────────────────────────────────────────────────
+    def create_project(
+        self, name: str, *, project_id: Optional[str] = None, created_at: Optional[str] = None
+    ) -> Project:
+        project_obj = Project(
+            id=project_id or str(uuid.uuid4()),
+            name=name,
+            created_at=created_at or utcnow_iso(),
+        )
+        return self.store.projects.put(project_obj)
 
-    # ── semantic write paths ─────────────────────────────────────────────────
     def create_task(
         self,
+        project_id: str,
         title: str,
-        actor: str = Actor.OPERATOR,
         *,
-        lifecycle: str = Lifecycle.CREATED,
+        state: str = State.CREATED,
         tier: Optional[int] = None,
-        entity_id: Optional[str] = None,
-    ) -> TaskEntity:
-        """Create a task, append-at-end in creation order. The order is seeded
-        after the current max live rank; ``rebalance`` is NEVER invoked here."""
-        entity_id = entity_id or str(uuid.uuid4())  # client-minted UUIDv4 per Card spec
-        last_order = max((e.order for e in self.list_entities()), default="")
-        payload: dict = {
-            "title": title,
-            "order": append_rank(last_order),
-            "lifecycle_state": lifecycle,
-        }
-        if tier is not None:
-            payload["tier"] = tier
-        return self._commit(entity_id, EventType.CREATED, payload, actor)
+        acceptance_criteria: Optional[Any] = None,
+        task_id: Optional[str] = None,
+        created_at: Optional[str] = None,
+    ) -> Task:
+        """Create a task, append-at-end in board order. ``order`` is seeded after
+        the current max live rank; ``rebalance`` is NEVER invoked here. Note: this
+        does not validate ``project_id`` exists (no such MI is specified)."""
+        if state not in STATES:
+            raise ValueError(f"unknown task state {state!r}")
+        last_order = max((t.order for t in self.store.tasks.list_live()), default="")
+        task = Task(
+            id=task_id or str(uuid.uuid4()),
+            project_id=project_id,
+            title=title,
+            state=state,
+            tier=tier,
+            acceptance_criteria=acceptance_criteria,
+            order=append_rank(last_order),
+            created_at=created_at or utcnow_iso(),
+        )
+        return self.store.tasks.put(task)
 
-    def change_title(self, entity_id: str, title: str, actor: str = Actor.CLAUDE) -> TaskEntity:
-        self._require_live(entity_id)
-        return self._commit(entity_id, EventType.TITLE_CHANGED, {"title": title}, actor)
+    def set_state(self, task_id: str, state: str) -> Task:
+        """Move a task to a new state (its board column). Validates the target is a
+        known state; transition legality is not guarded in this slice."""
+        if state not in STATES:
+            raise ValueError(f"unknown task state {state!r}")
+        task = self._require_task(task_id)
+        task.state = state
+        return self.store.tasks.put(task)
 
-    def move_column(
+    def assign_tier(self, task_id: str, tier: int) -> Task:
+        task = self._require_task(task_id)
+        task.tier = tier
+        return self.store.tasks.put(task)
+
+    def reposition(self, task_id: str, order: str) -> Task:
+        """Set a task's LexoRank board ``order`` (out-of-band move)."""
+        task = self._require_task(task_id)
+        task.order = order
+        return self.store.tasks.put(task)
+
+    def soft_delete_task(self, task_id: str) -> Task:
+        return self.store.tasks.soft_delete(task_id)
+
+    # ── artifact writes (MI-1) ─────────────────────────────────────────────────
+    def create_artifact(
         self,
-        entity_id: str,
-        lifecycle_state: Optional[str] = None,
-        order: Optional[str] = None,
-        actor: str = Actor.CLAUDE,
-    ) -> TaskEntity:
-        """Move (and/or reposition) a task. Mirrors the Card spec's card_move,
-        which carries column and order together."""
-        self._require_live(entity_id)
-        payload: dict = {}
-        if lifecycle_state is not None:
-            payload["lifecycle_state"] = lifecycle_state
-        if order is not None:
-            payload["order"] = order
-        if not payload:
-            raise ValueError("move_column requires lifecycle_state and/or order")
-        return self._commit(entity_id, EventType.COLUMN_CHANGED, payload, actor)
+        task_id: str,
+        kind: str,
+        ref: str,
+        *,
+        artifact_id: Optional[str] = None,
+        created_at: Optional[str] = None,
+    ) -> Artifact:
+        """Attach an artifact to a live task. MI-1: rejected if the task is
+        tombstoned (or absent)."""
+        if kind not in ARTIFACT_KINDS:
+            raise ValueError(f"unknown artifact kind {kind!r}")
+        self._require_live_parent(task_id)  # MI-1
+        artifact = Artifact(
+            id=artifact_id or str(uuid.uuid4()),
+            task_id=task_id,
+            kind=kind,
+            ref=ref,
+            created_at=created_at or utcnow_iso(),
+        )
+        return self.store.artifacts.put(artifact)
 
-    def assign_tier(self, entity_id: str, tier: int, actor: str = Actor.CLAUDE) -> TaskEntity:
-        self._require_live(entity_id)
-        return self._commit(entity_id, EventType.TIER_ASSIGNED, {"tier": tier}, actor)
+    # ── escalation writes (MI-1 on create, MI-2 on resolve) ────────────────────
+    def create_escalation(
+        self,
+        task_id: str,
+        reason: str,
+        *,
+        control_diff: Optional[Dict[str, Any]] = None,
+        escalation_id: Optional[str] = None,
+        created_at: Optional[str] = None,
+    ) -> Escalation:
+        """Raise an escalation on a live task. MI-1: rejected if the task is
+        tombstoned (or absent)."""
+        self._require_live_parent(task_id)  # MI-1
+        escalation = Escalation(
+            id=escalation_id or str(uuid.uuid4()),
+            task_id=task_id,
+            reason=reason,
+            control_diff=control_diff,
+            created_at=created_at or utcnow_iso(),
+        )
+        return self.store.escalations.put(escalation)
 
-    def raise_escalation(self, entity_id: str, ref: str, actor: str = Actor.CLAUDE) -> TaskEntity:
-        self._require_live(entity_id)
-        return self._commit(entity_id, EventType.ESCALATION_RAISED, {"ref": ref}, actor)
+    def resolve_escalation(self, escalation_id: str, *, resolved_at: Optional[str] = None) -> Escalation:
+        """MI-2: set ``resolved_at`` in a single put. No paired Task.state change —
+        'escalated' is not a state, so this is a trivial single-field write."""
+        escalation = self.store.escalations.get(escalation_id)
+        if escalation is None:
+            raise KeyError(f"escalation {escalation_id!r} does not exist")
+        escalation.resolved_at = resolved_at or utcnow_iso()
+        return self.store.escalations.put(escalation)
 
-    def resolve_escalation(
-        self, entity_id: str, actor: str = Actor.OPERATOR, resolution: Optional[str] = None
-    ) -> TaskEntity:
-        self._require_live(entity_id)
-        payload = {} if resolution is None else {"resolution": resolution}
-        return self._commit(entity_id, EventType.ESCALATION_RESOLVED, payload, actor)
+    # ── admission helpers ──────────────────────────────────────────────────────
+    def _require_task(self, task_id: str) -> Task:
+        task = self.store.tasks.get(task_id)
+        if task is None:
+            raise KeyError(f"task {task_id!r} does not exist")
+        return task
 
-    def soft_delete(self, entity_id: str, actor: str = Actor.OPERATOR) -> TaskEntity:
-        """Soft-delete (tombstone). The entity remains in the log and reduces with
-        ``deleted_at`` set, but the projection omits it."""
-        self._require_live(entity_id)
-        return self._commit(entity_id, EventType.DELETED, {}, actor)
+    def _require_live_parent(self, task_id: str) -> Task:
+        """MI-1 gate: the parent task must exist and not be tombstoned."""
+        task = self.store.tasks.get(task_id)
+        if task is None:
+            raise ValueError(f"task {task_id!r} does not exist (no orphan children)")
+        if task.deleted_at is not None:
+            raise ValueError(f"task {task_id!r} is tombstoned (MI-1: no late children)")
+        return task

@@ -1,26 +1,27 @@
-"""Claunker Spine — orchestration-state data core (read-slice foundation).
+"""Claunker Spine — orchestration-state data core (locked v1 architecture).
 
 Foundation 04 §5.9 names the *spine* as the durable orchestration-state tier
 (distinct from code-on-GitHub and the RAG corpus). This package is the DATA CORE
 of that tier ONLY — no MCP server, no transport, no network. It is the in-process
 truth from which the Kanbantt board projection is rendered.
 
-Shape (event-sourced, single source of truth = the event log):
+Shape (a plain 4-table entity store — NOT event-sourced):
 
-    events.py      append-only SQLite event log (``task_events``) + the narrow
-                   write/read interface. NOT a CRUD state table.
-    entity.py      ``TaskEntity`` — the canonical reduced entity, plus the
-                   lifecycle→reserved-column and actor→ref mappings.
-    reducer.py     fold an entity's events into its current ``TaskEntity``.
-    version.py     opaque version token ``{seq}:{content_hash}`` (collision-safe,
-                   equality-only by contract — never parsed by consumers).
+    storage.py     ``Store`` over four ``(id, data)`` SQLite tables (WAL), one per
+                   entity kind, each fronted by an ``EntityStore``
+                   (get/put/list_live/list_all/soft_delete). ``put`` mints the
+                   version token. ``dump``/``load`` are the future-Drive-sync seam.
+    entity.py      the four entities — ``Project``, ``Task``, ``Artifact``,
+                   ``Escalation`` — plus the ``State`` and ``ArtifactKind`` enums.
+    version.py     opaque version token ``{seq}:{content_hash}`` (equality-only by
+                   contract — never parsed by consumers).
     ordering.py    LexoRank string ordering: append-at-end seeding, ``rank_between``
                    for out-of-band inserts, and an out-of-band ``rebalance``.
-    projection.py  one-way lens ``TaskEntity → Card`` conforming to the Kanbantt
-                   MCP Card schema (soft-deleted entities omitted; ``gate_status``
-                   stamped COMMITTED on every card).
-    spine.py       ``Spine`` — a thin facade tying the log + reducer + ordering +
-                   projection together with semantic write paths.
+    projection.py  one-way lens ``Task → Card`` (state→column 1:1, tier→tag,
+                   unresolved escalation→badge, gate_status COMMITTED; soft-deleted
+                   tasks omitted).
+    spine.py       ``Spine`` — facade over the store with semantic write paths and
+                   the server write-admission checks (MI-1, MI-2).
 
 Kept import-light (stdlib only: sqlite3/json/hashlib/uuid/datetime/math). The
 spine deliberately does NOT import ``hermes_cli`` or the classifier — task STATE
@@ -28,14 +29,17 @@ and tool-call GATING are separate concerns that must not couple.
 """
 
 from .entity import (  # noqa: F401
-    Actor,
-    Lifecycle,
-    RESERVED_COLUMNS,
-    TaskEntity,
-    actor_ref,
-    lifecycle_to_column,
+    ARTIFACT_KINDS,
+    PIPELINE_STATES,
+    STATES,
+    TERMINAL_STATES,
+    Artifact,
+    ArtifactKind,
+    Escalation,
+    Project,
+    State,
+    Task,
 )
-from .events import Event, EventStore, EventType  # noqa: F401
 from .ordering import (  # noqa: F401
     MAX_RANK_LENGTH,
     append_rank,
@@ -43,7 +47,19 @@ from .ordering import (  # noqa: F401
     rank_between,
     rebalance,
 )
-from .projection import GATE_STATUS_COMMITTED, project, to_card  # noqa: F401
-from .reducer import apply_event, reduce, reduce_all  # noqa: F401
+from .projection import (  # noqa: F401
+    DEFAULT_PRIORITY,
+    GATE_STATUS_COMMITTED,
+    project,
+    to_card,
+)
 from .spine import Spine  # noqa: F401
+from .storage import (  # noqa: F401
+    DB_PATH,
+    SCHEMA_VERSION,
+    TABLES,
+    EntityStore,
+    Store,
+    utcnow_iso,
+)
 from .version import content_hash, make_version  # noqa: F401

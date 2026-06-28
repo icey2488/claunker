@@ -1,119 +1,159 @@
-"""The canonical ``TaskEntity`` plus the two boundary mappings the projection
-needs: internal lifecycle → board column (one-to-one), and actor string → the
-Card ``{type, id}`` actor ref.
+"""The four canonical Claunker Spine entities + the fixed enums they range over.
 
-``TaskEntity`` is the *reduced* state — never stored directly; always folded from
-the event log (``reducer.py``). Its rich orchestration fields (tier, escalation
-ref, seq, version, actors) are what the one-way projection deliberately drops or
-flattens when conforming to the Card schema.
+The locked v1 data core is a plain entity store, NOT an event log: each entity is
+its own JSON blob, stored and read directly (see ``storage.py``). There is no
+reducer and no derived ``TaskEntity`` — these dataclasses ARE the stored shape.
+
+Every entity carries three universal fields:
+
+    id          stable identity (client-minted UUIDv4)
+    version     opaque ``{seq}:{content_hash}`` token (``version.py``); equality-
+                only by contract — consumers compare it, never parse or order it.
+                Stamped by the store on every ``put`` (``storage.py``).
+    deleted_at  soft-delete tombstone (ISO-8601 string) or ``None`` while live.
+
+plus their own semantic fields. ``content()`` is the slice hashed into the version
+token (everything EXCEPT ``version`` itself, which would be circular); ``to_dict``/
+``from_dict`` are the JSON-blob (de)serialization the store round-trips.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, fields
 from typing import Any, Dict, Optional
 
 
-class Lifecycle:
-    """Claunker-internal orchestration lifecycle states.
-
-    These are the spine's own vocabulary; the projection maps each one-to-one
-    onto a board column of the same id (``created``/``queued``/``executing``/
-    ``judging``/``delivered``/``failed``), keeping executing vs judging and
-    delivered vs failed distinct for observability rather than collapsing them
-    onto Kanbantt's four reserved columns.
-    """
+# ── state / kind vocabularies ────────────────────────────────────────────────
+class State:
+    """The Task lifecycle. Pipeline: created → tiered → dispatched → judged →
+    delivered, with ``failed`` a terminal sibling of ``delivered``. There is NO
+    'escalated' state — escalation is a separate entity, orthogonal to the column.
+    Each state projects one-to-one onto a board column of the same id."""
 
     CREATED = "created"
-    QUEUED = "queued"
-    EXECUTING = "executing"
-    JUDGING = "judging"
+    TIERED = "tiered"
+    DISPATCHED = "dispatched"
+    JUDGED = "judged"
     DELIVERED = "delivered"
     FAILED = "failed"
 
 
-# Reserved Kanbantt column ids (the shared agent-routing vocabulary).
-RESERVED_COLUMNS = ("backlog", "todo", "in_progress", "done")
-
-# Internal lifecycle → board column, one-to-one: each lifecycle state is its own
-# column id (executing vs judging and delivered vs failed kept distinct for
-# observability instead of collapsing onto the four reserved columns). Anything
-# not here passes through unchanged, landing the card in Kanbantt's visible
-# "fallback tray" rather than being silently dropped — the spec-conformant degrade
-# for an unknown column.
-_LIFECYCLE_TO_COLUMN: Dict[str, str] = {
-    Lifecycle.CREATED: "created",
-    Lifecycle.QUEUED: "queued",
-    Lifecycle.EXECUTING: "executing",
-    Lifecycle.JUDGING: "judging",
-    Lifecycle.DELIVERED: "delivered",
-    Lifecycle.FAILED: "failed",
-}
+# Full state set (validation) and the happy-path pipeline order (documentation;
+# transitions are not guarded in this slice — any state in STATES is accepted).
+STATES = (
+    State.CREATED,
+    State.TIERED,
+    State.DISPATCHED,
+    State.JUDGED,
+    State.DELIVERED,
+    State.FAILED,
+)
+PIPELINE_STATES = (State.CREATED, State.TIERED, State.DISPATCHED, State.JUDGED, State.DELIVERED)
+TERMINAL_STATES = (State.DELIVERED, State.FAILED)
 
 
-def lifecycle_to_column(lifecycle_state: str) -> str:
-    """Map an internal lifecycle state to a Kanbantt column id (passthrough on miss)."""
-    return _LIFECYCLE_TO_COLUMN.get(lifecycle_state, lifecycle_state)
+class ArtifactKind:
+    """What an Artifact points at. ``kind`` is constrained to this set."""
+
+    DIFF = "diff"
+    FILE = "file"
+    VERDICT = "verdict"
+    DELIVERY = "delivery"
 
 
-class Actor:
-    """Who acted. ``created_by``/``updated_by`` are these actor strings."""
-
-    CLAUDE = "claude"      # architect
-    OLLAMA = "ollama"      # executor
-    GEMINI = "gemini"      # judge
-    OPERATOR = "operator"  # the human
+ARTIFACT_KINDS = (ArtifactKind.DIFF, ArtifactKind.FILE, ArtifactKind.VERDICT, ArtifactKind.DELIVERY)
 
 
-# Only the operator is a human; the model actors are agents.
-_HUMAN_ACTORS = frozenset({Actor.OPERATOR})
+# ── shared (de)serialization + version-content behavior ──────────────────────
+class _Entity:
+    """Mixin giving every entity dataclass blob (de)serialization and the version
+    content slice. Not a dataclass itself — methods only."""
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Full JSON-serializable blob (the ``data`` column), version included."""
+        return asdict(self)  # type: ignore[arg-type]
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "_Entity":
+        """Rebuild from a stored blob, ignoring any unknown keys (forward-compat:
+        a blob written by a newer schema still loads its known fields)."""
+        known = {f.name for f in fields(cls)}  # type: ignore[arg-type]
+        return cls(**{k: v for k, v in d.items() if k in known})
+
+    def content(self) -> Dict[str, Any]:
+        """The semantic content hashed into the version token: the whole blob
+        EXCEPT ``version`` (circular). Any real field change moves the token; the
+        store's monotonic ``seq`` prefix moves it on every put regardless."""
+        d = self.to_dict()
+        d.pop("version", None)
+        return d
 
 
-def actor_ref(actor: Optional[str]) -> Dict[str, str]:
-    """Flatten an actor string to the Card schema's ``{type, id}`` actor ref.
-    A missing actor defaults to the operator (fail safe: attribute to the human)."""
-    actor = actor or Actor.OPERATOR
-    return {"type": "human" if actor in _HUMAN_ACTORS else "agent", "id": actor}
+# ── the four entities ────────────────────────────────────────────────────────
+@dataclass
+class Project(_Entity):
+    """A unit of work that owns Tasks."""
+
+    id: str
+    name: str
+    created_at: Optional[str] = None
+    version: Optional[str] = None
+    deleted_at: Optional[str] = None
 
 
 @dataclass
-class TaskEntity:
-    """The canonical reduced entity. Mutated in place by the reducer as it folds.
+class Task(_Entity):
+    """A single piece of work in the pipeline. ``tier`` aligns with the
+    classifier's tier space (1=self-accept .. 4=human) but is a plain int here —
+    the spine does not import the classifier. ``order`` is the spine-assigned
+    LexoRank board position (``ordering.py``); it is not one of the spec's core
+    semantic fields but is required for the Card ``order`` passthrough and for the
+    retained LexoRank ordering."""
 
-    ``tier`` aligns with the classifier's tier space (1=self-accept .. 4=human)
-    but is stored as a plain int here — the spine does not import the classifier.
+    id: str
+    project_id: str
+    title: str
+    state: str = State.CREATED
+    tier: Optional[int] = None
+    acceptance_criteria: Optional[Any] = None
+    order: str = ""
+    created_at: Optional[str] = None
+    version: Optional[str] = None
+    deleted_at: Optional[str] = None
+
+
+@dataclass
+class Artifact(_Entity):
+    """A produced output attached to a Task. ``kind`` ∈ ARTIFACT_KINDS; ``ref`` is
+    an opaque pointer (path / url / blob id) the spine does not interpret."""
+
+    id: str
+    task_id: str
+    kind: str
+    ref: str
+    created_at: Optional[str] = None
+    version: Optional[str] = None
+    deleted_at: Optional[str] = None
+
+
+@dataclass
+class Escalation(_Entity):
+    """A request for human/governance attention on a Task, orthogonal to the
+    Task's state column. ``resolved_at`` is ``None`` while pending (an unresolved
+    escalation drives the projected approval badge). ``control_diff`` describes a
+    proposed control change, or is ``None`` when the escalation proposes none:
+
+        control_diff = { control_id, old_value, new_value, reduces_control } | None
+
+    ``reduces_control`` flags a change that *weakens* a guardrail — the field an
+    approval queue prioritizes on.
     """
 
     id: str
-    title: str
-    order: str  # LexoRank string (spine-assigned)
-    lifecycle_state: str = Lifecycle.CREATED
-    tier: Optional[int] = None
-    escalated: bool = False
-    escalation_ref: Optional[str] = None
-    version: Optional[str] = None  # opaque {seq}:{content_hash}; set by the reducer
-    seq: int = 0                   # seq of the last event folded into this state
-    deleted_at: Optional[str] = None
+    task_id: str
+    reason: str
+    control_diff: Optional[Dict[str, Any]] = None
+    resolved_at: Optional[str] = None
     created_at: Optional[str] = None
-    updated_at: Optional[str] = None
-    created_by: Optional[str] = None
-    updated_by: Optional[str] = None
-
-    def content(self) -> Dict[str, Any]:
-        """The semantic content hashed into the version token. Excludes ``version``
-        (circular) and ``seq`` (the token's own prefix); includes the mutating
-        timestamps/actors so any real change moves the token."""
-        return {
-            "id": self.id,
-            "title": self.title,
-            "order": self.order,
-            "lifecycle_state": self.lifecycle_state,
-            "tier": self.tier,
-            "escalated": self.escalated,
-            "escalation_ref": self.escalation_ref,
-            "deleted_at": self.deleted_at,
-            "created_at": self.created_at,
-            "created_by": self.created_by,
-            "updated_at": self.updated_at,
-            "updated_by": self.updated_by,
-        }
+    version: Optional[str] = None
+    deleted_at: Optional[str] = None
