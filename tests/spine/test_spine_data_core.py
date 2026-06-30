@@ -113,6 +113,27 @@ def test_soft_delete_omitted_from_list_live_and_projection():
     assert to_card(spine.store.tasks.get(t.id)) is None  # the lens omits a tombstone
 
 
+# ── migration-free: a legacy Task blob with no deleted_at key loads live ───────
+def test_legacy_task_blob_without_deleted_at_loads_live_and_visible():
+    """A Task blob written before ``deleted_at`` existed carries no such key. The
+    dataclass default fills it in (``from_dict`` ignores unknown keys, defaults the
+    missing one), so the task loads with ``deleted_at=None`` — LIVE and on the board.
+    No migration / backfill is needed when the soft-delete field is introduced."""
+    store = Store()
+    legacy = {  # exactly the pre-deleted_at blob shape (note: no "deleted_at" key)
+        "id": "t1", "project_id": "p", "title": "legacy", "state": "created",
+        "tier": None, "acceptance_criteria": None, "order": "i",
+        "created_at": T[0], "version": "1:deadbeef",
+    }
+    assert "deleted_at" not in legacy
+    store.load({"tasks": [legacy]})                      # raw INSERT, blob unchanged
+
+    loaded = store.tasks.get("t1")
+    assert loaded.deleted_at is None                     # defaulted, not absent
+    assert len(store.tasks.list_live()) == 1             # present in the live view
+    assert [c["id"] for c in project(store.tasks.list_all(), [])] == ["t1"]  # visible on the board
+
+
 # ── ordering: creation order reflected in LexoRank order + projection order ────
 def test_creation_order_reflected_in_lexorank_projection_order():
     spine = Spine()

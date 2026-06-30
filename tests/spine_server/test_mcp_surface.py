@@ -1,8 +1,9 @@
-"""MCP surface (via the SDK's in-memory client): exactly three tools advertised
-(the read-only ``board_get``/``card_list`` mirror PLUS the one mutating
-``escalation_resolve`` control), serverInfo identity, structuredContent as top-level
-objects, and the domain-error shape. Async calls are driven through ``anyio.run``
-inside sync test functions so no async test plugin is needed.
+"""MCP surface (via the SDK's in-memory client): exactly SEVEN tools advertised
+(the read-only ``board_get``/``card_list`` mirror, the one human-gated
+``escalation_resolve`` control, and the four operator ``card_create`` /
+``card_update`` / ``card_move`` / ``card_delete`` writes), serverInfo identity,
+structuredContent as top-level objects, and the domain-error shape. Async calls are
+driven through ``anyio.run`` inside sync test functions so no async plugin is needed.
 """
 
 import os
@@ -39,15 +40,18 @@ async def _call(server, name, arguments):
         return result.isError, result.structuredContent
 
 
-def test_tools_list_advertises_board_get_card_list_and_escalation_resolve():
+def test_tools_list_advertises_the_seven_tool_surface():
     directory, path = make_temp_db()
     try:
         seed(path, [{"title": "a"}])
         names = anyio.run(_tool_names, build_server(_config(path)))
-        # the read-only mirror pair PLUS the one human-gated mutating control. Still
-        # no card_*/column/tag/artifact write tools, and (deliberately) no
-        # escalation_list — the resolve payload rides in card_list's per-card badge.
-        assert sorted(names) == ["board_get", "card_list", "escalation_resolve"]
+        # the read-only mirror pair, the one human-gated escalation control, and the
+        # four operator card-write tools. (Still deliberately no escalation_list — the
+        # resolve payload rides in card_list's per-card badge.)
+        assert sorted(names) == sorted([
+            "board_get", "card_list", "escalation_resolve",
+            "card_create", "card_update", "card_move", "card_delete",
+        ])
     finally:
         cleanup(directory)
 

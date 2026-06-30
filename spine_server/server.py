@@ -1,17 +1,25 @@
 """FastMCP wiring + the Starlette ASGI app.
 
-Advertises THREE tools — the read-only mirror pair (``board_get``, ``card_list``)
-PLUS exactly one human-gated mutating control, ``escalation_resolve``. This slice
-is therefore no longer a pure mirror: it is a read-only mirror plus a single,
-narrow write path (an operator approve/deny on an escalation). Kanbantt still gates
-features on advertised tool NAMES — with no card_*/column/tag/artifact write tools
-the board stays a read-only mirror, and it renders escalations from the per-card
-badge that already rides in ``card_list`` (no ``escalation_list`` is advertised;
-see the asymmetric-advertising note on the tool below).
+Advertises SEVEN tools — the read-only mirror pair (``board_get``, ``card_list``),
+the one human-gated escalation control (``escalation_resolve``), and the FOUR
+operator card-write tools (``card_create``, ``card_update``, ``card_move``,
+``card_delete``). With the card_* write path advertised the board is no longer a
+read-only mirror: Kanbantt gates features on advertised tool NAMES, so this surface
+now lets Kanbantt's ``canWrite`` flip (Pass 2 wires the client). Escalations still
+render from the per-card badge that rides in ``card_list`` (no ``escalation_list``
+is advertised; see the asymmetric-advertising note on ``escalation_resolve`` below).
 
-The actor that performs the mutation is derived from the AUTHENTICATED CREDENTIAL,
-never from the request payload — see the actor-invariant comment on
-``escalation_resolve``.
+Two write-path stances coexist here, DELIBERATELY asymmetric:
+
+  * ``escalation_resolve`` is GOVERNED — a human control override. The actor is
+    derived from the AUTHENTICATED CREDENTIAL, never the payload, and is re-asserted
+    operator-only at the Spine (see the actor-invariant comment on the tool).
+  * the ``card_*`` tools are UNGOVERNED operator edits — direct state/field puts with
+    NO transition-legality check and NO actor field. The operator is the tier-4
+    human; these tools are the operator's hand, authenticated by the single Bearer
+    token (the token IS the attribution — light transport-level only). ``card_delete``
+    is a SOFT delete (a recoverable tombstone; the row is retained, hidden from the
+    board). The governed *agent* write path is a separate v2 concern.
 """
 
 from __future__ import annotations
@@ -23,7 +31,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.applications import Starlette
 
-from spine import Spine, Store
+from spine import Spine, Store, project
 
 from .board import build_board
 from .cards import PayloadTooLarge, list_cards
@@ -153,6 +161,123 @@ def build_server(config: ServerConfig) -> FastMCP:
             # Bad resolution enum, or a rationale under the >=10-char semantic floor.
             return domain_error_result(VALIDATION_FAILED, str(exc), {"id": id})
         return ok_result({"escalation": resolved.to_dict()})
+
+    # ── operator card-write tools (FREE / ungoverned: the operator's hand) ───────
+    # The four card_* mutating tools. UNLIKE escalation_resolve these are NOT a
+    # governed control: they are direct state/field puts with NO transition-legality
+    # check and NO actor field (the single Bearer token is the attribution). Each
+    # opens its OWN writable Store (exactly as escalation_resolve does — WAL serializes
+    # writers) and returns the freshly-projected Card (badge included) for the client
+    # to apply. They advertise together so a later slice can wire Kanbantt's canWrite.
+
+    @mcp.tool(
+        name="card_create",
+        description="Create a Task (an operator-authored card) in a project. A free, ungoverned operator write.",
+        structured_output=False,
+    )
+    def card_create(
+        project_id: str,
+        title: str,
+        state: str = "created",
+        tier: int = 1,
+        acceptance_criteria: str = "",
+    ) -> types.CallToolResult:
+        # Input hygiene (→ validation_failed) is checked before the project lookup
+        # (→ not_found), mirroring escalation_resolve's validate-before-lookup order.
+        if not title.strip():
+            return domain_error_result(VALIDATION_FAILED, "title must be a non-empty string", {})
+        if not (1 <= tier <= 4):
+            return domain_error_result(
+                VALIDATION_FAILED, f"tier must be an int in 1..4, got {tier!r}", {"tier": tier}
+            )
+        try:
+            with Store(config.db_path) as store:
+                spine = Spine(store)
+                if spine.get_project(project_id) is None:
+                    return domain_error_result(
+                        NOT_FOUND, f"project {project_id!r} does not exist", {"project_id": project_id}
+                    )
+                task = spine.create_task(
+                    project_id,
+                    title,
+                    state=state,
+                    tier=tier,
+                    acceptance_criteria=acceptance_criteria,
+                )
+                card = project([task], store.escalations.list_all())[0]
+        except ValueError as exc:
+            # create_task validates the target state ∈ STATES.
+            return domain_error_result(VALIDATION_FAILED, str(exc), {})
+        return ok_result({"card": card})
+
+    @mcp.tool(
+        name="card_update",
+        description=(
+            "Edit an operator card's mutable fields (title / acceptance_criteria / tier). "
+            "A free, ungoverned operator write — NOT state or order (use card_move)."
+        ),
+        structured_output=False,
+    )
+    def card_update(
+        task_id: str,
+        title: Optional[str] = None,
+        acceptance_criteria: Optional[str] = None,
+        tier: Optional[int] = None,
+    ) -> types.CallToolResult:
+        try:
+            with Store(config.db_path) as store:
+                spine = Spine(store)
+                task = spine.update_task(
+                    task_id,
+                    title=title,
+                    acceptance_criteria=acceptance_criteria,
+                    tier=tier,
+                )
+                card = project([task], store.escalations.list_all())[0]
+        except KeyError:
+            return domain_error_result(NOT_FOUND, f"task {task_id!r} does not exist", {"task_id": task_id})
+        except ValueError as exc:
+            # No field given, or a bad tier.
+            return domain_error_result(VALIDATION_FAILED, str(exc), {"task_id": task_id})
+        return ok_result({"card": card})
+
+    @mcp.tool(
+        name="card_move",
+        description=(
+            "Move an operator card to a state column (and optional LexoRank order). A "
+            "free, ungoverned operator write — no transition-legality check."
+        ),
+        structured_output=False,
+    )
+    def card_move(
+        task_id: str,
+        to_state: str,
+        order: Optional[str] = None,
+    ) -> types.CallToolResult:
+        try:
+            with Store(config.db_path) as store:
+                spine = Spine(store)
+                task = spine.move_task(task_id, to_state, order=order)
+                card = project([task], store.escalations.list_all())[0]
+        except KeyError:
+            return domain_error_result(NOT_FOUND, f"task {task_id!r} does not exist", {"task_id": task_id})
+        except ValueError as exc:
+            # Unknown target state.
+            return domain_error_result(VALIDATION_FAILED, str(exc), {"task_id": task_id})
+        return ok_result({"card": card})
+
+    @mcp.tool(
+        name="card_delete",
+        description="Soft-delete an operator card: a recoverable tombstone (the row is retained, hidden from the board).",
+        structured_output=False,
+    )
+    def card_delete(task_id: str) -> types.CallToolResult:
+        try:
+            with Store(config.db_path) as store:
+                Spine(store).soft_delete_task(task_id)
+        except KeyError:
+            return domain_error_result(NOT_FOUND, f"task {task_id!r} does not exist", {"task_id": task_id})
+        return ok_result({"id": task_id})
 
     # ASYMMETRIC-ADVERTISING / DEFERRED CAPABILITY GAP (deliberate, NOT permanent):
     # escalation_resolve is advertised WITHOUT a matching escalation_list query. The

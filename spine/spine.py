@@ -123,7 +123,59 @@ class Spine:
         task.order = order
         return self.store.tasks.put(task)
 
+    def update_task(
+        self,
+        task_id: str,
+        *,
+        title: Optional[str] = None,
+        acceptance_criteria: Optional[Any] = None,
+        tier: Optional[int] = None,
+    ) -> Task:
+        """Operator edit of a task's MUTABLE fields — ``title`` / ``acceptance_criteria``
+        / ``tier`` — in a single get→set→put. NOT ``state`` and NOT ``order`` (those
+        move via ``move_task``). A FREE, ungoverned operator edit (the operator is the
+        tier-4 human): only input hygiene is checked, never a transition policy.
+
+          * at least one field must be provided (all-``None`` → ``ValueError``);
+          * ``tier``, when provided, must be in 1..4 (else ``ValueError``);
+          * ``title``, when provided, must be non-empty (else ``ValueError``).
+
+        Only the provided (non-``None``) fields change; ``None`` means "leave as-is".
+        Unknown ``task_id`` → ``KeyError`` (→ not_found)."""
+        if title is None and acceptance_criteria is None and tier is None:
+            raise ValueError("update_task requires at least one field to change")
+        if tier is not None and not (1 <= tier <= 4):
+            raise ValueError(f"tier must be an int in 1..4, got {tier!r}")
+        if title is not None and not title.strip():
+            raise ValueError("title cannot be updated to an empty string")
+        task = self._require_task(task_id)
+        if title is not None:
+            task.title = title
+        if acceptance_criteria is not None:
+            task.acceptance_criteria = acceptance_criteria
+        if tier is not None:
+            task.tier = tier
+        return self.store.tasks.put(task)
+
+    def move_task(self, task_id: str, to_state: str, *, order: Optional[str] = None) -> Task:
+        """Operator move: set ``state`` (the board column) and, if ``order`` is given,
+        the LexoRank board position — in a single get→set→put. The move is FREE: NO
+        transition-legality check (any state in ``STATES`` is accepted, adjacent or
+        not), per the ratified 'manual operator edits are ungoverned' stance. Only the
+        target ``to_state`` is validated (a known state, else ``ValueError``). Unknown
+        ``task_id`` → ``KeyError`` (→ not_found)."""
+        if to_state not in STATES:
+            raise ValueError(f"unknown task state {to_state!r}")
+        task = self._require_task(task_id)
+        task.state = to_state
+        if order is not None:
+            task.order = order
+        return self.store.tasks.put(task)
+
     def soft_delete_task(self, task_id: str) -> Task:
+        """Tombstone a task (soft delete): stamp ``deleted_at`` and re-put, so the row
+        and its data are RETAINED (auditable, recoverable) while the card is omitted
+        from the board projection. Unknown ``task_id`` → ``KeyError`` (→ not_found)."""
         return self.store.tasks.soft_delete(task_id)
 
     # ── artifact writes (MI-1) ─────────────────────────────────────────────────
