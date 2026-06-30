@@ -1,0 +1,25 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "claunker-spine"
+version = "0.1.0"
+description = "Claunker Spine MCP server (board_get + card_list + escalation_resolve)"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp",
+    "starlette",
+    "anyio",
+    "httpx",
+    "uvicorn",
+]
+
+# One-command launch: `python -m spine_server.server`, or the console script below.
+# main() in spine_server.server is no-arg and reads CLAUNKER_SPINE_* from the env.
+[project.scripts]
+claunker-spine = "spine_server.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["spine", "spine_server"]
