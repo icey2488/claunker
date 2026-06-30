@@ -12,7 +12,9 @@ stance + the spec's optimistic-concurrency model:
     a separate slice — so it keeps its int ``tier`` and flat fields.)
   * card_update takes the spec shape { id, patch, expected_version, force? } and edits
     ONLY the modeled mutable fields in the patch (title / acceptance_criteria / tier);
-    patch.tier rides as the "tier:N" tag-id string the projection emits and round-trips.
+    patch.tier rides as the "tier:N" tag-id string the projection emits and round-trips
+    on the FREE initial classification (untiered → N). A SET tier is WRITE-ONCE — it
+    changes only via the governed card_retier path (see test_card_retier).
   * card_move takes { id, column_id, order, expected_version, force? } — column_id IS
     the target state, and it is FREE (moves across NON-adjacent states with no
     transition check) at the supplied LexoRank order.
@@ -206,10 +208,14 @@ def test_card_update_changes_only_provided_fields():
 def test_card_update_tier_round_trips_as_tag_id_string():
     directory, path = make_temp_db()
     try:
-        _, task_id = _seed_task(path, tier=1)
+        # Tier is WRITE-ONCE as of spec v0.3.0: card_update may set an UNTIERED card's
+        # INITIAL tier (the free first classification) but not CHANGE a set one — that is
+        # the governed card_retier path (see test_card_retier). So the "tier:N" tag-id
+        # string round-trip is exercised here on the surviving free path: untiered → N.
+        _, task_id = _seed_task(path, tier=None)
         ev = _version_of(path, task_id)
         # patch.tier is the "tier:N" tag-id string the projection emits — the EXACT
-        # representation the card already carries in `tags`; it must round-trip.
+        # representation the card carries in `tags`; it must round-trip (string→int→string).
         is_error, sc = anyio.run(
             _call, build_server(_config(path)), "card_update",
             {"id": task_id, "patch": {"tier": "tier:4"}, "expected_version": ev},

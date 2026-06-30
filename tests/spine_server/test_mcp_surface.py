@@ -1,9 +1,10 @@
-"""MCP surface (via the SDK's in-memory client): exactly SEVEN tools advertised
+"""MCP surface (via the SDK's in-memory client): exactly EIGHT tools advertised
 (the read-only ``board_get``/``card_list`` mirror, the one human-gated
-``escalation_resolve`` control, and the four operator ``card_create`` /
-``card_update`` / ``card_move`` / ``card_delete`` writes), serverInfo identity,
-structuredContent as top-level objects, and the domain-error shape. Async calls are
-driven through ``anyio.run`` inside sync test functions so no async plugin is needed.
+``escalation_resolve`` control, and the five operator ``card_create`` /
+``card_update`` / ``card_move`` / ``card_delete`` / ``card_retier`` writes),
+serverInfo identity, structuredContent as top-level objects, and the domain-error
+shape. Async calls are driven through ``anyio.run`` inside sync test functions so no
+async plugin is needed.
 """
 
 import os
@@ -40,17 +41,18 @@ async def _call(server, name, arguments):
         return result.isError, result.structuredContent
 
 
-def test_tools_list_advertises_the_seven_tool_surface():
+def test_tools_list_advertises_the_eight_tool_surface():
     directory, path = make_temp_db()
     try:
         seed(path, [{"title": "a"}])
         names = anyio.run(_tool_names, build_server(_config(path)))
         # the read-only mirror pair, the one human-gated escalation control, and the
-        # four operator card-write tools. (Still deliberately no escalation_list — the
-        # resolve payload rides in card_list's per-card badge.)
+        # five operator card-write tools (card_retier is the governed/audited one, which
+        # is what lets Kanbantt's canRetier derive true). (Still deliberately no
+        # escalation_list — the resolve payload rides in card_list's per-card badge.)
         assert sorted(names) == sorted([
             "board_get", "card_list", "escalation_resolve",
-            "card_create", "card_update", "card_move", "card_delete",
+            "card_create", "card_update", "card_move", "card_delete", "card_retier",
         ])
     finally:
         cleanup(directory)

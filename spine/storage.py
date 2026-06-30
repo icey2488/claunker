@@ -1,4 +1,5 @@
-"""The locked v1 Claunker Spine store: a 4-table SQLite JSON-blob store.
+"""The locked v1 Claunker Spine store: a SQLite JSON-blob store — four versioned
+entity tables plus one append-only governance ledger.
 
 This REPLACES the old event-log core (events.py + reducer.py are gone). There is
 no event log, no reducer, no event playback — each entity is stored and read as a
@@ -6,7 +7,10 @@ JSON blob in its own table:
 
     <table> ( id TEXT PRIMARY KEY, data TEXT NOT NULL )   -- data = the entity blob
 
-one table per entity kind (``projects``, ``tasks``, ``artifacts``, ``escalations``).
+one table per entity kind (``projects``, ``tasks``, ``artifacts``, ``escalations``),
+plus ``tier_audit`` — a FIFTH table holding the append-only re-tier governance ledger
+(same ``(id, data)`` JSON-blob shape, but INSERT-only: no version token, no soft
+delete, no update/delete path — see ``TIER_AUDIT_TABLE`` / ``append_tier_audit``).
 The connection is opened WAL (``PRAGMA journal_mode=WAL``) so reads never block the
 single writer. The ``.db`` file (and its ``-wal``/``-shm`` siblings) is gitignored.
 
@@ -20,7 +24,9 @@ yields a fresh equality-only token.
 (``sync-merge`` is out of scope this slice — this is just the seam): ``dump``
 returns ``{schema_version, seq, projects[], tasks[], artifacts[], escalations[]}``
 and ``load`` writes each collection straight back via INSERT OR REPLACE, preserving
-the stored version tokens (no re-stamp) and restoring ``seq``.
+the stored version tokens (no re-stamp) and restoring ``seq``. The append-only
+``tier_audit`` ledger is local-only this slice: like sync-merge itself, replicating
+the ledger across the seam is deferred — it rides neither ``dump`` nor ``load`` yet.
 """
 
 from __future__ import annotations
@@ -42,6 +48,12 @@ DB_PATH = os.path.join(os.path.dirname(__file__), "spine.db")
 
 # One table per entity kind. Order is the canonical dump/load order.
 TABLES = ("projects", "tasks", "artifacts", "escalations")
+
+# The append-only re-tier governance ledger (kanbantt-mcp-spec v0.3.0 §Re-tier). NOT
+# an entity kind — no version token, no soft delete, no ``EntityStore`` — so it lives
+# OUTSIDE ``TABLES`` (the versioned kinds the dump/load seam carries) and is created
+# and queried directly here. Rows are only ever INSERTed (append-only ledger).
+TIER_AUDIT_TABLE = "tier_audit"
 
 
 def utcnow_iso() -> str:
@@ -115,6 +127,13 @@ class Store:
             self._conn.execute(
                 f"CREATE TABLE IF NOT EXISTS {table} (id TEXT PRIMARY KEY, data TEXT NOT NULL)"
             )
+        # The FIFTH table: the append-only re-tier governance ledger. Same (id, data)
+        # JSON-blob shape as the entity tables (mirroring the repo's storage pattern),
+        # but it carries no EntityStore and is never updated or deleted — see
+        # ``append_tier_audit`` / ``list_tier_audit``.
+        self._conn.execute(
+            f"CREATE TABLE IF NOT EXISTS {TIER_AUDIT_TABLE} (id TEXT PRIMARY KEY, data TEXT NOT NULL)"
+        )
         self._conn.commit()
 
         # Monotonic change counter — the version-token prefix and the merge clock.
@@ -140,6 +159,32 @@ class Store:
 
     def __exit__(self, *exc: object) -> None:
         self.close()
+
+    # ── append-only governance ledger (tier_audit) ────────────────────────────
+    def append_tier_audit(self, row: Dict[str, Any], *, commit: bool = True) -> None:
+        """Append one row to the append-only ``tier_audit`` ledger. INSERT-only —
+        the ledger is never updated or deleted (no such code path exists).
+
+        ``commit=False`` STAGES the insert on the shared connection without committing,
+        so a following ``EntityStore.put`` commits BOTH in a single transaction — this
+        is how ``Spine.retier_task`` writes the tier change and its audit row
+        atomically (the ledger can never diverge from the tier it records, and a failed
+        put leaves no orphan ledger row)."""
+        self._conn.execute(
+            f"INSERT INTO {TIER_AUDIT_TABLE} (id, data) VALUES (?, ?)",
+            (row["id"], json.dumps(row, default=str)),
+        )
+        if commit:
+            self._conn.commit()
+
+    def list_tier_audit(self) -> List[Dict[str, Any]]:
+        """Every ledger row as a parsed blob, in insert order (``rowid``). No MCP tool
+        exposes this in v1 (RECORD now, render later — the read/history surface is a
+        later slice); it is the audit read path for tests and a future history tool."""
+        rows = self._conn.execute(
+            f"SELECT data FROM {TIER_AUDIT_TABLE} ORDER BY rowid"
+        ).fetchall()
+        return [json.loads(r[0]) for r in rows]
 
     # ── whole-blob sync seam (Drive sync itself is OUT of scope this slice) ────
     def dump(self) -> Dict[str, Any]:

@@ -53,11 +53,12 @@ from .projection import (  # noqa: F401
     project,
     to_card,
 )
-from .spine import ConflictError, Spine  # noqa: F401
+from .spine import RETIER_ACTOR, ConflictError, Spine  # noqa: F401
 from .storage import (  # noqa: F401
     DB_PATH,
     SCHEMA_VERSION,
     TABLES,
+    TIER_AUDIT_TABLE,
     EntityStore,
     Store,
     utcnow_iso,

@@ -1,6 +1,7 @@
-"""``Spine`` — the facade tying the four-table store, ordering, and projection
-together behind semantic write paths, and the home of the server write-admission
-checks (the Mutation Invariants).
+"""``Spine`` — the facade tying the store (four versioned entity tables + the
+append-only ``tier_audit`` ledger), ordering, and projection together behind semantic
+write paths, and the home of the server write-admission checks (the Mutation
+Invariants and the governed tier control).
 
 The ``Store`` / ``EntityStore`` layer is dumb persistence: it stamps versions and
 writes blobs, no cross-entity policy. The Spine is the "server" boundary that
@@ -17,6 +18,17 @@ admits or rejects writes:
           and ``resolve_escalation`` hard-aborts on any other actor.
 
 (There is no MI-3 — it dissolved when 'escalated' left the state enum.)
+
+GOVERNED TIER CONTROL (v0.3.0). The tier is the one field with a control gradient
+(tier 1 self-accept .. tier 4 human), so it gets governance the free edits do not:
+
+    retier_task   change an ALREADY-SET tier ONLY through an audited path — one
+                  append-only ``tier_audit`` row per change (who/when/why + whether it
+                  REDUCES oversight), written ATOMICALLY with the tier. No ``force``: a
+                  re-tier re-decides against fresh state, never clobbers.
+    write-once    ``update_task`` refuses to change a SET tier (only the untiered → N
+                  initial classification stays free) — so the governed path is the ONLY
+                  way to move a set tier, even if a client bypasses the UI.
 
 Reads return entity objects; ``cards()`` returns the projected, soft-delete-
 omitting, escalation-badged Card view.
@@ -39,6 +51,15 @@ from .entity import (
 from .ordering import append_rank
 from .projection import project
 from .storage import Store, utcnow_iso
+
+# Actor recorded on every tier_audit row. A PLACEHOLDER: every authenticated client
+# shares the single Bearer token today, so "client:bearer" is the most specific TRUE
+# attribution the server can assert (the token IS the identity — light transport-level
+# only). The audit column is typed (a plain string) to accept a per-user UUID/string
+# later with NO schema change: at Stage 2 (distinct per-user credentials) the server
+# derives the real actor from the authenticated identity and passes it to
+# ``retier_task(actor=...)`` — the parameter already exists for that seam.
+RETIER_ACTOR = "client:bearer"
 
 
 class ConflictError(Exception):
@@ -162,7 +183,12 @@ class Spine:
 
           * at least one field must be provided (all-``None`` → ``ValueError``);
           * ``tier``, when provided, must be in 1..4 (else ``ValueError``);
-          * ``title``, when provided, must be non-empty (else ``ValueError``).
+          * ``title``, when provided, must be non-empty (else ``ValueError``);
+          * WRITE-ONCE TIER: ``tier`` here may only set an UNTIERED task's INITIAL tier
+            (the free first classification). Changing an ALREADY-SET tier via update is
+            REFUSED (``ValueError`` → validation_failed) — a set tier moves only through
+            the GOVERNED, audited ``retier_task`` / ``card_retier`` path. A same-value
+            tier, or no ``tier`` at all, is unaffected.
 
         Only the provided (non-``None``) fields change; ``None`` means "leave as-is".
         Unknown ``task_id`` → ``KeyError`` (→ not_found).
@@ -173,7 +199,8 @@ class Spine:
         immutable — any edit raises ``ConflictError`` (the tombstone), even under
         ``force``. See ``_guard_mutable``. Input hygiene is validated BEFORE the
         concurrency gate, so a malformed edit is a ``ValueError`` (→ validation_failed)
-        regardless of version/tombstone."""
+        regardless of version/tombstone; the write-once tier guard, needing the current
+        tier, is the one check that runs AFTER the gate."""
         if title is None and acceptance_criteria is None and tier is None:
             raise ValueError("update_task requires at least one field to change")
         if tier is not None and not (1 <= tier <= 4):
@@ -181,6 +208,13 @@ class Spine:
         if title is not None and not title.strip():
             raise ValueError("title cannot be updated to an empty string")
         task = self._guard_mutable(task_id, expected_version=expected_version, force=force)
+        # WRITE-ONCE TIER GUARD (spec v0.3.0 §Re-tier): an already-set tier is immutable
+        # via this free edit — changing it must go through the governed, audited
+        # card_retier path. Initial classification (untiered → N) stays free; a same-tier
+        # patch (or none) is unaffected. Server-side, so it holds even if a client
+        # bypasses the UI that only *suggested* the lock.
+        if tier is not None and task.tier is not None and tier != task.tier:
+            raise ValueError("tier is write-once; use card_retier to change a set tier")
         if title is not None:
             task.title = title
         if acceptance_criteria is not None:
@@ -229,6 +263,78 @@ class Spine:
         immutable. See ``_guard_mutable``."""
         task = self._guard_mutable(task_id, expected_version=expected_version, force=False)
         task.deleted_at = utcnow_iso()
+        return self.store.tasks.put(task)
+
+    # ── governed re-tier (audited control) ─────────────────────────────────────
+    def retier_task(
+        self,
+        task_id: str,
+        new_tier: int,
+        *,
+        reason: str,
+        expected_version: Optional[str] = None,
+        actor: str = RETIER_ACTOR,
+    ) -> Task:
+        """Governed re-tier (kanbantt-mcp-spec v0.3.0 §Re-tier): change a task's
+        ALREADY-SET tier to a DIFFERENT valid tier, atomically recording one append-only
+        ``tier_audit`` row. UNLIKE the free operator edits this is a GOVERNED control —
+        the change is audited (who / when / why, and whether it REDUCES oversight) and
+        has NO ``force``: a re-tier always runs against FRESH state. A version mismatch
+        raises ``ConflictError`` (re-fetch + re-decide); it NEVER clobbers.
+
+        Gate THEN invariants:
+
+          1. ``_guard_mutable`` (force always False): unknown ``task_id`` → ``KeyError``
+             (→ not_found); a TOMBSTONE → ``ConflictError`` (immutable); a supplied
+             ``expected_version`` that does not match → ``ConflictError`` carrying the
+             fresh card. Failing here writes NO audit row.
+          2. its own invariants, each → ``ValueError`` (→ validation_failed):
+             * the card must CURRENTLY be tiered — else
+               "card is untiered; set the initial tier via card_update" (RE-TIER ONLY:
+               there is no N → null clear in v1);
+             * ``new_tier`` must be in 1..4 — else out of range;
+             * ``new_tier`` must DIFFER from the current tier — else "new_tier equals
+               current tier; nothing to change" (NO no-op audit row);
+             * ``reason`` must be non-empty after ``.strip()`` — else "retier requires a
+               non-empty reason".
+
+        On success, in a SINGLE transaction (one commit): rewrite the tier (the
+        projection re-emits the ``"tier:N"`` tag; every OTHER tag is derived and left
+        untouched) AND append one ``tier_audit`` row —
+
+            reduces_control = (new_tier < old_tier)   # int 0/1; tier 1 = self-accept
+                              (weakest oversight) .. tier 4 = human (strongest), so a
+                              LOWER new tier REDUCES control
+            actor           = the authenticated-client placeholder (see ``RETIER_ACTOR``)
+            ts              = ISO-8601 UTC
+
+        Returns the re-tiered Task (freshly version-stamped). ``reason`` is recorded
+        verbatim (validated, not trimmed — the ledger preserves what was submitted)."""
+        task = self._guard_mutable(task_id, expected_version=expected_version, force=False)
+        if task.tier is None:
+            raise ValueError("card is untiered; set the initial tier via card_update")
+        if not (1 <= new_tier <= 4):
+            raise ValueError(f"new_tier must be an int in 1..4, got {new_tier!r}")
+        if new_tier == task.tier:
+            raise ValueError("new_tier equals current tier; nothing to change")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("retier requires a non-empty reason")
+
+        old_tier = task.tier
+        audit_row = {
+            "id": str(uuid.uuid4()),
+            "card_id": task.id,
+            "old_tier": old_tier,
+            "new_tier": new_tier,
+            "reduces_control": 1 if new_tier < old_tier else 0,
+            "actor": actor,
+            "reason": reason,
+            "ts": utcnow_iso(),
+        }
+        # ATOMIC: stage the ledger insert (no commit), then the task put commits BOTH in
+        # ONE transaction — the audit row can never diverge from the tier it records.
+        self.store.append_tier_audit(audit_row, commit=False)
+        task.tier = new_tier
         return self.store.tasks.put(task)
 
     # ── artifact writes (MI-1) ─────────────────────────────────────────────────

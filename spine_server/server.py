@@ -1,25 +1,32 @@
 """FastMCP wiring + the Starlette ASGI app.
 
-Advertises SEVEN tools — the read-only mirror pair (``board_get``, ``card_list``),
-the one human-gated escalation control (``escalation_resolve``), and the FOUR
+Advertises EIGHT tools — the read-only mirror pair (``board_get``, ``card_list``),
+the one human-gated escalation control (``escalation_resolve``), and the FIVE
 operator card-write tools (``card_create``, ``card_update``, ``card_move``,
-``card_delete``). With the card_* write path advertised the board is no longer a
-read-only mirror: Kanbantt gates features on advertised tool NAMES, so this surface
-now lets Kanbantt's ``canWrite`` flip (Pass 2 wires the client). Escalations still
-render from the per-card badge that rides in ``card_list`` (no ``escalation_list``
-is advertised; see the asymmetric-advertising note on ``escalation_resolve`` below).
+``card_delete``, ``card_retier``). With the card_* write path advertised the board is
+no longer a read-only mirror: Kanbantt gates features on advertised tool NAMES, so this
+surface lets Kanbantt's ``canWrite`` and ``canRetier`` flip (``canRetier`` derives true
+iff ``card_retier`` is present). Escalations still render from the per-card badge that
+rides in ``card_list`` (no ``escalation_list`` is advertised; see the
+asymmetric-advertising note on ``escalation_resolve`` below).
 
-Two write-path stances coexist here, DELIBERATELY asymmetric:
+Three write-path stances coexist here, DELIBERATELY asymmetric:
 
-  * ``escalation_resolve`` is GOVERNED — a human control override. The actor is
-    derived from the AUTHENTICATED CREDENTIAL, never the payload, and is re-asserted
-    operator-only at the Spine (see the actor-invariant comment on the tool).
-  * the ``card_*`` tools are UNGOVERNED operator edits — direct state/field puts with
-    NO transition-legality check and NO actor field. The operator is the tier-4
-    human; these tools are the operator's hand, authenticated by the single Bearer
-    token (the token IS the attribution — light transport-level only). ``card_delete``
-    is a SOFT delete (a recoverable tombstone; the row is retained, hidden from the
-    board). The governed *agent* write path is a separate v2 concern.
+  * ``escalation_resolve`` is GOVERNED + HUMAN-GATED — a human control override. The
+    actor is derived from the AUTHENTICATED CREDENTIAL, never the payload, and is
+    re-asserted operator-only at the Spine (see the actor-invariant comment on the tool).
+  * ``card_create`` / ``card_update`` / ``card_move`` / ``card_delete`` are UNGOVERNED
+    operator edits — direct state/field puts with NO transition-legality check and NO
+    actor field. The operator is the tier-4 human; these tools are the operator's hand,
+    authenticated by the single Bearer token (the token IS the attribution — light
+    transport-level only). ``card_delete`` is a SOFT delete (a recoverable tombstone;
+    the row is retained, hidden from the board).
+  * ``card_retier`` is GOVERNED but NOT human-gated — the one card_* write that is
+    AUDITED. It changes an already-set tier (the field with a control gradient) only via
+    an append-only ``tier_audit`` row written ATOMICALLY with the change, takes NO force,
+    and records a (placeholder) actor; ``card_update`` enforces the matching WRITE-ONCE
+    tier guard so a set tier cannot be changed off this audited path. The governed
+    *agent* write path is a separate v2 concern.
 """
 
 from __future__ import annotations
@@ -376,6 +383,57 @@ def build_server(config: ServerConfig) -> FastMCP:
             # Spec: card_delete returns { card } (the tombstone). The board projection
             # omits a tombstone, so render it via the shared tombstone lens.
             return ok_result({"card": tombstone_card(task)})
+
+    # ── governed re-tier (audited; the matching write-once guard lives in card_update) ─
+    @mcp.tool(
+        name="card_retier",
+        description=(
+            "Re-tier an operator card: change an ALREADY-SET tier to a different valid "
+            "tier (1..4), recording an append-only governance audit row. A GOVERNED "
+            "write — reason is required (non-empty); expected_version is required "
+            "(optimistic concurrency); there is NO force (a re-tier re-decides against "
+            "fresh state, never clobbers)."
+        ),
+        structured_output=False,
+    )
+    def card_retier(
+        id: str,
+        new_tier: str,
+        expected_version: str,
+        reason: str,
+    ) -> types.CallToolResult:
+        # new_tier rides as the "tier:N" tag-id string the projection emits and the board
+        # declares — the SAME wire form as card_update's patch.tier — parsed to the
+        # internal int via _patch_tier_to_int. The 1..4 RANGE and every re-tier invariant
+        # (currently-tiered, differs-from-current, non-empty reason) live in
+        # Spine.retier_task (one source of truth): a value not parseable to a tier here is
+        # validation_failed.
+        try:
+            tier_int = _patch_tier_to_int(new_tier)
+        except ValueError as exc:
+            return domain_error_result(VALIDATION_FAILED, str(exc), {"id": id})
+        # ACTOR: card_retier deliberately takes NO actor parameter, so a client cannot set
+        # it via the payload. The Spine injects the authenticated-client placeholder
+        # (RETIER_ACTOR); at Stage 2 (per-user credentials) derive the real actor from the
+        # authenticated identity and pass retier_task(actor=...). This mirrors the
+        # escalation_resolve actor stance MINUS the operator-only invariant — any
+        # authenticated client may re-tier, because the audit row (not a gate) is the
+        # control here.
+        with Store(config.db_path) as store:
+            spine = Spine(store)
+            try:
+                task = spine.retier_task(
+                    id, tier_int, reason=reason, expected_version=expected_version
+                )
+            except KeyError:
+                return domain_error_result(NOT_FOUND, f"task {id!r} does not exist", {"id": id})
+            except ConflictError as exc:
+                return _conflict_result(exc.current, store)
+            except ValueError as exc:
+                # untiered card / tier out of range / no-op same tier / empty reason.
+                return domain_error_result(VALIDATION_FAILED, str(exc), {"id": id})
+            card = project([task], store.escalations.list_all())[0]
+            return ok_result({"card": card})
 
     # ASYMMETRIC-ADVERTISING / DEFERRED CAPABILITY GAP (deliberate, NOT permanent):
     # escalation_resolve is advertised WITHOUT a matching escalation_list query. The
