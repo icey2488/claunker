@@ -9,8 +9,12 @@ admits or rejects writes:
     MI-1  No late children on a tombstoned parent. ``create_artifact`` /
           ``create_escalation`` reject a ``task_id`` that resolves to a
           soft-deleted Task (and, as referential hygiene, an absent Task).
-    MI-2  Resolving an escalation sets ``resolved_at`` in a single put — one
-          write, no paired Task.state transition (escalation is not a state).
+    MI-2  Resolving an escalation records the human decision (``resolution``,
+          ``resolution_rationale``, ``actor``) and stamps ``resolved_at`` in a
+          single put — one write, no paired Task.state transition (escalation is
+          not a state). The resolving ``actor`` is an operator-only invariant: the
+          server derives it from the authenticated credential, never the payload,
+          and ``resolve_escalation`` hard-aborts on any other actor.
 
 (There is no MI-3 — it dissolved when 'escalated' left the state enum.)
 
@@ -168,13 +172,53 @@ class Spine:
         )
         return self.store.escalations.put(escalation)
 
-    def resolve_escalation(self, escalation_id: str, *, resolved_at: Optional[str] = None) -> Escalation:
-        """MI-2: set ``resolved_at`` in a single put. No paired Task.state change —
-        'escalated' is not a state, so this is a trivial single-field write."""
+    def resolve_escalation(
+        self,
+        escalation_id: str,
+        *,
+        resolution: str,
+        resolution_rationale: str,
+        actor: str,
+        resolved_at: Optional[str] = None,
+    ) -> Escalation:
+        """MI-2: resolve an escalation in a single put — record the human decision
+        (``resolution`` + ``resolution_rationale`` + ``actor``) and stamp
+        ``resolved_at``. Still one write with NO paired Task.state change
+        ('escalated' is not a state). The persisted escalation IS the override
+        receipt, so it records WHO resolved it.
+
+        This is a human-gated control override, so it validates HARD:
+
+          * ``resolution`` ∈ {'approve','deny'}        else ``ValueError``
+            (→ ``validation_failed`` at the tool layer).
+          * ``resolution_rationale``: a string with >=10 chars after ``.strip()``
+            else ``ValueError`` — a SEMANTIC floor (a justification, not merely a
+            non-empty string).
+          * ``actor`` == 'operator'                     else ``PermissionError`` —
+            the ACTOR INVARIANT (→ ``unauthorized`` at the tool layer). ``actor`` is
+            NOT a free client parameter: the server derives it from the
+            authenticated credential, and the only credential today is the operator
+            token. A future agent credential (the v2 write path) must be REFUSED
+            here. This is a hard-abort, deliberately distinct from the ordinary
+            argument ``ValueError``s, so a stolen/forged actor never reaches the
+            store even when the value arguments are well-formed.
+
+        An unknown ``escalation_id`` raises ``KeyError`` (→ ``not_found``)."""
+        if resolution not in ("approve", "deny"):
+            raise ValueError(f"resolution must be 'approve' or 'deny', got {resolution!r}")
+        if not isinstance(resolution_rationale, str) or len(resolution_rationale.strip()) < 10:
+            raise ValueError("resolution_rationale must be a string of >=10 non-whitespace characters")
+        if actor != "operator":
+            raise PermissionError(
+                f"actor {actor!r} may not resolve escalations (operator-only invariant)"
+            )
         escalation = self.store.escalations.get(escalation_id)
         if escalation is None:
             raise KeyError(f"escalation {escalation_id!r} does not exist")
         escalation.resolved_at = resolved_at or utcnow_iso()
+        escalation.resolution = resolution
+        escalation.resolution_rationale = resolution_rationale
+        escalation.actor = actor
         return self.store.escalations.put(escalation)
 
     # ── admission helpers ──────────────────────────────────────────────────────

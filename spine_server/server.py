@@ -1,10 +1,17 @@
 """FastMCP wiring + the Starlette ASGI app.
 
-Advertises EXACTLY two tools — ``board_get`` and ``card_list``. Advertising only
-these is deliberate: Kanbantt gates features on advertised tool names, so with no
-write/escalation/artifact/column/tag tools it treats the board as read-only and
-never tries to render escalations (which would need ``escalation_list`` /
-``escalation_resolve``). This slice is a mirror, not a controller.
+Advertises THREE tools — the read-only mirror pair (``board_get``, ``card_list``)
+PLUS exactly one human-gated mutating control, ``escalation_resolve``. This slice
+is therefore no longer a pure mirror: it is a read-only mirror plus a single,
+narrow write path (an operator approve/deny on an escalation). Kanbantt still gates
+features on advertised tool NAMES — with no card_*/column/tag/artifact write tools
+the board stays a read-only mirror, and it renders escalations from the per-card
+badge that already rides in ``card_list`` (no ``escalation_list`` is advertised;
+see the asymmetric-advertising note on the tool below).
+
+The actor that performs the mutation is derived from the AUTHENTICATED CREDENTIAL,
+never from the request payload — see the actor-invariant comment on
+``escalation_resolve``.
 """
 
 from __future__ import annotations
@@ -16,11 +23,20 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.applications import Starlette
 
+from spine import Spine, Store
+
 from .board import build_board
 from .cards import PayloadTooLarge, list_cards
 from .config import STREAMABLE_HTTP_PATH, ServerConfig, from_env
 from .http import BearerAuthMiddleware, CORSMiddleware
-from .result import PAYLOAD_TOO_LARGE, domain_error_result, ok_result
+from .result import (
+    NOT_FOUND,
+    PAYLOAD_TOO_LARGE,
+    UNAUTHORIZED,
+    VALIDATION_FAILED,
+    domain_error_result,
+    ok_result,
+)
 
 # serverInfo (arrives in the ``initialize`` handshake; Kanbantt shows it as
 # "MCP: Claunker"). The version is this server's own version — distinct from the
@@ -84,6 +100,67 @@ def build_server(config: ServerConfig) -> FastMCP:
                 {"size": exc.size, "limit": exc.limit},
             )
         return ok_result(result)
+
+    @mcp.tool(
+        name="escalation_resolve",
+        description=(
+            "Resolve an escalation: record an operator approve/deny decision with a "
+            "rationale. The one human-gated mutating control (it writes the spine)."
+        ),
+        structured_output=False,
+    )
+    def escalation_resolve(
+        id: str,
+        resolution: str,
+        resolution_rationale: str,
+    ) -> types.CallToolResult:
+        # ── ACTOR INVARIANT (security-critical) ──────────────────────────────────
+        # The actor is derived from the AUTHENTICATED CREDENTIAL, never from the
+        # payload. This tool deliberately takes NO `actor` parameter, so a client
+        # CANNOT set it via a JSON-RPC payload field — an extra `actor` field never
+        # reaches resolve_escalation. The server authenticates exactly one Bearer
+        # token (the operator token; see http.BearerAuthMiddleware), so the
+        # authenticated actor is, by construction, 'operator'. THE TOKEN IS THE ACTOR
+        # ASSERTION: an agent that steals the operator token still cannot forge a
+        # DIFFERENT actor, because resolve_escalation re-asserts actor == 'operator'
+        # and hard-aborts otherwise.
+        #
+        # TOKEN-SCOPING SEAM (v2): when distinct agent credentials exist (the v2 write
+        # path), the actor must be resolved from the authenticated identity and agent
+        # tokens MUST be refused for this tool — an agent is not 'operator'. Wire the
+        # per-credential actor here the moment a second credential is introduced.
+        actor = "operator"
+
+        # WRITABLE STORE: the read tools open a Store only to read; this tool WRITES,
+        # so it opens its own Store the way the Spine facade does (Spine(Store(path)))
+        # and the put inside resolve_escalation commits. WAL serializes writers, so
+        # this is safe alongside the read tools' connections and any other writer.
+        try:
+            with Store(config.db_path) as store:
+                resolved = Spine(store).resolve_escalation(
+                    id,
+                    resolution=resolution,
+                    resolution_rationale=resolution_rationale,
+                    actor=actor,
+                )
+        except KeyError:
+            return domain_error_result(NOT_FOUND, f"escalation {id!r} does not exist", {"id": id})
+        except PermissionError as exc:
+            # The actor invariant fired. Unreachable for the operator token today; the
+            # defense-in-depth backstop for the v2 agent-credential write path.
+            return domain_error_result(UNAUTHORIZED, str(exc), {"id": id})
+        except ValueError as exc:
+            # Bad resolution enum, or a rationale under the >=10-char semantic floor.
+            return domain_error_result(VALIDATION_FAILED, str(exc), {"id": id})
+        return ok_result({"escalation": resolved.to_dict()})
+
+    # ASYMMETRIC-ADVERTISING / DEFERRED CAPABILITY GAP (deliberate, NOT permanent):
+    # escalation_resolve is advertised WITHOUT a matching escalation_list query. The
+    # resolve payload already rides in card_list's per-card badge, so a separate list
+    # query is unnecessary for THIS slice — Kanbantt gates the resolve control on the
+    # advertised escalation_resolve name and reads the badge from card_list. At v2
+    # (multi-client / a real approval queue) realign discovery by adding escalation_list
+    # so the read and write halves of the escalation surface are symmetric again.
 
     return mcp
 

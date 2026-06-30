@@ -147,6 +147,25 @@ class Escalation(_Entity):
 
     ``reduces_control`` flags a change that *weakens* a guardrail — the field an
     approval queue prioritizes on.
+
+    The resolution triad is set together, in a single write, when the escalation
+    is resolved (``Spine.resolve_escalation``); all three are ``None`` while
+    pending:
+
+        resolution            the human decision — ``'approve'`` or ``'deny'``.
+        resolution_rationale  the operator's justification (a semantic floor of
+                              >=10 non-whitespace chars is enforced on write).
+        actor                 WHO resolved it — the resolving credential's
+                              identity. Operator-only today; this field IS the
+                              override receipt's attribution, so it is derived
+                              from the authenticated credential, NEVER from a
+                              client payload (see ``Spine.resolve_escalation`` and
+                              the ``escalation_resolve`` tool's actor invariant).
+
+    ``status`` is NOT a stored field: it stays derived from ``resolved_at``
+    (pending while ``None``, resolved once set). The projection additionally reads
+    ``resolution`` to choose the badge's three-state discriminator
+    (unresolved / denied / none).
     """
 
     id: str
@@ -154,6 +173,9 @@ class Escalation(_Entity):
     reason: str
     control_diff: Optional[Dict[str, Any]] = None
     resolved_at: Optional[str] = None
+    resolution: Optional[str] = None
+    resolution_rationale: Optional[str] = None
+    actor: Optional[str] = None
     created_at: Optional[str] = None
     version: Optional[str] = None
     deleted_at: Optional[str] = None

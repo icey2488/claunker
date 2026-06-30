@@ -5,7 +5,7 @@ and deliberately flattening. The locked v1 mapping:
 
     Task.state         → column_id    (one-to-one: six states, six columns)
     Task.tier          → a tag        ("tier:N" in the tags array)
-    unresolved escalation → a badge   (extension field; see below)
+    escalation (per card) → a badge   (three-state extension field; see below)
     gate_status        → extension field, hardcoded "COMMITTED"
     id, title, order, version, created_at → pass through
     everything else    → Card schema defaults (priority "med", empty collections,
@@ -13,11 +13,19 @@ and deliberately flattening. The locked v1 mapping:
                          update timestamp, so created_by/updated_by/updated_at
                          project as null.
 
-Escalation is ORTHOGONAL to the board column: an unresolved escalation attaches a
-``badge`` but never moves the card out of its ``state`` column (escalation is
-neither a column nor a tag). The badge carries exactly what an approval-queue
-filter needs — the escalation id, its reason, and its control_diff (which contains
-``reduces_control``).
+Escalation is ORTHOGONAL to the board column: a badge never moves the card out of
+its ``state`` column (escalation is neither a column nor a tag). The badge reduces
+ALL of a card's escalations to ONE of three states (``_badge_for``), exposed in the
+badge's ``status`` discriminator — precedence unresolved > denied > none:
+
+    unresolved  a live, not-yet-resolved escalation. {kind, status:'unresolved',
+                id, reason, control_diff} — the approval-queue affordance.
+    denied      no unresolved one, and the most-recently-resolved was a DENY.
+                {kind, status:'denied', id, reason, control_diff,
+                resolution_rationale} — a persistent kill-signal receipt.
+    none        no unresolved one, and the most-recent resolution was an APPROVE
+                (or there are no escalations). NO badge (``None``): an approved
+                control change is committed and needs no affordance.
 
 Two Claunker extension fields ride along (``gate_status``, ``badge``). The spec
 mandates unknown fields are "preserved and round-tripped, never stripped", so they
@@ -43,23 +51,53 @@ def _tags_for(task: Task) -> List[str]:
     return [f"tier:{task.tier}"] if task.tier is not None else []
 
 
-def _badge_for(escalation: Optional[Escalation]) -> Optional[Dict[str, Any]]:
-    """An unresolved escalation → the approval badge extension; else ``None``.
-    Carries the fields an approval-queue filter needs (id, reason, control_diff)."""
-    if escalation is None:
-        return None
-    return {
-        "kind": "escalation",
-        "id": escalation.id,
-        "reason": escalation.reason,
-        "control_diff": escalation.control_diff,
-    }
+def _badge_for(escalations: List[Escalation]) -> Optional[Dict[str, Any]]:
+    """Reduce ALL of one task's escalations to its single badge, or ``None``.
+
+    Three-state precedence — unresolved > denied > none:
+      * any live UNRESOLVED escalation (``resolved_at`` None, not deleted) →
+        a ``status:'unresolved'`` badge. On multiple, the OLDEST wins (min
+        ``created_at``, ``id`` tiebreak) — the one that has waited longest.
+      * else the most-recently-resolved live escalation, IF it was a DENY →
+        a ``status:'denied'`` badge carrying ``resolution_rationale`` (the
+        receipt). "Most recent" = max (``resolved_at``, ``created_at``, ``id``).
+      * else (the most-recent resolution was an approve, or there are none) →
+        ``None``. An approval commits the change; it needs no badge.
+
+    One badge per card by construction (a single dict or ``None``)."""
+    live = [e for e in escalations if e.deleted_at is None]
+
+    unresolved = [e for e in live if e.resolved_at is None]
+    if unresolved:
+        e = min(unresolved, key=lambda x: (x.created_at or "", x.id))
+        return {
+            "kind": "escalation",
+            "status": "unresolved",
+            "id": e.id,
+            "reason": e.reason,
+            "control_diff": e.control_diff,
+        }
+
+    resolved = [e for e in live if e.resolved_at is not None]
+    if resolved:
+        e = max(resolved, key=lambda x: (x.resolved_at or "", x.created_at or "", x.id))
+        if e.resolution == "deny":
+            return {
+                "kind": "escalation",
+                "status": "denied",
+                "id": e.id,
+                "reason": e.reason,
+                "control_diff": e.control_diff,
+                "resolution_rationale": e.resolution_rationale,
+            }
+    return None
 
 
-def to_card(task: Optional[Task], escalation: Optional[Escalation] = None) -> Optional[Dict[str, Any]]:
+def to_card(task: Optional[Task], badge: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
     """Project one Task to a Card dict, or ``None`` if it is soft-deleted (and thus
-    omitted from board output). ``escalation`` is the task's chosen unresolved
-    escalation (or ``None``); it sets the badge without affecting ``column_id``."""
+    omitted from board output). ``badge`` is the task's pre-computed escalation
+    badge (or ``None``) — see ``_badge_for``; it rides as an extension field and
+    never affects ``column_id``."""
     if task is None or task.deleted_at is not None:
         return None
 
@@ -85,32 +123,33 @@ def to_card(task: Optional[Task], escalation: Optional[Escalation] = None) -> Op
         "attachments": [],
         # ── Claunker extensions (preserved by the unknown-field round-trip rule) ─
         "gate_status": GATE_STATUS_COMMITTED,
-        "badge": _badge_for(escalation),
+        "badge": badge,
     }
 
 
-def _unresolved_by_task(escalations: Iterable[Escalation]) -> Dict[str, Escalation]:
-    """task_id → its chosen unresolved+live escalation. An escalation counts only
-    when ``resolved_at is None`` AND ``deleted_at is None``. On multiple, the
-    oldest (min created_at, id tiebreak) wins — the one waiting longest."""
-    chosen: Dict[str, Escalation] = {}
+def _badges_by_task(escalations: Iterable[Escalation]) -> Dict[str, Dict[str, Any]]:
+    """task_id → its single badge dict, for the tasks that earn one. Groups every
+    escalation by its task, then reduces each group to one badge via ``_badge_for``
+    (the three-state precedence). Tasks whose group reduces to ``None`` are absent."""
+    grouped: Dict[str, List[Escalation]] = {}
     for e in escalations:
-        if e.deleted_at is not None or e.resolved_at is not None:
-            continue
-        cur = chosen.get(e.task_id)
-        if cur is None or (e.created_at or "", e.id) < (cur.created_at or "", cur.id):
-            chosen[e.task_id] = e
-    return chosen
+        grouped.setdefault(e.task_id, []).append(e)
+    badges: Dict[str, Dict[str, Any]] = {}
+    for task_id, group in grouped.items():
+        badge = _badge_for(group)
+        if badge is not None:
+            badges[task_id] = badge
+    return badges
 
 
 def project(tasks: Iterable[Task], escalations: Iterable[Escalation] = ()) -> List[Dict[str, Any]]:
-    """Project tasks to the Card list: omit soft-deleted tasks, attach an approval
-    badge for any task with an unresolved escalation, and sort by ``(order, id)``
-    (the spec's stable tiebreak on an order collision)."""
-    badge_for_task = _unresolved_by_task(escalations)
+    """Project tasks to the Card list: omit soft-deleted tasks, attach each task's
+    three-state escalation badge (unresolved / denied / none; see ``_badge_for``),
+    and sort by ``(order, id)`` (the spec's stable tiebreak on an order collision)."""
+    badge_by_task = _badges_by_task(escalations)
     cards = []
     for task in tasks:
-        card = to_card(task, badge_for_task.get(task.id))
+        card = to_card(task, badge_by_task.get(task.id))
         if card is not None:
             cards.append(card)
     cards.sort(key=lambda c: (c["order"], c["id"]))

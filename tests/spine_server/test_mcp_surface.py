@@ -1,7 +1,8 @@
-"""MCP surface (via the SDK's in-memory client): exactly two tools advertised,
-serverInfo identity, structuredContent as top-level objects, and the domain-error
-shape. Async calls are driven through ``anyio.run`` inside sync test functions so no
-async test plugin is needed.
+"""MCP surface (via the SDK's in-memory client): exactly three tools advertised
+(the read-only ``board_get``/``card_list`` mirror PLUS the one mutating
+``escalation_resolve`` control), serverInfo identity, structuredContent as top-level
+objects, and the domain-error shape. Async calls are driven through ``anyio.run``
+inside sync test functions so no async test plugin is needed.
 """
 
 import os
@@ -38,13 +39,15 @@ async def _call(server, name, arguments):
         return result.isError, result.structuredContent
 
 
-def test_tools_list_advertises_exactly_board_get_and_card_list():
+def test_tools_list_advertises_board_get_card_list_and_escalation_resolve():
     directory, path = make_temp_db()
     try:
         seed(path, [{"title": "a"}])
         names = anyio.run(_tool_names, build_server(_config(path)))
-        # exactly the read-only pair — no write/escalation/artifact/column/tag tools.
-        assert sorted(names) == ["board_get", "card_list"]
+        # the read-only mirror pair PLUS the one human-gated mutating control. Still
+        # no card_*/column/tag/artifact write tools, and (deliberately) no
+        # escalation_list — the resolve payload rides in card_list's per-card badge.
+        assert sorted(names) == ["board_get", "card_list", "escalation_resolve"]
     finally:
         cleanup(directory)
 

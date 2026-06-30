@@ -3,9 +3,10 @@
 Covers the new model's required surface — per-entity store round-trip across all
 four tables, soft-delete omission (list_live + projection), opaque equality-only
 versions, LexoRank ordering, the two Mutation Invariants (MI-1 no late children on
-a tombstoned task; MI-2 resolve-escalation as a single-field write), the one-to-one
-state→column projection, the unresolved-escalation→badge rule (and its absence for
-resolved/tombstoned escalations), and the dump/load blob round-trip — adapting the
+a tombstoned task; MI-2 resolve-escalation as a single put recording the operator
+decision), the resolve validation floors + the operator-only actor invariant, the
+one-to-one state→column projection, the THREE-state escalation→badge rule
+(unresolved / denied / none), and the dump/load blob round-trip — adapting the
 surface the old event-sourced suite covered.
 
 Run (pytest):
@@ -224,35 +225,40 @@ def test_unresolved_escalation_badges_card_and_keeps_it_in_state_column():
 
     e = spine.create_escalation(t.id, "weakens egress control", control_diff=_CONTROL_DIFF, created_at=T[1])
     card = _card_for(spine, t.id)
-    # Badge present and carrying the approval-queue fields…
+    # Badge present, in the unresolved state, carrying the approval-queue fields…
     assert card["badge"] is not None
+    assert card["badge"]["status"] == "unresolved"
     assert card["badge"]["id"] == e.id
     assert card["badge"]["reason"] == "weakens egress control"
     assert card["badge"]["control_diff"]["reduces_control"] is True
     # …and the card STAYS in its state column (escalation is not a column).
     assert card["column_id"] == "dispatched"
 
-    # Resolving the escalation clears the badge (column unchanged).
-    spine.resolve_escalation(e.id)
+    # APPROVING the escalation clears the badge (an approved change is committed;
+    # the card's column is untouched).
+    spine.resolve_escalation(e.id, resolution="approve", resolution_rationale="approved after review", actor="operator")
     cleared = _card_for(spine, t.id)
     assert cleared["badge"] is None
     assert cleared["column_id"] == "dispatched"
 
 
-def test_resolved_and_tombstoned_escalations_yield_no_badge():
+def test_approved_and_tombstoned_escalations_yield_no_badge():
     spine = Spine()
     p = spine.create_project("p")
     t = spine.create_task(p.id, "x", state=State.JUDGED, created_at=T[0])
 
-    # A resolved escalation → no badge.
+    # An APPROVED escalation → no badge (the approved change is committed). (A DENIED
+    # one would badge as 'denied' — that case is covered by the three-state test.)
     resolved = spine.create_escalation(t.id, "r", created_at=T[1])
-    spine.resolve_escalation(resolved.id, resolved_at=T[2])
+    spine.resolve_escalation(resolved.id, resolution="approve", resolution_rationale="approved, looks fine", actor="operator", resolved_at=T[2])
     assert _card_for(spine, t.id)["badge"] is None
 
-    # A live unresolved one badges it…
+    # A live unresolved one badges it (status unresolved)…
     live = spine.create_escalation(t.id, "live", created_at=T[3])
-    assert _card_for(spine, t.id)["badge"]["id"] == live.id
-    # …and tombstoning that escalation clears the badge too.
+    badge = _card_for(spine, t.id)["badge"]
+    assert badge["id"] == live.id and badge["status"] == "unresolved"
+    # …and tombstoning that escalation clears the badge too (only the approved one
+    # remains, which yields no badge).
     spine.store.escalations.soft_delete(live.id)
     assert _card_for(spine, t.id)["badge"] is None
 
@@ -277,8 +283,8 @@ def test_mi1_rejects_artifact_and_escalation_on_tombstoned_task():
     _assert_raises(lambda: spine.create_artifact("ghost", ArtifactKind.DIFF, "f://3"), ValueError)
 
 
-# ── MI-2: resolving an escalation is a single-field write ───────────────────────
-def test_mi2_resolve_escalation_is_single_field_write():
+# ── MI-2: resolving an escalation is a single put, no paired state transition ──
+def test_mi2_resolve_escalation_is_a_single_put_with_no_state_transition():
     spine = Spine()
     p = spine.create_project("p")
     t = spine.create_task(p.id, "x", created_at=T[0])
@@ -286,16 +292,112 @@ def test_mi2_resolve_escalation_is_single_field_write():
     assert e.resolved_at is None
     before = e.to_dict()
 
-    resolved = spine.resolve_escalation(e.id, resolved_at=T[5])
+    resolved = spine.resolve_escalation(
+        e.id, resolution="deny", resolution_rationale="rejecting the egress weaken", actor="operator", resolved_at=T[5],
+    )
 
-    # Only resolved_at (and the version stamp) changed — no other field touched.
+    # MI-2 is ONE put that records the decision: exactly the resolution triad +
+    # resolved_at + the version stamp changed — nothing else on the escalation.
     assert resolved.resolved_at == T[5]
+    assert (resolved.resolution, resolved.actor) == ("deny", "operator")
     after = resolved.to_dict()
     changed = {k for k in after if after[k] != before[k]}
-    assert changed == {"resolved_at", "version"}, changed
+    assert changed == {"resolved_at", "resolution", "resolution_rationale", "actor", "version"}, changed
 
     # And NO paired Task.state transition (escalated is not a state).
     assert spine.get_task(t.id).state == State.CREATED
+
+
+# ── resolve_escalation: decision recorded; rationale floor + actor invariant ────
+def test_resolve_escalation_records_decision_rationale_and_actor():
+    spine = Spine()
+    p = spine.create_project("p")
+    t = spine.create_task(p.id, "x", created_at=T[0])
+
+    appr = spine.create_escalation(t.id, "loosen egress", created_at=T[1])
+    spine.resolve_escalation(appr.id, resolution="approve", resolution_rationale="reviewed and accepted", actor="operator", resolved_at=T[2])
+    got = spine.get_escalation(appr.id)
+    assert (got.resolution, got.resolution_rationale, got.actor) == ("approve", "reviewed and accepted", "operator")
+    assert got.resolved_at == T[2]
+
+    deny = spine.create_escalation(t.id, "loosen egress again", created_at=T[3])
+    spine.resolve_escalation(deny.id, resolution="deny", resolution_rationale="rejecting: weakens the guardrail", actor="operator")
+    got2 = spine.get_escalation(deny.id)
+    assert got2.resolution == "deny" and got2.resolved_at is not None  # resolved_at defaulted to now
+
+
+def test_resolve_escalation_rejects_unknown_resolution():
+    spine = Spine()
+    p = spine.create_project("p")
+    t = spine.create_task(p.id, "x", created_at=T[0])
+    e = spine.create_escalation(t.id, "why", created_at=T[1])
+    # Only 'approve'/'deny' are decisions; anything else is validation_failed (ValueError).
+    _assert_raises(lambda: spine.resolve_escalation(e.id, resolution="maybe", resolution_rationale="a long enough rationale", actor="operator"), ValueError)
+    assert spine.get_escalation(e.id).resolved_at is None  # no partial write
+
+
+def test_resolve_escalation_enforces_rationale_floor():
+    spine = Spine()
+    p = spine.create_project("p")
+    t = spine.create_task(p.id, "x", created_at=T[0])
+    e = spine.create_escalation(t.id, "why", created_at=T[1])
+    # Under 10 non-whitespace chars → ValueError (a semantic floor, not just non-empty)…
+    _assert_raises(lambda: spine.resolve_escalation(e.id, resolution="approve", resolution_rationale="too short", actor="operator"), ValueError)
+    # …and whitespace does not count toward the floor (.strip()).
+    _assert_raises(lambda: spine.resolve_escalation(e.id, resolution="approve", resolution_rationale="          ", actor="operator"), ValueError)
+    assert spine.get_escalation(e.id).resolved_at is None
+
+
+def test_resolve_escalation_enforces_operator_actor_invariant():
+    spine = Spine()
+    p = spine.create_project("p")
+    t = spine.create_task(p.id, "x", created_at=T[0])
+    e = spine.create_escalation(t.id, "why", created_at=T[1])
+    # A non-operator actor is a HARD abort (PermissionError → unauthorized), distinct
+    # from the argument ValueErrors — even with an otherwise-valid resolution+rationale.
+    _assert_raises(lambda: spine.resolve_escalation(e.id, resolution="approve", resolution_rationale="valid rationale here", actor="agent"), PermissionError)
+    assert spine.get_escalation(e.id).resolved_at is None  # nothing written
+
+
+def test_resolve_escalation_unknown_id_raises_keyerror():
+    spine = Spine()
+    _assert_raises(
+        lambda: spine.resolve_escalation("ghost", resolution="approve", resolution_rationale="valid rationale here", actor="operator"),
+        KeyError,
+    )
+
+
+# ── projection: the THREE-state escalation badge (unresolved > denied > none) ───
+def test_projection_badge_is_three_state_unresolved_denied_none():
+    spine = Spine()
+    p = spine.create_project("p")
+
+    # (1) a live unresolved escalation → status 'unresolved'.
+    t1 = spine.create_task(p.id, "unresolved", created_at=T[0])
+    spine.create_escalation(t1.id, "pending", control_diff=_CONTROL_DIFF, created_at=T[1])
+    assert _card_for(spine, t1.id)["badge"]["status"] == "unresolved"
+
+    # (2) most-recent resolution is a DENY → status 'denied', carrying the rationale receipt.
+    t2 = spine.create_task(p.id, "denied", created_at=T[0])
+    d = spine.create_escalation(t2.id, "weakens egress", control_diff=_CONTROL_DIFF, created_at=T[1])
+    spine.resolve_escalation(d.id, resolution="deny", resolution_rationale="rejecting: ghost-worker overreach", actor="operator", resolved_at=T[2])
+    badge2 = _card_for(spine, t2.id)["badge"]
+    assert badge2["status"] == "denied"
+    assert badge2["id"] == d.id
+    assert badge2["resolution_rationale"] == "rejecting: ghost-worker overreach"
+
+    # (3) most-recent resolution is an APPROVE → NO badge.
+    t3 = spine.create_task(p.id, "approved", created_at=T[0])
+    a = spine.create_escalation(t3.id, "fine", created_at=T[1])
+    spine.resolve_escalation(a.id, resolution="approve", resolution_rationale="approved, committed", actor="operator", resolved_at=T[2])
+    assert _card_for(spine, t3.id)["badge"] is None
+
+    # precedence: a NEW unresolved escalation outranks an earlier denial on the same card.
+    t4 = spine.create_task(p.id, "denied-then-reescalated", created_at=T[0])
+    d4 = spine.create_escalation(t4.id, "first", control_diff=_CONTROL_DIFF, created_at=T[1])
+    spine.resolve_escalation(d4.id, resolution="deny", resolution_rationale="denied the first attempt", actor="operator", resolved_at=T[2])
+    spine.create_escalation(t4.id, "second", created_at=T[3])  # a fresh unresolved one
+    assert _card_for(spine, t4.id)["badge"]["status"] == "unresolved"
 
 
 # ── dump / load: whole-blob sync seam round-trips losslessly ───────────────────

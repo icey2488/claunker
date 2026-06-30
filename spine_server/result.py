@@ -18,9 +18,17 @@ from typing import Any, Dict, List, Optional
 
 import mcp.types as types
 
-# Reserved domain-error codes (kanbantt-mcp-spec §Errors). For these read-only
-# tools, ``payload_too_large`` is the only realistic one.
+# Domain-error codes used by the tool surface. ``payload_too_large`` is the read
+# tools' only realistic error; the other three are the ``escalation_resolve``
+# mutation's validation / authorization / lookup codes. These now CONFORM to the
+# spec's reserved §Errors vocabulary — ``validation_failed`` / ``unauthorized`` /
+# ``not_found`` — rather than the gRPC-style ``invalid_argument`` / ``forbidden``
+# that previously sat alongside it (the divergence flagged for the v2 error-code
+# reconciliation is resolved).
 PAYLOAD_TOO_LARGE = "payload_too_large"
+NOT_FOUND = "not_found"
+VALIDATION_FAILED = "validation_failed"
+UNAUTHORIZED = "unauthorized"
 
 
 def _content(obj: Dict[str, Any]) -> List[types.TextContent]:
