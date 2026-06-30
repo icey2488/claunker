@@ -41,6 +41,28 @@ from .projection import project
 from .storage import Store, utcnow_iso
 
 
+class ConflictError(Exception):
+    """Optimistic-concurrency failure on a card-write path (``update_task`` /
+    ``move_task`` / ``soft_delete_task``). Raised when:
+
+      * the target is a TOMBSTONE — immutable, per the spec; NOT even ``force``
+        bypasses this (there is no undelete in v1); OR
+      * not ``force`` and a supplied ``expected_version`` does not equal the task's
+        current opaque ``version`` token (the spec's sole concurrency primitive,
+        compared by equality only).
+
+    Carries the FRESHLY-READ current ``Task`` so the MCP tool layer can project it
+    into the spec's ``conflict`` envelope (``meta.current``), handing Kanbantt's
+    reconcile immediate ground truth without an extra round trip."""
+
+    def __init__(self, current: Task) -> None:
+        self.current = current
+        super().__init__(
+            f"version conflict on task {current.id!r} "
+            f"(current version {current.version!r}, deleted_at={current.deleted_at!r})"
+        )
+
+
 class Spine:
     def __init__(self, store: Optional[Store] = None) -> None:
         self.store = store or Store()
@@ -130,6 +152,8 @@ class Spine:
         title: Optional[str] = None,
         acceptance_criteria: Optional[Any] = None,
         tier: Optional[int] = None,
+        expected_version: Optional[str] = None,
+        force: bool = False,
     ) -> Task:
         """Operator edit of a task's MUTABLE fields — ``title`` / ``acceptance_criteria``
         / ``tier`` — in a single get→set→put. NOT ``state`` and NOT ``order`` (those
@@ -141,14 +165,22 @@ class Spine:
           * ``title``, when provided, must be non-empty (else ``ValueError``).
 
         Only the provided (non-``None``) fields change; ``None`` means "leave as-is".
-        Unknown ``task_id`` → ``KeyError`` (→ not_found)."""
+        Unknown ``task_id`` → ``KeyError`` (→ not_found).
+
+        OPTIMISTIC CONCURRENCY (spec §Concurrency): ``expected_version`` is checked
+        against the task's current ``version`` token; on mismatch (and not ``force``)
+        a ``ConflictError`` carrying the current task is raised. A tombstoned task is
+        immutable — any edit raises ``ConflictError`` (the tombstone), even under
+        ``force``. See ``_guard_mutable``. Input hygiene is validated BEFORE the
+        concurrency gate, so a malformed edit is a ``ValueError`` (→ validation_failed)
+        regardless of version/tombstone."""
         if title is None and acceptance_criteria is None and tier is None:
             raise ValueError("update_task requires at least one field to change")
         if tier is not None and not (1 <= tier <= 4):
             raise ValueError(f"tier must be an int in 1..4, got {tier!r}")
         if title is not None and not title.strip():
             raise ValueError("title cannot be updated to an empty string")
-        task = self._require_task(task_id)
+        task = self._guard_mutable(task_id, expected_version=expected_version, force=force)
         if title is not None:
             task.title = title
         if acceptance_criteria is not None:
@@ -157,26 +189,47 @@ class Spine:
             task.tier = tier
         return self.store.tasks.put(task)
 
-    def move_task(self, task_id: str, to_state: str, *, order: Optional[str] = None) -> Task:
+    def move_task(
+        self,
+        task_id: str,
+        to_state: str,
+        *,
+        order: Optional[str] = None,
+        expected_version: Optional[str] = None,
+        force: bool = False,
+    ) -> Task:
         """Operator move: set ``state`` (the board column) and, if ``order`` is given,
         the LexoRank board position — in a single get→set→put. The move is FREE: NO
         transition-legality check (any state in ``STATES`` is accepted, adjacent or
         not), per the ratified 'manual operator edits are ungoverned' stance. Only the
         target ``to_state`` is validated (a known state, else ``ValueError``). Unknown
-        ``task_id`` → ``KeyError`` (→ not_found)."""
+        ``task_id`` → ``KeyError`` (→ not_found).
+
+        OPTIMISTIC CONCURRENCY: as ``update_task`` — ``expected_version`` is checked
+        (skippable by ``force``); a tombstone is immutable even under ``force``. The
+        ``to_state`` validation precedes the concurrency gate. See ``_guard_mutable``."""
         if to_state not in STATES:
             raise ValueError(f"unknown task state {to_state!r}")
-        task = self._require_task(task_id)
+        task = self._guard_mutable(task_id, expected_version=expected_version, force=force)
         task.state = to_state
         if order is not None:
             task.order = order
         return self.store.tasks.put(task)
 
-    def soft_delete_task(self, task_id: str) -> Task:
+    def soft_delete_task(self, task_id: str, *, expected_version: Optional[str] = None) -> Task:
         """Tombstone a task (soft delete): stamp ``deleted_at`` and re-put, so the row
         and its data are RETAINED (auditable, recoverable) while the card is omitted
-        from the board projection. Unknown ``task_id`` → ``KeyError`` (→ not_found)."""
-        return self.store.tasks.soft_delete(task_id)
+        from the board projection. Unknown ``task_id`` → ``KeyError`` (→ not_found).
+
+        OPTIMISTIC CONCURRENCY (spec §Concurrency / §Deletion): ``expected_version`` is
+        checked against the current ``version`` token; on mismatch a ``ConflictError``
+        carrying the current task is raised. Deletion has NO ``force`` — the spec's
+        deliberate asymmetry: destructive ops never get a bypass. Deleting an ALREADY-
+        tombstoned task raises ``ConflictError`` (the tombstone) — tombstones are
+        immutable. See ``_guard_mutable``."""
+        task = self._guard_mutable(task_id, expected_version=expected_version, force=False)
+        task.deleted_at = utcnow_iso()
+        return self.store.tasks.put(task)
 
     # ── artifact writes (MI-1) ─────────────────────────────────────────────────
     def create_artifact(
@@ -278,6 +331,27 @@ class Spine:
         task = self.store.tasks.get(task_id)
         if task is None:
             raise KeyError(f"task {task_id!r} does not exist")
+        return task
+
+    def _guard_mutable(self, task_id: str, *, expected_version: Optional[str], force: bool) -> Task:
+        """The shared optimistic-concurrency + tombstone-immutability gate for the
+        operator card-write paths. Returns the live task to mutate, or raises:
+
+          * ``KeyError``      — unknown ``task_id`` (→ ``not_found`` at the tool layer);
+          * ``ConflictError`` — the task is a TOMBSTONE (immutable; NOT even ``force``
+            bypasses, per the spec), OR (not ``force`` and an ``expected_version`` was
+            supplied that does not equal the current ``version`` token).
+
+        ``expected_version is None`` opts OUT of the optimistic check — the internal,
+        non-Kanbantt caller path (test fixtures / direct API use). The MCP tool layer
+        ALWAYS supplies one (it is REQUIRED on the wire), so the wire contract has no
+        silent last-write-wins. Tombstone immutability is enforced regardless of
+        ``expected_version`` or ``force``."""
+        task = self._require_task(task_id)
+        if task.deleted_at is not None:
+            raise ConflictError(task)  # tombstone: immutable — force cannot resurrect
+        if not force and expected_version is not None and task.version != expected_version:
+            raise ConflictError(task)  # optimistic-concurrency mismatch
         return task
 
     def _require_live_parent(self, task_id: str) -> Task:

@@ -18,17 +18,18 @@ from typing import Any, Dict, List, Optional
 
 import mcp.types as types
 
-# Domain-error codes used by the tool surface. ``payload_too_large`` is the read
-# tools' only realistic error; the other three are the ``escalation_resolve``
-# mutation's validation / authorization / lookup codes. These now CONFORM to the
-# spec's reserved §Errors vocabulary — ``validation_failed`` / ``unauthorized`` /
-# ``not_found`` — rather than the gRPC-style ``invalid_argument`` / ``forbidden``
-# that previously sat alongside it (the divergence flagged for the v2 error-code
-# reconciliation is resolved).
+# Domain-error codes used by the tool surface, all drawn from the spec's reserved
+# §Errors vocabulary. ``payload_too_large`` is the read tools' only realistic error;
+# ``validation_failed`` / ``unauthorized`` / ``not_found`` are the mutation paths'
+# validation / authorization / lookup codes. ``conflict`` is the card-write
+# optimistic-concurrency outcome — a version mismatch OR a write to an immutable
+# tombstone; its ``meta`` carries the FRESHLY-READ current card (spec §Concurrency:
+# "carrying the current card so the client can re-merge without an extra round trip").
 PAYLOAD_TOO_LARGE = "payload_too_large"
 NOT_FOUND = "not_found"
 VALIDATION_FAILED = "validation_failed"
 UNAUTHORIZED = "unauthorized"
+CONFLICT = "conflict"
 
 
 def _content(obj: Dict[str, Any]) -> List[types.TextContent]:

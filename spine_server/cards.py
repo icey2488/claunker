@@ -30,11 +30,16 @@ def mint_sync_token() -> str:
     return f"st_{uuid.uuid4().hex}"
 
 
-def _tombstone_card(task: Task) -> Dict[str, Any]:
+def tombstone_card(task: Task) -> Dict[str, Any]:
     """Project a soft-deleted Task to its tombstone card. Reuses ``to_card`` (on a
     copy with ``deleted_at`` cleared so the lens emits the full card) then restores
     ``deleted_at`` — so the field mapping never drifts from the live projection. No
-    approval badge: a deleted card carries no actionable affordance."""
+    approval badge: a deleted card carries no actionable affordance.
+
+    Shared with the card-write path (``server.card_delete`` returns the tombstone;
+    a ``conflict`` envelope carries it as ``meta.current``) — the board projection
+    (``project``/``to_card``) deliberately OMITS tombstones, so this is the one lens
+    that renders them, keeping that rendering in a single place."""
     card = to_card(replace(task, deleted_at=None))
     card["deleted_at"] = task.deleted_at
     return card
@@ -72,7 +77,7 @@ def list_cards(
     # with a live unresolved escalation (orthogonal to its column).
     cards = project(tasks, escalations)
     if include_deleted:
-        tombstones = [_tombstone_card(t) for t in tasks if t.deleted_at is not None]
+        tombstones = [tombstone_card(t) for t in tasks if t.deleted_at is not None]
         cards = sorted(cards + tombstones, key=lambda c: (c["order"], c["id"]))
 
     if column_id is not None:

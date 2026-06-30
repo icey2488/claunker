@@ -24,20 +24,21 @@ Two write-path stances coexist here, DELIBERATELY asymmetric:
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Dict, Optional
 
 import mcp.types as types
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.applications import Starlette
 
-from spine import Spine, Store, project
+from spine import ConflictError, Spine, Store, project
 
-from .board import build_board
-from .cards import PayloadTooLarge, list_cards
+from .board import TIER_TAG_PREFIX, build_board
+from .cards import PayloadTooLarge, list_cards, tombstone_card
 from .config import STREAMABLE_HTTP_PATH, ServerConfig, from_env
 from .http import BearerAuthMiddleware, CORSMiddleware
 from .result import (
+    CONFLICT,
     NOT_FOUND,
     PAYLOAD_TOO_LARGE,
     UNAUTHORIZED,
@@ -51,6 +52,56 @@ from .result import (
 # spec version (0.2.4) and the data schema version (1).
 SERVER_NAME = "Claunker"
 SERVER_VERSION = "0.1.0"
+
+
+def _patch_tier_to_int(value: Any) -> int:
+    """Map a ``card_update`` ``patch.tier`` wire value to the facade's internal int
+    domain. The CANONICAL wire form is the tag-id STRING the projection emits into
+    ``Card.tags`` and the board declares — ``"tier:N"`` (see
+    ``spine.projection._tags_for`` / ``board.tier_tag_id``); the spec Card has no
+    native ``tier`` field, so tier lives in ``tags`` and an operator edit round-trips
+    that EXACT representation. A bare int is also accepted, a tolerance for non-Kanbantt
+    MCP callers (and symmetry with ``card_create``'s int ``tier``). The 1..4 RANGE is
+    enforced downstream by ``Spine.update_task`` (one source of truth); a value not
+    parseable to an int here raises ``ValueError`` → ``validation_failed``."""
+    # bool is an int subclass — reject True/False, which are never a tier.
+    if isinstance(value, bool):
+        raise ValueError(f"tier must be the tag-id string 'tier:N' or an int 1..4, got {value!r}")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.startswith(TIER_TAG_PREFIX):
+        suffix = value[len(TIER_TAG_PREFIX):]
+        if suffix.isdigit():
+            return int(suffix)
+    raise ValueError(f"tier must be the tag-id string 'tier:N' or an int 1..4, got {value!r}")
+
+
+def _conflict_result(current, store: Store) -> types.CallToolResult:
+    """Build the spec's ``conflict`` envelope (spec §Concurrency) for a card-write that
+    lost the optimistic-concurrency check OR targeted an immutable tombstone.
+    ``meta.current`` is the FRESHLY-READ current Card, so Kanbantt's reconcile has
+    immediate ground truth (no extra round trip):
+
+      * a LIVE current task → the normal board projection (escalation badge included);
+      * a TOMBSTONE → its tombstone card (``cards.tombstone_card``), which the board
+        projection deliberately OMITS — but the spec REQUIRES the tombstone in
+        ``meta.current`` for a tombstone-immutability conflict.
+
+    Must be called while ``store`` is still open (it reads escalations for the live
+    badge)."""
+    if current.deleted_at is not None:
+        current_card = tombstone_card(current)
+        message = (
+            f"card {current.id!r} is a tombstone and is immutable "
+            "(no undelete in v1); re-read the board"
+        )
+    else:
+        current_card = project([current], store.escalations.list_all())[0]
+        message = (
+            f"version conflict on card {current.id!r}: it was modified since you last "
+            "read it; reconcile against meta.current and retry"
+        )
+    return domain_error_result(CONFLICT, message, {"current": current_card})
 
 
 def build_server(config: ServerConfig) -> FastMCP:
@@ -169,6 +220,19 @@ def build_server(config: ServerConfig) -> FastMCP:
     # opens its OWN writable Store (exactly as escalation_resolve does — WAL serializes
     # writers) and returns the freshly-projected Card (badge included) for the client
     # to apply. They advertise together so a later slice can wire Kanbantt's canWrite.
+    #
+    # SPEC CONFORMANCE (kanbantt-mcp-spec §Tool Contract / §Concurrency): card_update /
+    # card_move / card_delete speak the spec's exact wire shapes — keyed by `id`, a
+    # `patch` object for update, `column_id` for move — and enforce OPTIMISTIC
+    # CONCURRENCY. `expected_version` is REQUIRED on these three (the spec's "declare
+    # your violence"): a mismatch against the card's current opaque `version` token
+    # returns the `conflict` envelope (meta.current = the freshly-read current card).
+    # `force: true` (update/move ONLY) crushes the version check; card_delete has NO
+    # force — destructive ops never get a bypass. Tombstones are immutable: any of the
+    # three targeting one returns `conflict` (meta.current = the tombstone), even under
+    # force. card_create is unchanged here (its CardInput conformance is a separate
+    # pass), so it keeps its int `tier`; card_update's patch.tier rides as the "tier:N"
+    # tag-id string the projection emits (see _patch_tier_to_int).
 
     @mcp.tool(
         name="card_create",
@@ -213,71 +277,105 @@ def build_server(config: ServerConfig) -> FastMCP:
     @mcp.tool(
         name="card_update",
         description=(
-            "Edit an operator card's mutable fields (title / acceptance_criteria / tier). "
-            "A free, ungoverned operator write — NOT state or order (use card_move)."
+            "Edit an operator card's mutable fields via a Card patch (title / "
+            "acceptance_criteria / tier). A free, ungoverned operator write — NOT state "
+            "or order (use card_move). expected_version is required (optimistic "
+            "concurrency); force skips the check."
         ),
         structured_output=False,
     )
     def card_update(
-        task_id: str,
-        title: Optional[str] = None,
-        acceptance_criteria: Optional[str] = None,
-        tier: Optional[int] = None,
+        id: str,
+        patch: Dict[str, Any],
+        expected_version: str,
+        force: bool = False,
     ) -> types.CallToolResult:
-        try:
-            with Store(config.db_path) as store:
-                spine = Spine(store)
+        # Map the spec's partial-Card `patch` onto the facade's field kwargs. Only the
+        # three modeled mutable fields are honored; any other patch key is ignored
+        # (a patch touching ONLY unmodeled Card fields reduces to no change → the
+        # facade's "at least one field" validation_failed). `tier` rides as the
+        # "tier:N" tag-id string the projection emits, parsed to the internal int here.
+        kwargs: Dict[str, Any] = {}
+        if "title" in patch:
+            kwargs["title"] = patch["title"]
+        if "acceptance_criteria" in patch:
+            kwargs["acceptance_criteria"] = patch["acceptance_criteria"]
+        if "tier" in patch:
+            try:
+                kwargs["tier"] = _patch_tier_to_int(patch["tier"])
+            except ValueError as exc:
+                return domain_error_result(VALIDATION_FAILED, str(exc), {"id": id})
+        with Store(config.db_path) as store:
+            spine = Spine(store)
+            try:
                 task = spine.update_task(
-                    task_id,
-                    title=title,
-                    acceptance_criteria=acceptance_criteria,
-                    tier=tier,
+                    id, expected_version=expected_version, force=force, **kwargs
                 )
-                card = project([task], store.escalations.list_all())[0]
-        except KeyError:
-            return domain_error_result(NOT_FOUND, f"task {task_id!r} does not exist", {"task_id": task_id})
-        except ValueError as exc:
-            # No field given, or a bad tier.
-            return domain_error_result(VALIDATION_FAILED, str(exc), {"task_id": task_id})
-        return ok_result({"card": card})
+            except KeyError:
+                return domain_error_result(NOT_FOUND, f"task {id!r} does not exist", {"id": id})
+            except ConflictError as exc:
+                return _conflict_result(exc.current, store)
+            except ValueError as exc:
+                # No modeled field given, or a bad tier value/range.
+                return domain_error_result(VALIDATION_FAILED, str(exc), {"id": id})
+            card = project([task], store.escalations.list_all())[0]
+            return ok_result({"card": card})
 
     @mcp.tool(
         name="card_move",
         description=(
-            "Move an operator card to a state column (and optional LexoRank order). A "
-            "free, ungoverned operator write — no transition-legality check."
+            "Move an operator card to a column (a Task state) at a LexoRank order. A "
+            "free, ungoverned operator write — no transition-legality check. "
+            "expected_version is required (optimistic concurrency); force skips the check."
         ),
         structured_output=False,
     )
     def card_move(
-        task_id: str,
-        to_state: str,
-        order: Optional[str] = None,
+        id: str,
+        column_id: str,
+        order: str,
+        expected_version: str,
+        force: bool = False,
     ) -> types.CallToolResult:
-        try:
-            with Store(config.db_path) as store:
-                spine = Spine(store)
-                task = spine.move_task(task_id, to_state, order=order)
-                card = project([task], store.escalations.list_all())[0]
-        except KeyError:
-            return domain_error_result(NOT_FOUND, f"task {task_id!r} does not exist", {"task_id": task_id})
-        except ValueError as exc:
-            # Unknown target state.
-            return domain_error_result(VALIDATION_FAILED, str(exc), {"task_id": task_id})
-        return ok_result({"card": card})
+        # column_id IS the target Task state (state↔column is one-to-one); move_task
+        # validates it ∈ STATES (unknown → validation_failed, the existing case).
+        with Store(config.db_path) as store:
+            spine = Spine(store)
+            try:
+                task = spine.move_task(
+                    id, column_id, order=order, expected_version=expected_version, force=force
+                )
+            except KeyError:
+                return domain_error_result(NOT_FOUND, f"task {id!r} does not exist", {"id": id})
+            except ConflictError as exc:
+                return _conflict_result(exc.current, store)
+            except ValueError as exc:
+                # Unknown column_id (not one of the six Task states).
+                return domain_error_result(VALIDATION_FAILED, str(exc), {"id": id})
+            card = project([task], store.escalations.list_all())[0]
+            return ok_result({"card": card})
 
     @mcp.tool(
         name="card_delete",
-        description="Soft-delete an operator card: a recoverable tombstone (the row is retained, hidden from the board).",
+        description=(
+            "Soft-delete an operator card: a recoverable tombstone (the row is retained, "
+            "hidden from the board). Returns the tombstone card. expected_version is "
+            "required and has NO force — destructive ops never bypass the version check."
+        ),
         structured_output=False,
     )
-    def card_delete(task_id: str) -> types.CallToolResult:
-        try:
-            with Store(config.db_path) as store:
-                Spine(store).soft_delete_task(task_id)
-        except KeyError:
-            return domain_error_result(NOT_FOUND, f"task {task_id!r} does not exist", {"task_id": task_id})
-        return ok_result({"id": task_id})
+    def card_delete(id: str, expected_version: str) -> types.CallToolResult:
+        with Store(config.db_path) as store:
+            spine = Spine(store)
+            try:
+                task = spine.soft_delete_task(id, expected_version=expected_version)
+            except KeyError:
+                return domain_error_result(NOT_FOUND, f"task {id!r} does not exist", {"id": id})
+            except ConflictError as exc:
+                return _conflict_result(exc.current, store)
+            # Spec: card_delete returns { card } (the tombstone). The board projection
+            # omits a tombstone, so render it via the shared tombstone lens.
+            return ok_result({"card": tombstone_card(task)})
 
     # ASYMMETRIC-ADVERTISING / DEFERRED CAPABILITY GAP (deliberate, NOT permanent):
     # escalation_resolve is advertised WITHOUT a matching escalation_list query. The
