@@ -238,6 +238,20 @@ def test_tier_projects_to_a_tag():
     assert _card_for(spine, tiered.id)["tags"] == ["tier:4"]
 
 
+def test_acceptance_criteria_echoes_into_the_card_lens():
+    spine = Spine()
+    p = spine.create_project("p")
+    # Unset → the key is present (the lens always carries it) and projects as None.
+    bare = spine.create_task(p.id, "bare", created_at=T[0])
+    bare_card = _card_for(spine, bare.id)
+    assert "acceptance_criteria" in bare_card
+    assert bare_card["acceptance_criteria"] is None
+    # A set value round-trips through the projection unchanged.
+    criteria = ["compiles", "tests pass"]
+    withac = spine.create_task(p.id, "withac", acceptance_criteria=criteria, created_at=T[1])
+    assert _card_for(spine, withac.id)["acceptance_criteria"] == criteria
+
+
 # ── escalation → badge (orthogonal to the state column) ────────────────────────
 def test_unresolved_escalation_badges_card_and_keeps_it_in_state_column():
     spine = Spine()

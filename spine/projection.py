@@ -5,6 +5,9 @@ and deliberately flattening. The locked v1 mapping:
 
     Task.state         → column_id    (one-to-one: six states, six columns)
     Task.tier          → a tag        ("tier:N" in the tags array)
+    acceptance_criteria → echoed      (a direct Task-field copy; not a native
+                         kanbantt Card field, so it survives via the unknown-field
+                         round-trip rule, letting a card_update read its own write back)
     escalation (per card) → a badge   (three-state extension field; see below)
     gate_status        → extension field, hardcoded "COMMITTED"
     id, title, order, version, created_at → pass through
@@ -106,6 +109,7 @@ def to_card(task: Optional[Task], badge: Optional[Dict[str, Any]] = None) -> Opt
         "id": task.id,
         "title": task.title,
         "description": "",
+        "acceptance_criteria": task.acceptance_criteria,  # echoed so a write round-trips
         "column_id": task.state,            # state → column, one-to-one
         "order": task.order,
         "tags": _tags_for(task),
