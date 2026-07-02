@@ -14,7 +14,7 @@ below exists to make it *enforced*, not merely intended.
 > real mechanism has two required halves:
 >
 > 1. **Routing — a call argument.** `tools.py` passes `provider=JUDGE_PROVIDER,
->    model=JUDGE_MODEL` (`"gemini"` / `"gemini-2.5-flash"`) explicitly on every
+>    model=JUDGE_MODEL` (`"gemini"` / `"gemini-3.5-flash"`) explicitly on every
 >    judge call. Omit these and the judge runs on Claude.
 > 2. **Authorization — a config trust gate + allowlist.** Per-plugin LLM
 >    overrides are fail-closed. `config.yaml` must grant the override AND
@@ -44,7 +44,7 @@ Confirm it loaded with `hermes plugins list` (status `enabled`) and that the
 
 ```python
 JUDGE_PROVIDER = "gemini"
-JUDGE_MODEL    = "gemini-2.5-flash"
+JUDGE_MODEL    = "gemini-3.5-flash"
 # ...
 ctx.llm.complete_structured(..., provider=JUDGE_PROVIDER, model=JUDGE_MODEL)
 ```
@@ -68,7 +68,7 @@ plugins:
         allowed_providers:
           - gemini            # load-bearing: NOT a wider list, NOT ["*"]
         allowed_models:
-          - gemini-2.5-flash  # load-bearing: the only model the gate permits
+          - gemini-3.5-flash  # load-bearing: the only model the gate permits
 ```
 
 ```ini
@@ -77,7 +77,7 @@ GEMINI_API_KEY=<your gemini key>
 ```
 
 **Do not widen the allowlist.** `allowed_providers: [gemini]` /
-`allowed_models: [gemini-2.5-flash]` is what converts "judge accidentally points
+`allowed_models: [gemini-3.5-flash]` is what converts "judge accidentally points
 at Claude" into a `PluginLlmTrustError`. The gate refusing is the safety
 property; a well-behaved model is not.
 
@@ -124,7 +124,7 @@ valid verdict" passes through the exact regression it must catch. Assert the
   to catch it; assert provider, never eyeball the verdict.
 - **Widening the allowlist.** `allowed_providers: ["*"]` or adding `anthropic`
   re-opens the exact hole the gate closes. Keep it pinned to `gemini` /
-  `gemini-2.5-flash`.
+  `gemini-3.5-flash`.
 - **`ctx.llm` signature drift.** This build's `complete_structured` is
   keyword-only: `instructions=`, `input=[...]`, `json_schema=`, `system_prompt=`,
   `provider=`, `model=`; it returns a dataclass whose parsed verdict is on

@@ -663,7 +663,7 @@ plugins:
         allowed_providers:
         - gemini
         allowed_models:
-        - gemini-2.5-flash
+        - gemini-3.5-flash
 
 # ── Claunker deterministic dispatch classifier (Phase 2 Step 2a) ────────────
 # Optional config-authorized OVERRIDE surface for the deterministic tiering core

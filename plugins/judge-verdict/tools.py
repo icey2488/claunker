@@ -22,7 +22,7 @@ from .schemas import VERDICT_OUTPUT_SCHEMA
 # model, the trust gate raises PluginLlmTrustError (a loud failure) instead of
 # quietly adjudicating on the wrong model. See references/judge-config.md.
 JUDGE_PROVIDER = "gemini"
-JUDGE_MODEL = "gemini-2.5-flash"
+JUDGE_MODEL = "gemini-3.5-flash"
 
 # The judge's standing instructions. Deliberately adversarial: its job is to
 # find reasons the work fails, not to be agreeable. Separation of duties — it
