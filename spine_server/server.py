@@ -55,10 +55,11 @@ from .result import (
 )
 
 # serverInfo (arrives in the ``initialize`` handshake; Kanbantt shows it as
-# "MCP: Claunker"). The version is this server's own version — distinct from the
-# spec version (0.2.4) and the data schema version (1).
+# "MCP: Claunker"). The version is this server's own version, aligned to the Kanbantt
+# MCP spec version it implements (0.3.0) and still distinct from the data schema
+# version (1).
 SERVER_NAME = "Claunker"
-SERVER_VERSION = "0.1.0"
+SERVER_VERSION = "0.3.0"
 
 
 def _patch_tier_to_int(value: Any) -> int:

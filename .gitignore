@@ -16,6 +16,10 @@ config.yaml
 __pycache__/
 *.pyc
 *.pyo
+.pytest_cache/
+
+# --- Virtualenv (uv-managed) ---
+.venv/
 
 # --- Runtime state / sandboxes (if this tree is ever used as a hermes home) ---
 sandboxes/

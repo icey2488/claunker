@@ -1,15 +1,17 @@
-<!-- SYNCED COPY. Canonical home: kanbantt-app/docs/kanbantt-mcp-spec.md (Kanbantt owns this contract). This copy exists so the Claunker server build can see the contract it implements. Re-sync on change. Synced 2026-06-28. -->
+<!-- SYNCED COPY. Canonical home: kanbantt-app/docs/kanbantt-mcp-spec.md (Kanbantt owns this contract). This copy exists so the Claunker server build can see the contract it implements. Re-sync on change. Synced 2026-07-01. -->
 
 # Kanbantt MCP Specification
 
-**Version:** 0.2.4
-**Date:** 2026-06-11
+**Version:** 0.3.0
+**Date:** 2026-06-30
 **Author:** Erick M. Gonzales
 **Schema Version:** 1
 **Status:** Private draft — breaking changes permitted until public release
 **Supersedes:** kanbantt-provider-spec.md v0.1.0 (REST contract, retired)
 **Parent Doc:** claunker-foundation.md
 **MCP Revision Pinned:** 2025-06-18 (verify latest before public release)
+
+**Changes in v0.3.0:** Adds `card_retier` — a governed, audited tier change — gated on the new `canRetier` capability; makes a *set* tier **write-once** on `card_update` (a set tier moves only through `card_retier`); and reserves the append-only tier-audit ledger (recorded server-side, no read API this version). The Card schema and data `schema_version` are unchanged: tier still lives as a `tier:N` tag, not a native field.
 
 ---
 
@@ -149,10 +151,20 @@ A client receiving cards with a `column_id` it cannot map MUST render them in a 
 There is no custom capabilities endpoint. Standard MCP mechanisms only:
 
 1. **`initialize`** handshake — server identity (name, version) arrives in `serverInfo`. Kanbantt displays this as the connection indicator (`MCP: Claunker`, `MCP: <name>`).
-2. **`tools/list`** — feature gating keys off advertised tool names. The escalations column renders iff `escalation_list` and `escalation_resolve` are advertised. Column-mutation tools absent ⇒ server board config is read-only to the client and column edits stay local.
+2. **`tools/list`** — feature gating keys off advertised tool names. The escalations column renders iff `escalation_list` and `escalation_resolve` are advertised. Column-mutation tools absent ⇒ server board config is read-only to the client and column edits stay local. The governed re-tier affordance renders iff `card_retier` is advertised (`canRetier`) — derived from that one tool ALONE, independent of the `card_*` write set (`canWrite`): a server may govern re-tier without offering the full board writes, or vice versa.
 3. `board_get` returns `kanbantt_schema_version` — the data schema version, deliberately separate from the MCP protocol revision.
 
 Connection flow and indicators (`Local`, `MCP: <name>`, `Local (MCP unavailable)` with retry) carry over from v0.1.0 unchanged.
+
+### Read-Only Servers (a first-class connection state)
+
+A server advertising the read surface (`board_get` + `card_list`) but **not** the four `card_*` write tools is a valid, fully supported backend — not a failed connection. Kanbantt connects, polls, and renders a **read-only mirror**; the connection indicator reads `MCP: <name> (read-only)`.
+
+- **Required for a viable connection:** `board_get` + `card_list`. A server missing either is genuinely unusable (no board to render) and connection fails as incompatible.
+- **Write affordances are feature-gated on the four `card_*` write tools** — `card_create`, `card_update`, `card_move`, `card_delete`, treated as a set. All four advertised ⇒ writes enabled (`canWrite`); any absent ⇒ the board is read-only: drag is disabled at the source (`draggable=false`), and add/edit/delete controls are suppressed. This is the same rule the column-mutation and escalation tools already follow above.
+- **Capability is detected from `tools/list`, never assumed.** A client MUST gate writes on advertised tool names, not on connection success.
+
+(The Required Tools table below lists the `card_*` tools because a *fully writable* backend needs them; their absence gates writes off per the rule here, it does not block the connection. This is Design Principle 5 — degrade by capability, never silently — applied to the card surface.)
 
 ---
 
@@ -178,9 +190,12 @@ All tool results use `structuredContent` with a **top-level object wrapper** (MC
 
 | Tool | Input | Output |
 |---|---|---|
+| `card_retier` | `{ "id": string, "new_tier": "tier:N", "expected_version": string, "reason": string }` | `{ "card": Card }` |
 | `escalation_list` | `{ "status?": "pending" \| "resolved" }` | `{ "escalations": [Escalation] }` |
 | `escalation_resolve` | `{ "id": string, "resolution": string }` | `{ "escalation": Escalation }` |
 | `artifact_list` | `{ "card_id": string }` | `{ "artifacts": [Artifact] }` |
+
+`card_retier` is the GOVERNED, audited tier change — gated on its own capability (`canRetier`), distinct from `canWrite`. It changes an already-set tier and is the ONLY way to change a set tier (see Re-tier semantics and the `card_update` write-once rule). It has NO `force`. See Re-tier below.
 
 Escalations and artifacts referencing a **tombstoned** card remain valid and retrievable (deleted work still has an audit trail). A `card_id` the server has never known returns `not_found`.
 | `column_create` / `column_update` | column shape / patch | `{ "board": Board }` |
@@ -214,10 +229,24 @@ Escalations and artifacts referencing a **tombstoned** card remain valid and ret
 - `expected_version` is REQUIRED. On mismatch the server returns a `conflict` error carrying the current card so the client can re-merge without an extra round trip.
 - `force: true` (update/move only) skips the version check. Clients MUST NOT default to force.
 - **Tombstoned cards are immutable.** Any `card_update`, `card_move`, or `card_delete` targeting a tombstone MUST fail with `conflict` (meta carries the tombstone), even with `force: true`. There is no undelete in v1; resurrection, if ever supported, is a v2 tool with its own semantics.
+- **Tier is write-once on `card_update`.** A `patch.tier` that DIFFERS from the card's current set tier MUST fail with `validation_failed` — a set tier changes only through the governed `card_retier`. The free initial classification (an untiered card → its first tier) is allowed; a same-value `patch.tier`, or a patch with no `tier` key, is unaffected. Enforced server-side, so it holds even if a client bypasses any UI lock; `force` does NOT bypass it (force gates only the version check). The check runs AFTER the not-found / tombstone / version gate, so a tombstoned or stale target is still a `conflict`, not a validation error.
 
 **Deletion:**
 - Soft-delete only at the protocol level: `card_delete` sets `deleted_at` and mints a new `version`.
 - Servers MUST retain tombstones ≥ 30 days. A client returning from a longer offline gap MUST treat local-only cards as requiring user-visible reconciliation, never silent re-create.
+
+**Re-tier (`card_retier`) — governed, audited tier change:**
+Tier is the one field with a control gradient (tier 1 = self-accept, weakest oversight … tier 4 = human, strongest), so changing a *set* tier is GOVERNED, not a free edit. `card_retier` is gated on `canRetier` (advertised iff the tool is present), independent of `canWrite`. Tier lives as a `tier:N` tag, not a native Card field — a re-tier rewrites that tag.
+
+- **Signature:** `{ id, new_tier, expected_version, reason }` → `{ card }`. `new_tier` is the `tier:N` tag id (the form the projection emits into `tags`; a client mapping an internal `tier-N` form does so at its own boundary). There is NO `column_id` and NO `force`.
+- **Concurrency:** `expected_version` is REQUIRED. A re-tier always runs against fresh state: on mismatch it returns `conflict` (meta carries the current card) — re-fetch and re-decide. There is deliberately NO `force`; a governed override never clobbers.
+- **Invariants** (each → `validation_failed`), checked AFTER the not-found / tombstone / version gate (a tombstoned or stale target is a `conflict`, not a validation error):
+  - the card MUST already be tiered — re-tier is N→M only; there is NO N→null clear in v1 (set the initial tier via `card_update`);
+  - `new_tier` MUST be a valid tier (1..4);
+  - `new_tier` MUST differ from the current tier — a no-op is rejected and writes NO audit row;
+  - `reason` MUST be non-empty after trimming.
+- **Audit (record now, render later):** on success the server appends exactly ONE row to an append-only tier-audit ledger, ATOMICALLY with the tier change: `{ card_id, old_tier, new_tier, reduces_control, actor, reason, ts }`. `reduces_control` is true iff `new_tier < old_tier` (a LOWER tier weakens oversight). `actor` is derived from the authenticated credential, NEVER the payload (a placeholder `client:bearer` until per-user tokens; the field accepts a per-user id later with no schema change). `ts` is ISO-8601 UTC. There is NO ledger read tool in this version — the record is written for a later history surface (see Out of Scope).
+- On success the tier tag is rewritten in place (the new `tier:N` replaces the old; every OTHER tag is untouched) and the re-projected `{ card }` is returned.
 
 ---
 
@@ -304,7 +333,7 @@ Client handling:
 - **Batch operations** — `card_batch` as a future optional tool.
 - **OAuth 2.1** — release-gating item.
 - **Attachment transfer** — schema shape reserved; no transfer tools.
-- **Audit log API** — actor fields make it buildable server-side; no protocol surface yet.
+- **Audit log API** — actor fields make it buildable server-side, and `card_retier` now WRITES an append-only tier-audit ledger; there is still no protocol READ surface (record now, render later — a history tool is a later version).
 - **CRDT / collaborative editing** — version tokens + fractional ordering cover current scenarios; CRDT is the escalation path only if live co-editing becomes a goal.
 
 ---

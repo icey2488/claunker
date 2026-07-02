@@ -1,9 +1,9 @@
-"""Claunker Spine MCP server — the read-only-mirror slice.
+"""Claunker Spine MCP server — the governed board surface.
 
 The spine data core (``spine/``) is in-process truth with no network surface. This
-package puts a real MCP server in front of it so Kanbantt can mirror the spine's
-Tasks live over its 5-second poll, read-only, in six columns — conforming to the
-Kanbantt MCP spec v0.2.4 (synced to ``docs/kanbantt-mcp-spec.md``).
+package puts a real MCP server in front of it so Kanbantt can drive the spine's
+Tasks as a board of Cards in six columns — conforming to the Kanbantt MCP spec
+v0.3.0 (synced to ``docs/kanbantt-mcp-spec.md``).
 
 Shape:
 
@@ -21,11 +21,13 @@ Shape:
                 domain-error shape (isError).
     http.py     pure-ASGI CORS + Bearer middleware (pure-ASGI so the SSE GET stream
                 is never buffered). Verbatim CORS headers; 401 at the transport.
-    server.py   FastMCP wiring: advertises EXACTLY ``board_get`` + ``card_list``
-                (read-only — no write/escalation/artifact/column/tag tools), plus
+    server.py   FastMCP wiring: advertises the eight governed tools ``board_get``,
+                ``card_list``, ``card_create``, ``card_update``, ``card_move``,
+                ``card_delete``, ``card_retier``, and ``escalation_resolve``, plus
                 ``create_app`` (the Starlette ASGI app) and ``main``.
 
-READ-ONLY: the tools open the spine store but never mutate it.
+GOVERNED: the write tools mutate the spine store under optimistic-concurrency
+version checks; ``board_get`` and ``card_list`` stay read-only.
 """
 
 from .board import (  # noqa: F401

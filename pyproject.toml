@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "claunker-spine"
-version = "0.1.0"
-description = "Claunker Spine MCP server (board_get + card_list + escalation_resolve)"
+version = "0.3.0"
+description = "Claunker Spine: a governed MCP board server (Streamable HTTP) backing Kanbantt, with 8 tools, tiered authorization, and an append-only tier-audit ledger"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -20,6 +20,16 @@ dependencies = [
 # main() in spine_server.server is no-arg and reads CLAUNKER_SPINE_* from the env.
 [project.scripts]
 claunker-spine = "spine_server.server:main"
+
+# Dev/test tooling (PEP 735). `uv sync` installs it into .venv; `uv run pytest`
+# then works with no --with injection.
+[dependency-groups]
+dev = ["pytest"]
+
+# Bare `pytest` from the repo root collects only tests/ (keeps it off the
+# plugins/judge-verdict tree, which is not a pytest suite).
+[tool.pytest.ini_options]
+testpaths = ["tests"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["spine", "spine_server"]

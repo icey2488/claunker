@@ -1,4 +1,4 @@
-"""One-way projection ``Task → Card`` (kanbantt-mcp-spec v0.2.4 Card shape).
+"""One-way projection ``Task → Card`` (kanbantt-mcp-spec v0.3.0 Card shape).
 
 A LENS, not a mirror: strictly one-directional (the spine never reads a Card back)
 and deliberately flattening. The locked v1 mapping:
