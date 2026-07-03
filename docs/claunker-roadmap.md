@@ -1,178 +1,110 @@
 # Claunker Build Roadmap — Hermes-Claunker
 
-**Status:** Active build plan
-**Date:** 2026-06-12
-**Companions:** Foundations 00–05 + the v2 index. This is the *execution* plan; the foundations are the *what and why*.
-**Governing constraint:** The local inference rig (9800X3D + RTX 3080) is not yet ordered or assembled. This roadmap is sequenced so that the rig gates as little as possible.
+**Status:** Active build plan. Originally 2026-06-12; status ledger updated 2026-07-03. Phases 0-3 are COMPLETE and the anywhere-in-world loop is closed (spine.icehunter.net live via Cloudflare Tunnel, Kanbantt connecting from the deployed web app). The remaining work is Phases 4-7 plus a short punch list.
+**Companions:** Foundations 00-05 + the v2 index, the Phase 2 build plan v3, the storage/schema ratifications, the Phase 1 findings log. This is the *execution* plan; the foundations are the *what and why*.
+**Governing constraint (original):** the local inference rig (9800X3D + RTX 3080) gates only Phases 6-7. That sequencing held: everything through Phase 3 shipped with no rig.
+
+---
+
+## 0. Status ledger (2026-07-03)
+
+| Phase | Status | Evidence |
+|---|---|---|
+| 0 — Chassis + stand-in executor | **DONE** | Gateway confirmation closed (findings log, 2026-06-13) |
+| 1 — Judge loop | **DONE** | Live loop + honest defect ledger (FT-001..013, RC-001); FT-003/007/009 all RESOLVED with red-on-violation tests |
+| 2 — MCP spine | **DONE** | Abort + classifier core (observe-only) + executor allowlist + spine server 127/127; storage/schema ratified; spine repo at spec v0.3.0, cleanup commit 753fba9 |
+| 3 — Kanbantt integration | **DONE** | Live client 143/143 → production persistence port → write-through (c00c1b0) → card_retier + Unlock-to-re-tier (e6991ae, 59c8d10) → escalation resolve UI + structured control_diff renderer → read-only spine support → Connection settings BYO-spine (1d709b6) → CSP blast door (cb3cb82). Board-creates-spine-task and spine-task-renders-as-card both hold; the Phase 3 done-when is satisfied in both directions |
+| First light / anywhere-in-world | **DONE 2026-07-02 03:28 PT** | cloudflared tunnel, spine.icehunter.net, firstlight token retired for a strong random credential (.env.spine-token, icacls-locked), edge matrix verified (401 bare, 8 tools via token, preflight echoes deployed origin, firstlight dead at edge); operator connected from the live site |
+| Drive auth (spine transport dependency) | **DONE** | Rewritten to auth-code + PKCE with same-origin Cloudflare Pages Function (/api/auth/exchange); GIS/popup gone; top-level redirect; verified at pushed HEAD |
+| 4 — Security loop | NOT STARTED | Pre-work partially banked: FT-008 Docker grant-narrowing done, executor allowlist done, judge outage fail-safe done |
+| 5 — Downtime boundaries | NOT STARTED | |
+| 6 — Rig bring-up + executor swap | BLOCKED ON RIG | |
+| 7 — Economics + throughput | BLOCKED ON 6 | |
+
+**Classifier arming (`enforce: true`):** still observe-only, parallel + evidence-gated per the Phase 2 plan. Not a phase gate; arm when observation logs confirm tiers on real dispatches.
+
+**Post-Phase-3 board work also shipped (beyond the original roadmap's scope):** full mobile pass (Matrix compact map, Timeline frozen columns, long-press card move, tag filter collapse), sticky column headers, archival UI with purge guard + bulk sweep + Show Archive (4299489), Calendar Day view + Timeline Work Week (9535480), top-level view persistence (9cc427b), PolyForm Noncommercial 1.0.0 license (4b53d78).
+
+## 0.1 Punch list (carry-forward, before/alongside Phase 4)
+
+1. **Kanbantt cleanup arc — the one deferred item still open.** Deferred behind the Connection commit and never landed: README is still the stock Vite template at pushed HEAD, lint debt (audit counted 21), missing window guard behind two failing tests. One cleanup commit closes it.
+2. **FT-008 grant inventory refresh.** New standing grants since the last inventory: the tunnel credential (.env.spine-token), the Cloudflare Tunnel itself, the OAuth redirect URI + Pages Function secret (grant #3), the Google Fonts runtime injection noted in the CSP. Plus the two carried actions: narrow Claude Code's Desktop-wide `.claude` read grant; FT-013 judge trust-block absent→hardcoded-default backstop.
+3. **Classifier arming** per the evidence gate above.
+4. **Architecture SVG update** requested at first light (firstlight token retirement marked); confirm it landed in the corpus.
 
 ---
 
 ## 1. The key realization: the rig is not on the critical path
 
-Claunker's executor role is a **configuration value**, not a hardcoded dependency. Hermes routes `delegate_task` children to whatever `delegation.provider` / `delegation.model` names. That means the entire system can be built and tested against a **stand-in executor** now, and switched to the rig's local Ollama later with a one-line config change.
+Claunker's executor role is a **configuration value**, not a hardcoded dependency. Hermes routes `delegate_task` children to whatever `delegation.provider` / `delegation.model` names. The entire system was built and tested against a stand-in executor; the rig swap remains a config change.
 
-Of the eight phases below, **six require no rig at all** (Phases 0–5). The rig gates only Phase 6 (executor swap + relay decommission) and Phase 7 (economics validation + throughput tuning). The architecture, the loop, the MCP spine, Kanbantt, the security loop, and the downtime boundaries are all buildable and testable today.
-
-What you *cannot* validate until the rig arrives: the local-inference-first **cost economics** (free local tokens for execution volume). Everything else is provable without it.
+**Validated by events:** Phases 0-3 shipped rig-free exactly as sequenced. The only thing still deferred is the cost-economics measurement (Phase 7).
 
 ---
 
 ## 2. Executor substitution strategy
 
-During Phases 0–5, the executor role is filled by a stand-in. Recommended approach:
-
-- **Primary stand-in: a cheap hosted model** (e.g. Haiku, or an OpenRouter low-cost/free tier) as `delegation.model`. Fast iteration, zero local setup, exercises the full delegation path. Cost is real but small during development.
-- **One Ollama smoke test before the swap:** at least once before Phase 6, point `delegation.provider` at a small Ollama model on whatever current hardware exists (laptop/desktop GPU or even CPU). This proves the *Ollama provider wiring* end-to-end so the rig swap is a model change, not a first-time integration. De-risks Phase 6 to near-zero.
-
-The swap in Phase 6 is then: change two config lines, repull on real hardware, done.
-
-**Consequence to accept consciously:** developing executor-blind to cost means the cost thesis is unvalidated until Phase 7. That is fine — it is the *only* thing deferred, and it is a measurement, not a design risk.
+Stand-in executor in place through Phases 0-5. Remaining item from this section: **one Ollama smoke test before Phase 6** on current hardware, proving the Ollama provider wiring end-to-end so the rig swap is a model change, not a first-time integration.
 
 ---
 
 ## 3. Phase map
 
 ```
-        ┌─ Phase 0  CHASSIS + STAND-IN EXECUTOR ─┐   (no rig)
-        │  Hermes install · Discord · DM pairing │
-        │  Claude parent · stand-in executor     │
-        └────────────────┬───────────────────────┘
-                         │
-     ┌───────────┬───────┴───────┬───────────────┐
-     ▼           ▼               ▼               ▼
-  Phase 1     Phase 2         Phase 4         Phase 5      (all no rig,
-  JUDGE LOOP  MCP SPINE       SECURITY LOOP   DOWNTIME      parallelizable
-  judge_      Project/Task/   redteam profile mode logic    after Phase 0,
-  verdict +   Artifact/Escal  regression set  buffer/block/  bounded only by
-  orch skill  + HermesMCP     draft_policy_   urgent_only    you being one dev)
-     │        client wiring   diff + 2 logs   + override log
-     │           │
-     │           ▼
-     │        Phase 3  KANBANTT  (no rig)
-     │        MCPProvider → Claunker MCP server
-     │           │
-     └─────┬─────┘
-           ▼
-     ┌─────────────────────────────────────────┐
-     │  Phase 6  RIG BRING-UP + EXECUTOR SWAP   │  ◀── RIG REQUIRED
-     │  assemble · Ollama · swap config ·       │
-     │  gateway to rig · decommission GCP relay │
-     └────────────────┬─────────────────────────┘
-                      ▼
-     ┌─────────────────────────────────────────┐
-     │  Phase 7  ECONOMICS + THROUGHPUT         │  ◀── RIG REQUIRED
-     │  measure paid-token/task · concurrency · │
-     │  child_timeout · tool-RPC scripting      │
-     └─────────────────────────────────────────┘
+ Phase 0 CHASSIS ──────────────────────────────── DONE
+ Phase 1 JUDGE LOOP ───────────────────────────── DONE
+ Phase 2 MCP SPINE ────────────────────────────── DONE (server 127/127; classifier observe-only, arming evidence-gated)
+ Phase 3 KANBANTT ─────────────────────────────── DONE (live client, write-through, BYO connect, tunnel first light)
+ Phase 4 SECURITY LOOP ────────────────────────── NEXT (no rig)
+ Phase 5 DOWNTIME BOUNDARIES ──────────────────── open (no rig, independent)
+ Phase 6 RIG BRING-UP + EXECUTOR SWAP ─────────── rig required
+ Phase 7 ECONOMICS + THROUGHPUT ───────────────── rig required, after 6
 ```
 
 ---
 
 ## 4. Phases in detail
 
-### Phase 0 — Chassis + stand-in executor · *no rig*
-**Goal:** Phone-dispatched task completes the architect → executor loop with a stand-in executor.
-- Install Hermes on the current dev machine (or the $5 VPS — either works; gateway location is decided in Phase 6).
-- Configure Claude as the parent/architect provider.
-- Set `delegation.model` to the hosted stand-in executor.
-- Wire the Discord adapter; enable DM pairing.
-- Pin the Hermes version; treat updates as deliberate events from here on.
+### Phase 0 — Chassis + stand-in executor — DONE
+Gateway confirmation closed 2026-06-13: judge beat gate-guaranteed (RC-001 allowlist), skill-loads observed, executor beat gated against accidental fallback. See the Phase 1 findings log.
 
-**Done when:** a task sent from Discord on mobile decomposes (Claude) and executes (stand-in) end-to-end, no GCP relay involved.
+### Phase 1 — The judge loop — DONE
+Full architect → executor → judge cycle live. The primary deliverable was the honest defect ledger: FT-003 (abort) fixed with a container-layer kill + RED/GREEN test; FT-007 (executor pin) closed by the delegation allowlist; FT-009 (judge outage self-verification) closed with the escalate envelope fix + 4/4 control test. FT-005 (durable judge-call provenance) still rides toward Phase 4.
 
----
+### Phase 2 — The Claunker MCP spine — DONE
+Per the Phase 2 build plan v3: abort → classifier core (observe-only) + executor allowlist → spine. Storage ratified (one Drive-durable blob, schema-dumb merge, R1-R6), four-entity schema ratified (write-once tier, structured control_diff, two-projection boundary, MI-1/2/3), convergence re-proven for the four-entity shape, MCP method surface built as a seam (127/127). Spine repo cleaned and public: README rewritten from code, spec v0.3.0, pyproject 0.3.0, commit 753fba9.
 
-### Phase 1 — The judge loop · *no rig*
-**Goal:** Full architect → executor → judge cycle on a real task.
-- Build the `judge_verdict` plugin (Gemini API; `~/.hermes/plugins/`). Input: task spec + executor output + acceptance criteria. Output: accept / revise / escalate + rationale.
-- Author the orchestration `SKILL.md`: when to fan out, what a complete work order contains, judge criteria, revision limits. Include Pitfalls + Verification sections.
-- Define the triage rule: architect self-accepts low-risk output; judge gates only substantive work (protects the latency/cost the judge would otherwise eat).
+### Phase 3 — Kanbantt integration — DONE
+The original done-when (board reflects live orchestration state; card-on-board ⟷ task-in-spine both directions) is satisfied and exceeded: MCPProvider live client with zero projection imports (proof-by-absence), production Drive persistence port, card write-through over the live spine, card_retier with write-once tier enforcement (spec v0.3.0) and the governed Unlock-to-re-tier control, escalation resolve + control_diff rendered legibly per §5.6, read-only spine servers first-class, BYO-spine Connection settings from the deployed web app (disposed-flag resurrection guards, parse-then-regex 401 classifier, unreachable strike counter), CSP blast door (script-src 'self', BYO connect-src), and the Cloudflare Tunnel closing the anywhere-in-world loop at spine.icehunter.net.
 
-**Done when:** a known task runs the full three-model loop; paid-token-per-task is measured as a baseline (will drop in Phase 7 once the executor goes local).
+### Phase 4 — Security loop scaffolding — NEXT, no rig
+Unchanged scope: `redteam` Hermes profile (isolated HERMES_HOME, fake/revoked credentials, restricted toolset, Docker backend); mirror the live gate config; fixed regression set of known-bad payloads against the live gate; `draft_policy_diff` plugin (write-blocked, layer-routed); two append-only quarantined logs; cron cadence with `cron_mode: deny` on live.
+**Banked pre-work:** Docker backend switch + grant narrowing (FT-008 structural half), executor allowlist (FT-007), judge-unavailable hard-escalate (FT-009), §5.8 controls tests. **Entry criteria before starting:** the FT-008 inventory refresh (punch list #2), FT-013 backstop, FT-004 home-channel routing decision, FT-005 durable attribution log. §5.9's red-team isolation (scoped credential + separate host, two independent boundaries) governs the sandbox design.
+**Done when:** introduce a gate hole → regression set fails loudly → `draft_policy_diff` emits a proposed fix requiring approval; the redteam profile provably cannot resolve a live credential.
 
----
+### Phase 5 — Downtime boundaries — open, no rig
+Unchanged: buffer / block / urgent_only modes on Hermes cron + gateway; "Held — outside active hours" buffering; `!urgent` / `!worksession` overrides; override audit log. Independent of Phase 4.
 
-### Phase 2 — The Claunker MCP spine · *no rig*
-**Goal:** Orchestration-domain state persisted and queryable. This is the Foundation 01 spine, and it is **not** replaced by Hermes session storage — different state.
-- Implement the MCP orchestration-state **server**: entities Project / Task / Artifact / Escalation; operations `list_projects`, `get_project`, `create_task`, `update_task`, `cancel_task`, `list_tasks`, `get_artifact`, `list_escalations`, `resolve_escalation`.
-- Wire Hermes (MCP **client**) to it.
+### Phase 6 — Rig bring-up + executor swap — RIG REQUIRED
+Unchanged: assemble rig, Ollama, swap `delegation.provider/model` (the one-line payoff), decide gateway home, migrate persona into SOUL.md, decommission the GCP relay. Prerequisite from §2: the Ollama smoke test on current hardware.
 
-**Done when:** tasks, artifacts, and escalations created during a loop persist in the spine and are queryable via Hermes's MCP client. Parallelizable with Phase 1.
-
----
-
-### Phase 3 — Kanbantt integration · *no rig*
-**Goal:** The board is the live visual surface and a tool the architect reads/writes.
-- Point Kanbantt's `MCPProvider` at the Claunker MCP server from Phase 2.
-- Capability discovery lights up the Escalations column and real-time sync.
-- Architect can read/write board state as a tool.
-
-**Done when:** board reflects live orchestration state; a card created on the board appears as a task in the spine and vice versa. Depends on Phase 2.
-
----
-
-### Phase 4 — Security loop scaffolding · *no rig*
-**Goal:** A deliberately introduced gate weakness is caught and surfaces a white-hat draft.
-- Create the `redteam` Hermes profile: isolated HERMES_HOME, **fake/revoked** credentials, restricted toolset, Docker backend. Its executor can also be the stand-in.
-- Mirror the live gate config (approvals + blocklist) into the redteam profile so it tests the real gate logic against fake creds.
-- Build the fixed **regression set** of known-bad payloads, asserted against the live gate.
-- Build the `draft_policy_diff` plugin: write-blocked, layer-routed (gate-tighten → credential-scope → prose, in that order).
-- Stand up the two append-only logs (finding log, policy diff log), both quarantined from any live-tool context.
-- Schedule cadence via cron: regression set on every gate-code change; generative red-teamer weekly + on tool/credential changes. `cron_mode: deny` on the live profile.
-
-**Done when:** introduce a gate hole → regression set fails loudly → `draft_policy_diff` emits a proposed fix you must approve before it applies; the redteam profile provably cannot resolve a live credential. Depends on Phase 0.
-
----
-
-### Phase 5 — Downtime boundaries · *no rig*
-**Goal:** Foundation 03 behavior enforced on the chassis.
-- Implement the three modes (buffer / block / urgent_only) as Claunker logic layered on Hermes cron + gateway. (Hermes supplies the timer and delivery; the mode semantics are yours.)
-- Schedule entity, escalation buffering with "Held — outside active hours" state, `!urgent` / `!worksession` overrides.
-- Override audit log.
-
-**Done when:** an off-hours task buffers and surfaces at next active time; `!urgent` overrides and the override is logged. Depends on Phase 0; independent of 1–4.
-
----
-
-### Phase 6 — Rig bring-up + executor swap · *RIG REQUIRED*
-**Goal:** Full loop runs on the local executor; relay-era prototype retired.
-- Order/assemble the rig (9800X3D + RTX 3080). Install Ollama; pull executor model(s).
-- Swap `delegation.model` / `delegation.provider` from stand-in to local Ollama (the one-line payoff).
-- Decide gateway home: on the rig directly, or on the VPS with an SSH terminal backend into the rig.
-- Migrate Claunker persona/prompt material into SOUL.md + USER.md/MEMORY.md.
-- Decommission the GCP e2-micro relay (cost saving, one less attack surface).
-
-**Done when:** a phone-dispatched task completes the full loop with the local executor and zero GCP involvement. The Phase 0 Ollama smoke test means this is a model swap, not an integration.
-
----
-
-### Phase 7 — Economics + throughput · *RIG REQUIRED*
-**Goal:** The cost thesis is validated with numbers; throughput tuned.
-- Measure paid-token-per-task with the free local executor vs the Phase 1 baseline. This is the proof of the local-inference-first thesis.
-- Size `delegate_task` concurrency to the 3080's batching headroom.
-- Tune `child_timeout_seconds` down for fast local models.
-- Apply the tool-RPC scripting pattern to serial-heavy pipelines (the Amdahl's-law fix).
-
-**Done when:** paid-token-per-task is measurably below the Phase 1 baseline and throughput is tuned to the hardware.
+### Phase 7 — Economics + throughput — RIG REQUIRED
+Unchanged: measure paid-token-per-task vs the Phase 1 baseline, size concurrency to the 3080, tune `child_timeout_seconds`, apply tool-RPC scripting to serial-heavy pipelines.
 
 ---
 
 ## 5. Sequencing guidance
 
-- **Strict prerequisites:** Phase 0 before everything. Phase 2 before Phase 3. Phases 6 → 7. The rig before 6.
-- **Parallelizable after Phase 0:** Phases 1, 2, 4, 5 have no hard ordering between them — sequence them by your interest and energy, bounded only by being one developer. Phase 1 + Phase 2 together give the most satisfying early system (a working loop with persistent state), so they're the natural first pair.
-- **Recommended order if going linearly:** 0 → 1 → 2 → 3 → 5 → 4 → (rig) → 6 → 7. Security scaffolding (4) lands late-but-before-rig deliberately: it has the most value once executors are about to get real tool access, and building it against the stand-in first is fine.
+Phases 4 and 5 remain parallelizable and rig-free. Recommended: the punch list first (it is small and mostly inventory), then Phase 4, with Phase 5 slotted by energy. The rig gates only 6 → 7.
 
 ---
 
-## 6. What the rig delay actually costs you
+## 6. What the rig delay actually costs
 
-Nothing structural. The only deferred deliverable is the **cost-economics measurement** (Phase 7), and the only deferred *quality* is final throughput tuning. You can demo a fully working Hermes-Claunker — phone dispatch, three-model adversarial loop, persistent orchestration state, live Kanbantt board, red-hat/white-hat security loop, enforced downtime — entirely on cloud + current hardware before the rig ships. When it arrives, the system gets *cheaper and faster*, not *more capable*.
-
-This is the cleanest possible position for a hardware-dependent project: hardware on the cost/perf axis, never the capability axis.
+Nothing structural, now demonstrated rather than argued: the full system (phone dispatch, three-model adversarial loop, persistent governed spine, live board reachable from anywhere) shipped on cloud + current hardware. The rig makes it cheaper and faster, not more capable.
 
 ---
 
 ## 7. Immediate next action
 
-Phase 0, step one: install Hermes on whatever machine you have now and get a single Discord-dispatched task running with Claude as parent and a hosted stand-in as executor. That one loop validates the entire chassis decision from Foundation 04 and unblocks Phases 1–5. Everything else is downstream of that working.
+Close the Kanbantt cleanup commit (punch list #1), then run the FT-008 inventory refresh (punch list #2). Those two clear the deck for Phase 4, whose entry criteria are otherwise already banked.
