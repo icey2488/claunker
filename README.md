@@ -8,7 +8,7 @@ Kanbantt renders. Authorization is tiered (tier 1 self-accept through tier 4 hum
 and every governed tier change is written to an append-only audit ledger, so who
 changed a card's oversight level, when, and why is a fact on disk rather than a guess.
 
-The wire contract is the Kanbantt MCP spec (`docs/kanbantt-mcp-spec.md`, v0.3.0).
+The wire contract is the Kanbantt MCP spec (`docs/kanbantt-mcp-spec.md`, v0.4.0).
 Kanbantt gates its features on the tool names this server advertises, so the surface
 below is also the capability declaration.
 
