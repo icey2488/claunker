@@ -11,10 +11,13 @@ stance + the spec's optimistic-concurrency model:
     (card_create is UNCHANGED by the conformance pass — its CardInput conformance is
     a separate slice — so it keeps its int ``tier`` and flat fields.)
   * card_update takes the spec shape { id, patch, expected_version, force? } and edits
-    ONLY the modeled mutable fields in the patch (title / acceptance_criteria / tier);
-    patch.tier rides as the "tier:N" tag-id string the projection emits and round-trips
-    on the FREE initial classification (untiered → N). A SET tier is WRITE-ONCE — it
-    changes only via the governed card_retier path (see test_card_retier).
+    ONLY the modeled mutable fields in the patch (title / acceptance_criteria / effort /
+    impact / tier); patch.tier rides as the "tier:N" tag-id string the projection emits
+    and round-trips on the FREE initial classification (untiered → N). A SET tier is
+    WRITE-ONCE — it changes only via the governed card_retier path (see
+    test_card_retier). effort/impact are plain ungoverned string fields with the exact
+    same "only present keys apply" treatment as acceptance_criteria — no validation, no
+    write-once semantics.
   * card_move takes { id, column_id, order, expected_version, force? } — column_id IS
     the target state, and it is FREE (moves across NON-adjacent states with no
     transition check) at the supplied LexoRank order.
@@ -363,6 +366,105 @@ def test_card_update_on_tombstone_is_conflict_even_with_force():
         assert current["id"] == task_id
         assert current["deleted_at"] is not None     # the tombstone rides in meta.current
         assert _task_on_disk(path, task_id).title == "doomed"  # untouched
+    finally:
+        cleanup(directory)
+
+
+# ── card_update — effort/impact (plain ungoverned fields, spec §Field rules) ──────
+def test_card_update_effort_and_impact_set_and_returned():
+    directory, path = make_temp_db()
+    try:
+        _, task_id = _seed_task(path)
+        ev = _version_of(path, task_id)
+        is_error, sc = anyio.run(
+            _call, build_server(_config(path)), "card_update",
+            {"id": task_id, "patch": {"effort": "high", "impact": "med"},
+             "expected_version": ev},
+        )
+        assert is_error is False
+        assert sc["card"]["effort"] == "high"
+        assert sc["card"]["impact"] == "med"
+        stored = _task_on_disk(path, task_id)
+        assert stored.effort == "high" and stored.impact == "med"
+    finally:
+        cleanup(directory)
+
+
+def test_card_update_effort_and_impact_round_trip_on_fresh_read():
+    directory, path = make_temp_db()
+    try:
+        _, task_id = _seed_task(path)
+        ev = _version_of(path, task_id)
+        anyio.run(
+            _call, build_server(_config(path)), "card_update",
+            {"id": task_id, "patch": {"effort": "low", "impact": "high"},
+             "expected_version": ev},
+        )
+        # A brand-new server/client connection, reading fresh off disk — not the
+        # immediate call_tool response — proves persistence, not just an echo.
+        cards = anyio.run(_cards, build_server(_config(path)))
+        card = next(c for c in cards if c["id"] == task_id)
+        assert card["effort"] == "low"
+        assert card["impact"] == "high"
+    finally:
+        cleanup(directory)
+
+
+def test_card_update_omitting_effort_impact_leaves_existing_values_untouched():
+    directory, path = make_temp_db()
+    try:
+        _, task_id = _seed_task(path, title="before")
+        ev = _version_of(path, task_id)
+        anyio.run(
+            _call, build_server(_config(path)), "card_update",
+            {"id": task_id, "patch": {"effort": "high", "impact": "low"},
+             "expected_version": ev},
+        )
+        ev2 = _version_of(path, task_id)
+        # A second patch touching only title — effort/impact absent from the patch
+        # entirely, must survive unchanged (same "only present keys apply" rule as
+        # acceptance_criteria).
+        is_error, sc = anyio.run(
+            _call, build_server(_config(path)), "card_update",
+            {"id": task_id, "patch": {"title": "after"}, "expected_version": ev2},
+        )
+        assert is_error is False
+        assert sc["card"]["effort"] == "high"
+        assert sc["card"]["impact"] == "low"
+        stored = _task_on_disk(path, task_id)
+        assert stored.title == "after"
+        assert stored.effort == "high" and stored.impact == "low"
+    finally:
+        cleanup(directory)
+
+
+def test_card_update_effort_impact_default_to_null_when_never_set():
+    directory, path = make_temp_db()
+    try:
+        _, task_id = _seed_task(path)
+        cards = anyio.run(_cards, build_server(_config(path)))
+        card = next(c for c in cards if c["id"] == task_id)
+        assert card["effort"] is None
+        assert card["impact"] is None
+    finally:
+        cleanup(directory)
+
+
+def test_card_update_effort_composes_with_title_in_same_patch():
+    directory, path = make_temp_db()
+    try:
+        _, task_id = _seed_task(path, title="before")
+        ev = _version_of(path, task_id)
+        is_error, sc = anyio.run(
+            _call, build_server(_config(path)), "card_update",
+            {"id": task_id, "patch": {"title": "after", "effort": "med"},
+             "expected_version": ev},
+        )
+        assert is_error is False
+        assert sc["card"]["title"] == "after"
+        assert sc["card"]["effort"] == "med"
+        stored = _task_on_disk(path, task_id)
+        assert stored.title == "after" and stored.effort == "med"
     finally:
         cleanup(directory)
 

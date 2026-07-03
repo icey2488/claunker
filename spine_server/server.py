@@ -296,9 +296,9 @@ def build_server(config: ServerConfig) -> FastMCP:
         name="card_update",
         description=(
             "Edit an operator card's mutable fields via a Card patch (title / "
-            "acceptance_criteria / tier). A free, ungoverned operator write — NOT state "
-            "or order (use card_move). expected_version is required (optimistic "
-            "concurrency); force skips the check."
+            "acceptance_criteria / effort / impact / tier). A free, ungoverned operator "
+            "write — NOT state or order (use card_move). expected_version is required "
+            "(optimistic concurrency); force skips the check."
         ),
         structured_output=False,
     )
@@ -309,7 +309,7 @@ def build_server(config: ServerConfig) -> FastMCP:
         force: bool = False,
     ) -> types.CallToolResult:
         # Map the spec's partial-Card `patch` onto the facade's field kwargs. Only the
-        # three modeled mutable fields are honored; any other patch key is ignored
+        # modeled mutable fields are honored; any other patch key is ignored
         # (a patch touching ONLY unmodeled Card fields reduces to no change → the
         # facade's "at least one field" validation_failed). `tier` rides as the
         # "tier:N" tag-id string the projection emits, parsed to the internal int here.
@@ -318,6 +318,10 @@ def build_server(config: ServerConfig) -> FastMCP:
             kwargs["title"] = patch["title"]
         if "acceptance_criteria" in patch:
             kwargs["acceptance_criteria"] = patch["acceptance_criteria"]
+        if "effort" in patch:
+            kwargs["effort"] = patch["effort"]
+        if "impact" in patch:
+            kwargs["impact"] = patch["impact"]
         if "tier" in patch:
             try:
                 kwargs["tier"] = _patch_tier_to_int(patch["tier"])

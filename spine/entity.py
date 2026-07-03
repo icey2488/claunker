@@ -124,6 +124,8 @@ class Task(_Entity):
     state: str = State.CREATED
     tier: Optional[int] = None
     acceptance_criteria: Optional[Any] = None
+    effort: Optional[str] = None
+    impact: Optional[str] = None
     order: str = ""
     created_at: Optional[str] = None
     version: Optional[str] = None

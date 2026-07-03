@@ -185,12 +185,14 @@ class Spine:
         *,
         title: Optional[str] = None,
         acceptance_criteria: Optional[Any] = None,
+        effort: Optional[str] = None,
+        impact: Optional[str] = None,
         tier: Optional[int] = None,
         expected_version: Optional[str] = None,
         force: bool = False,
     ) -> Task:
         """Operator edit of a task's MUTABLE fields — ``title`` / ``acceptance_criteria``
-        / ``tier`` — in a single get→set→put. NOT ``state`` and NOT ``order`` (those
+        / ``effort`` / ``impact`` / ``tier`` — in a single get→set→put. NOT ``state`` and NOT ``order`` (those
         move via ``move_task``). A FREE, ungoverned operator edit (the operator is the
         tier-4 human): only input hygiene is checked, never a transition policy.
 
@@ -214,7 +216,13 @@ class Spine:
         concurrency gate, so a malformed edit is a ``ValueError`` (→ validation_failed)
         regardless of version/tombstone; the write-once tier guard, needing the current
         tier, is the one check that runs AFTER the gate."""
-        if title is None and acceptance_criteria is None and tier is None:
+        if (
+            title is None
+            and acceptance_criteria is None
+            and effort is None
+            and impact is None
+            and tier is None
+        ):
             raise ValueError("update_task requires at least one field to change")
         if tier is not None and not (1 <= tier <= 4):
             raise ValueError(f"tier must be an int in 1..4, got {tier!r}")
@@ -232,6 +240,10 @@ class Spine:
             task.title = title
         if acceptance_criteria is not None:
             task.acceptance_criteria = acceptance_criteria
+        if effort is not None:
+            task.effort = effort
+        if impact is not None:
+            task.impact = impact
         if tier is not None:
             task.tier = tier
         return self.store.tasks.put(task)

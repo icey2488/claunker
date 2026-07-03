@@ -120,8 +120,8 @@ def to_card(task: Optional[Task], badge: Optional[Dict[str, Any]] = None) -> Opt
         "checklist": [],
         "due": None,
         "priority": DEFAULT_PRIORITY,
-        "effort": None,
-        "impact": None,
+        "effort": task.effort,
+        "impact": task.impact,
         "version": task.version,
         "deleted_at": None,                 # soft-deleted tasks are omitted, never projected
         "archived_at": task.archived_at,    # echoed so archive state round-trips to the client
