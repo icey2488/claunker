@@ -13,6 +13,7 @@ Usage::
                                           # task, print ONLY the new task id
     python jobcard.py done   <task_id>    # set that task's state to DELIVERED
     python jobcard.py fail   <task_id>    # set that task's state to FAILED
+    python jobcard.py delete <task_id>    # hard-remove that task's row entirely
 
 The db path follows the server's own resolution: ``$CLAUNKER_SPINE_DB`` if set,
 else the package default ``spine/spine.db``.
@@ -72,6 +73,15 @@ def cmd_fail(spine: Spine, task_id: str) -> None:
     _set_state(spine, task_id, State.FAILED)
 
 
+def cmd_delete(spine: Spine, task_id: str) -> None:
+    """Hard-remove a task's row entirely — distinct from ``done``/``fail``, which
+    only change state. Errors clearly if the id is unknown rather than no-op-ing."""
+    try:
+        spine.store.tasks.hard_delete(task_id)
+    except KeyError:
+        raise SystemExit(f"jobcard: no task with id {task_id!r} (nothing to delete)")
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         prog="jobcard", description="Log Claude Code passes as cards on the spine board."
@@ -87,6 +97,9 @@ def main(argv=None) -> int:
     p_fail = sub.add_parser("fail", help="mark a pass card FAILED")
     p_fail.add_argument("task_id", help="the task id printed by create")
 
+    p_delete = sub.add_parser("delete", help="hard-remove a pass card's row entirely")
+    p_delete.add_argument("task_id", help="the task id printed by create")
+
     args = parser.parse_args(argv)
 
     # One writable Store for the whole command; WAL serializes us against the live
@@ -99,6 +112,8 @@ def main(argv=None) -> int:
             cmd_done(spine, args.task_id)
         elif args.command == "fail":
             cmd_fail(spine, args.task_id)
+        elif args.command == "delete":
+            cmd_delete(spine, args.task_id)
     return 0
 
 

@@ -124,6 +124,16 @@ class EntityStore:
         entity.deleted_at = utcnow_iso()  # type: ignore[attr-defined]
         return self.put(entity)
 
+    def hard_delete(self, entity_id: str) -> None:
+        """Permanently remove the row — unlike ``soft_delete``, there is no
+        tombstone and no version token left behind; the id is simply gone from the
+        table. Raises ``KeyError`` if absent, so callers can't silently no-op on a
+        typo'd id."""
+        if self.get(entity_id) is None:
+            raise KeyError(f"{self._table[:-1]} {entity_id!r} does not exist")
+        self._conn.execute(f"DELETE FROM {self._table} WHERE id = ?", (entity_id,))
+        self._conn.commit()
+
 
 class Store:
     """The four-table SQLite store. ``path=":memory:"`` for tests; ``DB_PATH`` (or
