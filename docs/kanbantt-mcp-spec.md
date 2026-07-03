@@ -1,4 +1,4 @@
-<!-- SYNCED COPY. Canonical home: kanbantt-app/docs/kanbantt-mcp-spec.md (Kanbantt owns this contract). This copy exists so the Claunker server build can see the contract it implements. Re-sync on change. Synced 2026-07-01 at v0.3.0. SYNC-DIRECTION EXCEPTION: v0.4.0 (the archive surface) ORIGINATED HERE, spine-side, on 2026-07-02 — the REVERSE of the usual kanbantt→spine flow. The kanbantt canonical does not yet carry 0.4.0; it syncs FROM this copy in Pass 2. Until that back-sync lands, THIS copy is ahead of the canonical — deliberate, temporary, and stated here so the drift stays legible. -->
+<!-- SYNCED COPY. Canonical home: kanbantt-app/docs/kanbantt-mcp-spec.md (Kanbantt owns this contract). This copy exists so the Claunker server build can see the contract it implements. Re-sync on change. Bodies verified byte-identical outside this comment 2026-07-03. v0.4.0 (the archive surface) ORIGINATED spine-side on 2026-07-02 — the documented reverse-flow exception — and was back-synced to the canonical on 2026-07-02. Normal flow (kanbantt → spine re-sync on change) applies from here. -->
 
 # Kanbantt MCP Specification
 
