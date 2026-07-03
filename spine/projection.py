@@ -9,6 +9,10 @@ and deliberately flattening. The locked v1 mapping:
                          kanbantt Card field, so it survives via the unknown-field
                          round-trip rule, letting a card_update read its own write back)
     escalation (per card) → a badge   (three-state extension field; see below)
+    archived_at        → echoed       (the orthogonal archive flag, mirrored onto the
+                         Card so archive state round-trips; the DEFAULT card_list view
+                         filters archived cards out — in ``spine_server.cards`` — but
+                         the lens itself projects them: archived ≠ deleted)
     gate_status        → extension field, hardcoded "COMMITTED"
     id, title, order, version, created_at → pass through
     everything else    → Card schema defaults (priority "med", empty collections,
@@ -120,6 +124,7 @@ def to_card(task: Optional[Task], badge: Optional[Dict[str, Any]] = None) -> Opt
         "impact": None,
         "version": task.version,
         "deleted_at": None,                 # soft-deleted tasks are omitted, never projected
+        "archived_at": task.archived_at,    # echoed so archive state round-trips to the client
         "created_at": task.created_at,
         "updated_at": None,                 # v1 entities track no update timestamp
         "created_by": None,                 # v1 entities carry no actor attribution

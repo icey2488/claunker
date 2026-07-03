@@ -1,7 +1,7 @@
 """``Spine`` — the facade tying the store (four versioned entity tables + the
-append-only ``tier_audit`` ledger), ordering, and projection together behind semantic
-write paths, and the home of the server write-admission checks (the Mutation
-Invariants and the governed tier control).
+append-only ``tier_audit`` and ``archive_audit`` ledgers), ordering, and projection
+together behind semantic write paths, and the home of the server write-admission
+checks (the Mutation Invariants and the governed tier and archive controls).
 
 The ``Store`` / ``EntityStore`` layer is dumb persistence: it stamps versions and
 writes blobs, no cross-entity policy. The Spine is the "server" boundary that
@@ -29,6 +29,13 @@ GOVERNED TIER CONTROL (v0.3.0). The tier is the one field with a control gradien
     write-once    ``update_task`` refuses to change a SET tier (only the untiered → N
                   initial classification stays free) — so the governed path is the ONLY
                   way to move a set tier, even if a client bypasses the UI.
+
+GOVERNED ARCHIVE CONTROL (v0.4.0). ``archive_task`` / ``unarchive_task`` set/clear the
+orthogonal ``archived_at`` flag ONLY through an audited path — one append-only
+``archive_audit`` row per change, written atomically with the flag; loud idempotency
+(already-archived / not-archived are rejections, never silent no-ops); and an
+escalation gate on archive (an open escalation blocks it). No ``force``, same as
+re-tier.
 
 Reads return entity objects; ``cards()`` returns the projected, soft-delete-
 omitting, escalation-badged Card view.
@@ -60,6 +67,12 @@ from .storage import Store, utcnow_iso
 # derives the real actor from the authenticated identity and passes it to
 # ``retier_task(actor=...)`` — the parameter already exists for that seam.
 RETIER_ACTOR = "client:bearer"
+
+# Actor recorded on every archive_audit row — the same placeholder pattern as
+# RETIER_ACTOR, for the same reason (one shared Bearer token today; the ``actor=``
+# parameter on ``archive_task`` / ``unarchive_task`` is the Stage-2 seam for a real
+# per-credential identity).
+ARCHIVE_ACTOR = "client:bearer"
 
 
 class ConflictError(Exception):
@@ -336,6 +349,122 @@ class Spine:
         self.store.append_tier_audit(audit_row, commit=False)
         task.tier = new_tier
         return self.store.tasks.put(task)
+
+    # ── governed archive / unarchive (audited controls) ────────────────────────
+    def archive_task(
+        self,
+        task_id: str,
+        *,
+        reason: str,
+        expected_version: Optional[str] = None,
+        actor: str = ARCHIVE_ACTOR,
+    ) -> Task:
+        """Governed archive (kanbantt-mcp-spec v0.4.0 §Archive): set ``archived_at``
+        on an ACTIVE (non-archived) task, atomically recording one append-only
+        ``archive_audit`` row. Mirrors ``retier_task``'s shape verbatim: GOVERNED,
+        audited, NO ``force`` — an archive always runs against fresh state; a version
+        mismatch raises ``ConflictError`` (re-fetch + re-decide), never clobbers.
+        ``archived_at`` is ORTHOGONAL to ``state`` (not a lifecycle move — the card
+        keeps its column and merely leaves the default list view).
+
+        Gate THEN invariants:
+
+          1. ``_guard_mutable`` (force always False): unknown ``task_id`` → ``KeyError``
+             (→ not_found); a TOMBSTONE → ``ConflictError`` (immutable); a supplied
+             ``expected_version`` that does not match → ``ConflictError`` carrying the
+             fresh card. Failing here writes NO audit row.
+          2. its own invariants, each → ``ValueError`` (→ validation_failed):
+             * the task must NOT already be archived — else "already archived". LOUD
+               idempotency, deliberately: a healthy archive and a re-archive of an
+               already-archived card must not emit the same signal (sweepers filter
+               their own targets);
+             * the task must have NO OPEN escalation — else "cannot archive a task
+               with an unresolved escalation". OPEN means a live (``deleted_at is
+               None``), unresolved (``resolved_at is None``) Escalation whose
+               ``task_id`` is this task — the same predicate the projection's badge
+               uses. Archiving would bury a card awaiting human attention; resolve
+               the escalation first. (The gate applies to archive ONLY — unarchive
+               has no reason to be blocked.)
+          3. the LEDGER invariant: ``append_archive_audit`` REJECTS (``ValueError``)
+             an empty/whitespace ``reason`` before staging anything — the row-layer
+             NOT NULL. The tool layer defaults an omitted reason, so this fires only
+             on explicit garbage.
+
+        On success, in a SINGLE transaction (one commit): stage the ``archive_audit``
+        row (``{id, card_id, action: "archive", actor, reason, ts}``) with
+        ``commit=False``, stamp ``archived_at``, and ``put`` — the put commits BOTH,
+        so the ledger can never diverge from the flag it records. The put mints a
+        fresh version token (``archived_at`` rides ``content()``). Returns the
+        archived Task."""
+        task = self._guard_mutable(task_id, expected_version=expected_version, force=False)
+        if task.archived_at is not None:
+            raise ValueError(f"task {task_id!r} is already archived")
+        if self._has_open_escalation(task_id):
+            raise ValueError("cannot archive a task with an unresolved escalation")
+
+        audit_row = {
+            "id": str(uuid.uuid4()),
+            "card_id": task.id,
+            "action": "archive",
+            "actor": actor,
+            "reason": reason,
+            "ts": utcnow_iso(),
+        }
+        # ATOMIC: stage the ledger insert (no commit), then the task put commits BOTH
+        # in ONE transaction — mirroring retier_task's idiom precisely.
+        self.store.append_archive_audit(audit_row, commit=False)
+        task.archived_at = utcnow_iso()
+        return self.store.tasks.put(task)
+
+    def unarchive_task(
+        self,
+        task_id: str,
+        *,
+        reason: str,
+        expected_version: Optional[str] = None,
+        actor: str = ARCHIVE_ACTOR,
+    ) -> Task:
+        """Governed unarchive: clear ``archived_at`` on an ARCHIVED task, atomically
+        recording one append-only ``archive_audit`` row (``action: "unarchive"``).
+        Same gate-then-invariants shape as ``archive_task``:
+
+          1. ``_guard_mutable`` (no force): not_found / tombstone / stale version
+             exactly as archive — failing here writes NO audit row.
+          2. the task MUST currently be archived — else ``ValueError``
+             "not archived" (loud idempotency, same rationale as archive).
+             There is NO escalation gate on unarchive — restoring a card to view
+             never buries anything.
+          3. the ledger's non-empty-``reason`` invariant, as archive.
+
+        On success: one staged ledger row + the cleared flag, committed together by
+        the put (fresh version token — unarchiving moves it again). Returns the
+        unarchived Task."""
+        task = self._guard_mutable(task_id, expected_version=expected_version, force=False)
+        if task.archived_at is None:
+            raise ValueError(f"task {task_id!r} is not archived")
+
+        audit_row = {
+            "id": str(uuid.uuid4()),
+            "card_id": task.id,
+            "action": "unarchive",
+            "actor": actor,
+            "reason": reason,
+            "ts": utcnow_iso(),
+        }
+        self.store.append_archive_audit(audit_row, commit=False)
+        task.archived_at = None
+        return self.store.tasks.put(task)
+
+    def _has_open_escalation(self, task_id: str) -> bool:
+        """True iff the task has a live, unresolved Escalation — the archive gate's
+        predicate, built on the SAME linkage the projection badge uses
+        (``Escalation.task_id`` + ``resolved_at is None`` while pending +
+        ``deleted_at is None`` for liveness; ``resolve_escalation`` stamping
+        ``resolved_at`` is what closes one)."""
+        return any(
+            e.task_id == task_id and e.deleted_at is None and e.resolved_at is None
+            for e in self.store.escalations.list_all()
+        )
 
     # ── artifact writes (MI-1) ─────────────────────────────────────────────────
     def create_artifact(

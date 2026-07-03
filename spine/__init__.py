@@ -53,8 +53,9 @@ from .projection import (  # noqa: F401
     project,
     to_card,
 )
-from .spine import RETIER_ACTOR, ConflictError, Spine  # noqa: F401
+from .spine import ARCHIVE_ACTOR, RETIER_ACTOR, ConflictError, Spine  # noqa: F401
 from .storage import (  # noqa: F401
+    ARCHIVE_AUDIT_TABLE,
     DB_PATH,
     SCHEMA_VERSION,
     TABLES,

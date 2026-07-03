@@ -1,10 +1,10 @@
-"""MCP surface (via the SDK's in-memory client): exactly EIGHT tools advertised
+"""MCP surface (via the SDK's in-memory client): exactly TEN tools advertised
 (the read-only ``board_get``/``card_list`` mirror, the one human-gated
-``escalation_resolve`` control, and the five operator ``card_create`` /
-``card_update`` / ``card_move`` / ``card_delete`` / ``card_retier`` writes),
-serverInfo identity, structuredContent as top-level objects, and the domain-error
-shape. Async calls are driven through ``anyio.run`` inside sync test functions so no
-async plugin is needed.
+``escalation_resolve`` control, the five operator ``card_create`` /
+``card_update`` / ``card_move`` / ``card_delete`` / ``card_retier`` writes, and the
+governed ``card_archive`` / ``card_unarchive`` pair), serverInfo identity,
+structuredContent as top-level objects, and the domain-error shape. Async calls are
+driven through ``anyio.run`` inside sync test functions so no async plugin is needed.
 """
 
 import os
@@ -41,18 +41,20 @@ async def _call(server, name, arguments):
         return result.isError, result.structuredContent
 
 
-def test_tools_list_advertises_the_eight_tool_surface():
+def test_tools_list_advertises_the_ten_tool_surface():
     directory, path = make_temp_db()
     try:
         seed(path, [{"title": "a"}])
         names = anyio.run(_tool_names, build_server(_config(path)))
-        # the read-only mirror pair, the one human-gated escalation control, and the
+        # the read-only mirror pair, the one human-gated escalation control, the
         # five operator card-write tools (card_retier is the governed/audited one, which
-        # is what lets Kanbantt's canRetier derive true). (Still deliberately no
-        # escalation_list — the resolve payload rides in card_list's per-card badge.)
+        # is what lets Kanbantt's canRetier derive true), and the governed archive pair
+        # (card_archive present is what lets canArchive derive true). (Still deliberately
+        # no escalation_list — the resolve payload rides in card_list's per-card badge.)
         assert sorted(names) == sorted([
             "board_get", "card_list", "escalation_resolve",
             "card_create", "card_update", "card_move", "card_delete", "card_retier",
+            "card_archive", "card_unarchive",
         ])
     finally:
         cleanup(directory)

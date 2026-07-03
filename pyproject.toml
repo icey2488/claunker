@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "claunker-spine"
-version = "0.3.0"
-description = "Claunker Spine: a governed MCP board server (Streamable HTTP) backing Kanbantt, with 8 tools, tiered authorization, and an append-only tier-audit ledger"
+version = "0.4.0"
+description = "Claunker Spine: a governed MCP board server (Streamable HTTP) backing Kanbantt, with 10 tools, tiered authorization, and append-only tier- and archive-audit ledgers"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [

@@ -1,12 +1,14 @@
 """FastMCP wiring + the Starlette ASGI app.
 
-Advertises EIGHT tools — the read-only mirror pair (``board_get``, ``card_list``),
-the one human-gated escalation control (``escalation_resolve``), and the FIVE
+Advertises TEN tools — the read-only mirror pair (``board_get``, ``card_list``),
+the one human-gated escalation control (``escalation_resolve``), the FIVE
 operator card-write tools (``card_create``, ``card_update``, ``card_move``,
-``card_delete``, ``card_retier``). With the card_* write path advertised the board is
+``card_delete``, ``card_retier``), and the governed archive pair (``card_archive``,
+``card_unarchive``). With the card_* write path advertised the board is
 no longer a read-only mirror: Kanbantt gates features on advertised tool NAMES, so this
-surface lets Kanbantt's ``canWrite`` and ``canRetier`` flip (``canRetier`` derives true
-iff ``card_retier`` is present). Escalations still render from the per-card badge that
+surface lets Kanbantt's ``canWrite``, ``canRetier``, and ``canArchive`` flip
+(``canRetier`` derives true iff ``card_retier`` is present; ``canArchive`` iff
+``card_archive`` is). Escalations still render from the per-card badge that
 rides in ``card_list`` (no ``escalation_list`` is advertised; see the
 asymmetric-advertising note on ``escalation_resolve`` below).
 
@@ -21,12 +23,18 @@ Three write-path stances coexist here, DELIBERATELY asymmetric:
     authenticated by the single Bearer token (the token IS the attribution — light
     transport-level only). ``card_delete`` is a SOFT delete (a recoverable tombstone;
     the row is retained, hidden from the board).
-  * ``card_retier`` is GOVERNED but NOT human-gated — the one card_* write that is
-    AUDITED. It changes an already-set tier (the field with a control gradient) only via
-    an append-only ``tier_audit`` row written ATOMICALLY with the change, takes NO force,
-    and records a (placeholder) actor; ``card_update`` enforces the matching WRITE-ONCE
-    tier guard so a set tier cannot be changed off this audited path. The governed
-    *agent* write path is a separate v2 concern.
+  * ``card_retier`` is GOVERNED but NOT human-gated — AUDITED. It changes an
+    already-set tier (the field with a control gradient) only via an append-only
+    ``tier_audit`` row written ATOMICALLY with the change, takes NO force, and records
+    a (placeholder) actor; ``card_update`` enforces the matching WRITE-ONCE tier guard
+    so a set tier cannot be changed off this audited path.
+  * ``card_archive`` / ``card_unarchive`` follow ``card_retier``'s governed stance
+    verbatim: audited (one append-only ``archive_audit`` row, atomic with the flag),
+    NO force, placeholder actor. Two extra rules of their own: LOUD idempotency
+    (archiving an already-archived card, or unarchiving a non-archived one, is
+    validation_failed — healthy and broken must not emit the same signal), and the
+    ESCALATION GATE (a card with an open escalation cannot be archived; unarchive is
+    ungated). The governed *agent* write path is a separate v2 concern.
 """
 
 from __future__ import annotations
@@ -56,10 +64,10 @@ from .result import (
 
 # serverInfo (arrives in the ``initialize`` handshake; Kanbantt shows it as
 # "MCP: Claunker"). The version is this server's own version, aligned to the Kanbantt
-# MCP spec version it implements (0.3.0) and still distinct from the data schema
+# MCP spec version it implements (0.4.0) and still distinct from the data schema
 # version (1).
 SERVER_NAME = "Claunker"
-SERVER_VERSION = "0.3.0"
+SERVER_VERSION = "0.4.0"
 
 
 def _patch_tier_to_int(value: Any) -> int:
@@ -150,6 +158,7 @@ def build_server(config: ServerConfig) -> FastMCP:
         column_id: Optional[str] = None,
         tag: Optional[str] = None,
         include_deleted: bool = False,
+        include_archived: bool = False,
     ) -> types.CallToolResult:
         try:
             result = list_cards(
@@ -158,6 +167,7 @@ def build_server(config: ServerConfig) -> FastMCP:
                 column_id=column_id,
                 tag=tag,
                 include_deleted=include_deleted,
+                include_archived=include_archived,
                 max_bytes=config.max_bytes,
             )
         except PayloadTooLarge as exc:
@@ -432,6 +442,84 @@ def build_server(config: ServerConfig) -> FastMCP:
                 return _conflict_result(exc.current, store)
             except ValueError as exc:
                 # untiered card / tier out of range / no-op same tier / empty reason.
+                return domain_error_result(VALIDATION_FAILED, str(exc), {"id": id})
+            card = project([task], store.escalations.list_all())[0]
+            return ok_result({"card": card})
+
+    # ── governed archive pair (audited; mirrors card_retier's shape verbatim) ────
+    @mcp.tool(
+        name="card_archive",
+        description=(
+            "Archive an operator card: set the orthogonal archived_at flag, hiding it "
+            "from the default card_list view (NOT a delete, NOT a column move), "
+            "recording an append-only governance audit row. A GOVERNED write — "
+            "expected_version is required (optimistic concurrency); there is NO force. "
+            "An already-archived card is validation_failed (loud idempotency); a card "
+            "with an unresolved escalation cannot be archived. reason is optional "
+            "(defaults to 'manual_archive'; the audit ledger always records one)."
+        ),
+        structured_output=False,
+    )
+    def card_archive(
+        id: str,
+        expected_version: str,
+        reason: Optional[str] = None,
+    ) -> types.CallToolResult:
+        # REASON DEFAULTING (the ergonomic half of the ledger's hard non-empty-reason
+        # invariant): an OMITTED reason becomes the deterministic default here, so the
+        # manual path has zero friction while 100% of archive_audit rows stay reasoned.
+        # An EXPLICIT empty/whitespace reason is NOT defaulted — the ledger rejects it
+        # (→ validation_failed): explicit garbage is loud, omission is ergonomic.
+        # Bulk/auto contexts (Pass 2 sweepers) pass their own canned strings.
+        if reason is None:
+            reason = "manual_archive"
+        # ACTOR: as card_retier — NO actor parameter, so a client cannot set it via the
+        # payload; the Spine injects the authenticated-client placeholder (ARCHIVE_ACTOR).
+        with Store(config.db_path) as store:
+            spine = Spine(store)
+            try:
+                task = spine.archive_task(id, reason=reason, expected_version=expected_version)
+            except KeyError:
+                return domain_error_result(NOT_FOUND, f"task {id!r} does not exist", {"id": id})
+            except ConflictError as exc:
+                return _conflict_result(exc.current, store)
+            except ValueError as exc:
+                # already archived / open escalation / explicit empty reason (ledger).
+                return domain_error_result(VALIDATION_FAILED, str(exc), {"id": id})
+            card = project([task], store.escalations.list_all())[0]
+            return ok_result({"card": card})
+
+    @mcp.tool(
+        name="card_unarchive",
+        description=(
+            "Unarchive an operator card: clear the archived_at flag, returning it to "
+            "the default card_list view, recording an append-only governance audit row. "
+            "A GOVERNED write — expected_version is required (optimistic concurrency); "
+            "there is NO force. A card that is not archived is validation_failed (loud "
+            "idempotency). reason is optional (defaults to 'manual_unarchive'; the "
+            "audit ledger always records one)."
+        ),
+        structured_output=False,
+    )
+    def card_unarchive(
+        id: str,
+        expected_version: str,
+        reason: Optional[str] = None,
+    ) -> types.CallToolResult:
+        # Same reason-defaulting and actor stance as card_archive. No escalation gate:
+        # unarchiving restores a card to view, which never buries anything.
+        if reason is None:
+            reason = "manual_unarchive"
+        with Store(config.db_path) as store:
+            spine = Spine(store)
+            try:
+                task = spine.unarchive_task(id, reason=reason, expected_version=expected_version)
+            except KeyError:
+                return domain_error_result(NOT_FOUND, f"task {id!r} does not exist", {"id": id})
+            except ConflictError as exc:
+                return _conflict_result(exc.current, store)
+            except ValueError as exc:
+                # not archived / explicit empty reason (ledger).
                 return domain_error_result(VALIDATION_FAILED, str(exc), {"id": id})
             card = project([task], store.escalations.list_all())[0]
             return ok_result({"card": card})

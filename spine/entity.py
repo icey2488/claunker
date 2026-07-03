@@ -108,7 +108,15 @@ class Task(_Entity):
     the spine does not import the classifier. ``order`` is the spine-assigned
     LexoRank board position (``ordering.py``); it is not one of the spec's core
     semantic fields but is required for the Card ``order`` passthrough and for the
-    retained LexoRank ordering."""
+    retained LexoRank ordering.
+
+    ``archived_at`` is an ORTHOGONAL nullable flag mirroring ``deleted_at``'s shape
+    exactly (ISO-8601 string while archived, ``None`` while active) — NOT a lifecycle
+    state: an archived task keeps its ``state`` column and is merely filtered from
+    the default ``card_list`` view. Set/cleared ONLY through the governed
+    ``Spine.archive_task`` / ``unarchive_task`` pair (each write is audited in the
+    append-only ``archive_audit`` ledger). Being a dataclass field, it rides
+    ``content()`` into the version token automatically — archiving moves the token."""
 
     id: str
     project_id: str
@@ -120,6 +128,7 @@ class Task(_Entity):
     created_at: Optional[str] = None
     version: Optional[str] = None
     deleted_at: Optional[str] = None
+    archived_at: Optional[str] = None
 
 
 @dataclass

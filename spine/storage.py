@@ -1,5 +1,5 @@
 """The locked v1 Claunker Spine store: a SQLite JSON-blob store — four versioned
-entity tables plus one append-only governance ledger.
+entity tables plus two append-only governance ledgers.
 
 This REPLACES the old event-log core (events.py + reducer.py are gone). There is
 no event log, no reducer, no event playback — each entity is stored and read as a
@@ -10,7 +10,9 @@ JSON blob in its own table:
 one table per entity kind (``projects``, ``tasks``, ``artifacts``, ``escalations``),
 plus ``tier_audit`` — a FIFTH table holding the append-only re-tier governance ledger
 (same ``(id, data)`` JSON-blob shape, but INSERT-only: no version token, no soft
-delete, no update/delete path — see ``TIER_AUDIT_TABLE`` / ``append_tier_audit``).
+delete, no update/delete path — see ``TIER_AUDIT_TABLE`` / ``append_tier_audit``) —
+and ``archive_audit``, the SIXTH table, the archive governance ledger mirroring the
+same idiom (see ``ARCHIVE_AUDIT_TABLE`` / ``append_archive_audit``).
 The connection is opened WAL (``PRAGMA journal_mode=WAL``) so reads never block the
 single writer. The ``.db`` file (and its ``-wal``/``-shm`` siblings) is gitignored.
 
@@ -54,6 +56,14 @@ TABLES = ("projects", "tasks", "artifacts", "escalations")
 # OUTSIDE ``TABLES`` (the versioned kinds the dump/load seam carries) and is created
 # and queried directly here. Rows are only ever INSERTed (append-only ledger).
 TIER_AUDIT_TABLE = "tier_audit"
+
+# The append-only archive governance ledger (kanbantt-mcp-spec v0.4.0 §Archive) — the
+# SIXTH table, mirroring ``tier_audit``'s idiom precisely: same ``(id, data)`` JSON-blob
+# shape, INSERT-only, no version token, no soft delete, no ``EntityStore``, outside
+# ``TABLES`` (it rides neither ``dump`` nor ``load`` this slice). One row per
+# archive/unarchive, written atomically with the flag change — see
+# ``append_archive_audit`` / ``list_archive_audit``.
+ARCHIVE_AUDIT_TABLE = "archive_audit"
 
 
 def utcnow_iso() -> str:
@@ -134,6 +144,10 @@ class Store:
         self._conn.execute(
             f"CREATE TABLE IF NOT EXISTS {TIER_AUDIT_TABLE} (id TEXT PRIMARY KEY, data TEXT NOT NULL)"
         )
+        # The SIXTH table: the append-only archive governance ledger, same idiom.
+        self._conn.execute(
+            f"CREATE TABLE IF NOT EXISTS {ARCHIVE_AUDIT_TABLE} (id TEXT PRIMARY KEY, data TEXT NOT NULL)"
+        )
         self._conn.commit()
 
         # Monotonic change counter — the version-token prefix and the merge clock.
@@ -183,6 +197,40 @@ class Store:
         later slice); it is the audit read path for tests and a future history tool."""
         rows = self._conn.execute(
             f"SELECT data FROM {TIER_AUDIT_TABLE} ORDER BY rowid"
+        ).fetchall()
+        return [json.loads(r[0]) for r in rows]
+
+    # ── append-only governance ledger (archive_audit) ─────────────────────────
+    def append_archive_audit(self, row: Dict[str, Any], *, commit: bool = True) -> None:
+        """Append one row to the append-only ``archive_audit`` ledger — INSERT-only,
+        mirroring ``append_tier_audit``'s atomic idiom: ``commit=False`` STAGES the
+        insert on the shared connection so a following ``EntityStore.put`` commits
+        BOTH in a single transaction (``Spine.archive_task`` / ``unarchive_task``
+        write the flag change and its audit row atomically; a failed put leaves no
+        orphan ledger row).
+
+        LEDGER INVARIANT (hard): every row MUST carry a non-empty, non-whitespace
+        ``reason`` — this is the NOT NULL constraint translated to the blob-row layer
+        that actually exists. Rejected (``ValueError``) BEFORE anything is staged, so
+        a bad row never touches the transaction. The ergonomic defaulting lives at
+        the tool layer (an omitted reason becomes "manual_archive"/"manual_unarchive"
+        there), never here: 100% of ledger rows are reasoned."""
+        reason = row.get("reason")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("archive_audit rows require a non-empty reason")
+        self._conn.execute(
+            f"INSERT INTO {ARCHIVE_AUDIT_TABLE} (id, data) VALUES (?, ?)",
+            (row["id"], json.dumps(row, default=str)),
+        )
+        if commit:
+            self._conn.commit()
+
+    def list_archive_audit(self) -> List[Dict[str, Any]]:
+        """Every ``archive_audit`` row as a parsed blob, in insert order (``rowid``).
+        As ``list_tier_audit``: no MCP tool exposes this yet (record now, render
+        later) — the audit read path for tests and a future history tool."""
+        rows = self._conn.execute(
+            f"SELECT data FROM {ARCHIVE_AUDIT_TABLE} ORDER BY rowid"
         ).fetchall()
         return [json.loads(r[0]) for r in rows]
 

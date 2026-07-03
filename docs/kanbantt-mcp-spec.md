@@ -1,15 +1,17 @@
-<!-- SYNCED COPY. Canonical home: kanbantt-app/docs/kanbantt-mcp-spec.md (Kanbantt owns this contract). This copy exists so the Claunker server build can see the contract it implements. Re-sync on change. Synced 2026-07-01. -->
+<!-- SYNCED COPY. Canonical home: kanbantt-app/docs/kanbantt-mcp-spec.md (Kanbantt owns this contract). This copy exists so the Claunker server build can see the contract it implements. Re-sync on change. Synced 2026-07-01 at v0.3.0. SYNC-DIRECTION EXCEPTION: v0.4.0 (the archive surface) ORIGINATED HERE, spine-side, on 2026-07-02 — the REVERSE of the usual kanbantt→spine flow. The kanbantt canonical does not yet carry 0.4.0; it syncs FROM this copy in Pass 2. Until that back-sync lands, THIS copy is ahead of the canonical — deliberate, temporary, and stated here so the drift stays legible. -->
 
 # Kanbantt MCP Specification
 
-**Version:** 0.3.0
-**Date:** 2026-06-30
+**Version:** 0.4.0
+**Date:** 2026-07-02
 **Author:** Erick M. Gonzales
 **Schema Version:** 1
 **Status:** Private draft — breaking changes permitted until public release
 **Supersedes:** kanbantt-provider-spec.md v0.1.0 (REST contract, retired)
 **Parent Doc:** claunker-foundation.md
 **MCP Revision Pinned:** 2025-06-18 (verify latest before public release)
+
+**Changes in v0.4.0:** Adds the governed, audited archive pair `card_archive` / `card_unarchive`, gated on the new `canArchive` capability (derived from `card_archive` alone); adds the nullable `archived_at` Card field — an orthogonal flag mirroring `deleted_at`'s shape, NOT a lifecycle state (an archived card keeps its `column_id`); adds `include_archived` to `card_list` (archived cards omitted from full fetches by default, composing with `include_deleted`); and reserves the append-only archive-audit ledger (recorded server-side, no read API this version, same stance as the tier-audit ledger). Data `schema_version` is unchanged: `archived_at` is nullable-with-null-default, so v1 blobs load untouched.
 
 **Changes in v0.3.0:** Adds `card_retier` — a governed, audited tier change — gated on the new `canRetier` capability; makes a *set* tier **write-once** on `card_update` (a set tier moves only through `card_retier`); and reserves the append-only tier-audit ledger (recorded server-side, no read API this version). The Card schema and data `schema_version` are unchanged: tier still lives as a `tier:N` tag, not a native field.
 
@@ -67,6 +69,7 @@ A single schema serves as the wire shape, the Drive blob shape, and the localSto
   "impact": "low | med | high | null",
   "version": "opaque string",
   "deleted_at": "ISO 8601 | null",
+  "archived_at": "ISO 8601 | null",
   "created_at": "ISO 8601",
   "updated_at": "ISO 8601",
   "created_by": { "type": "human | agent", "id": "string" },
@@ -81,6 +84,7 @@ Field rules:
 - **`order`** — lexicographic fractional position (LexoRank-style string). Inserting between `"a"` and `"c"` mints `"b"`. No integer cascades; reordering one card touches one card. Clients mint positions; the minting algorithm is client-internal but MUST produce strings that sort correctly under ordinal comparison. On an exact `order` collision (possible under concurrent offline minting), clients MUST break the tie by sorting on `id` so rendering is stable.
 - **`version`** — opaque token minted by the authority (server, or LocalProvider) on every mutation. Clients MUST NOT generate, parse, or compare these except for equality. This is the sole concurrency primitive.
 - **`deleted_at`** — non-null marks a tombstone. Tombstoned cards are soft-deleted; hard deletion is server housekeeping outside this protocol (see Tombstones).
+- **`archived_at`** — non-null marks an ARCHIVED card: an orthogonal nullable flag mirroring `deleted_at`'s shape, NOT a lifecycle state. An archived card keeps its `column_id` and all other fields; it is merely omitted from default `card_list` full fetches (see `include_archived`). Set/cleared ONLY through the governed `card_archive` / `card_unarchive` pair — never via `card_update` patch. Archived ≠ deleted: an archived card is live, mutable, and unarchivable; the two flags are independent and compose.
 - **`created_at` / `updated_at`** — display metadata ONLY. MUST NOT be used for synchronization, conflict detection, or ordering decisions.
 - **`created_by` / `updated_by`** — stamped by the authority on mutation. Servers SHOULD derive actor identity from the authenticated context; agents SHOULD identify with a stable id.
 - **`attachments`** — reserved shape, optional in v1. Large objects live in external storage; the blob carries references only. No v1 tool operates on attachments beyond round-tripping the field.
@@ -151,7 +155,7 @@ A client receiving cards with a `column_id` it cannot map MUST render them in a 
 There is no custom capabilities endpoint. Standard MCP mechanisms only:
 
 1. **`initialize`** handshake — server identity (name, version) arrives in `serverInfo`. Kanbantt displays this as the connection indicator (`MCP: Claunker`, `MCP: <name>`).
-2. **`tools/list`** — feature gating keys off advertised tool names. The escalations column renders iff `escalation_list` and `escalation_resolve` are advertised. Column-mutation tools absent ⇒ server board config is read-only to the client and column edits stay local. The governed re-tier affordance renders iff `card_retier` is advertised (`canRetier`) — derived from that one tool ALONE, independent of the `card_*` write set (`canWrite`): a server may govern re-tier without offering the full board writes, or vice versa.
+2. **`tools/list`** — feature gating keys off advertised tool names. The escalations column renders iff `escalation_list` and `escalation_resolve` are advertised. Column-mutation tools absent ⇒ server board config is read-only to the client and column edits stay local. The governed re-tier affordance renders iff `card_retier` is advertised (`canRetier`) — derived from that one tool ALONE, independent of the `card_*` write set (`canWrite`): a server may govern re-tier without offering the full board writes, or vice versa. Likewise the archive affordance: `canArchive` derives true iff `card_archive` is advertised — that one tool ALONE, independent of `canWrite` and `canRetier` (a server advertising `card_archive` without `card_unarchive` is one-way: the client shows archive but no unarchive affordance).
 3. `board_get` returns `kanbantt_schema_version` — the data schema version, deliberately separate from the MCP protocol revision.
 
 Connection flow and indicators (`Local`, `MCP: <name>`, `Local (MCP unavailable)` with retry) carry over from v0.1.0 unchanged.
@@ -179,7 +183,7 @@ All tool results use `structuredContent` with a **top-level object wrapper** (MC
 | Tool | Input | Output (structuredContent) |
 |---|---|---|
 | `board_get` | — | `{ "board": Board, "kanbantt_schema_version": 1 }` |
-| `card_list` | `{ "updated_since?": sync_token, "column_id?": string, "tag?": string, "include_deleted?": bool }` | `{ "cards": [Card], "sync_token": string }` |
+| `card_list` | `{ "updated_since?": sync_token, "column_id?": string, "tag?": string, "include_deleted?": bool, "include_archived?": bool }` | `{ "cards": [Card], "sync_token": string }` |
 | `card_get` | `{ "id": string }` | `{ "card": Card }` |
 | `card_create` | `{ "card": CardInput }` | `{ "card": Card }` |
 | `card_update` | `{ "id": string, "patch": object, "expected_version": string, "force?": bool }` | `{ "card": Card }` |
@@ -191,11 +195,15 @@ All tool results use `structuredContent` with a **top-level object wrapper** (MC
 | Tool | Input | Output |
 |---|---|---|
 | `card_retier` | `{ "id": string, "new_tier": "tier:N", "expected_version": string, "reason": string }` | `{ "card": Card }` |
+| `card_archive` | `{ "id": string, "expected_version": string, "reason?": string }` | `{ "card": Card }` |
+| `card_unarchive` | `{ "id": string, "expected_version": string, "reason?": string }` | `{ "card": Card }` |
 | `escalation_list` | `{ "status?": "pending" \| "resolved" }` | `{ "escalations": [Escalation] }` |
 | `escalation_resolve` | `{ "id": string, "resolution": string }` | `{ "escalation": Escalation }` |
 | `artifact_list` | `{ "card_id": string }` | `{ "artifacts": [Artifact] }` |
 
 `card_retier` is the GOVERNED, audited tier change — gated on its own capability (`canRetier`), distinct from `canWrite`. It changes an already-set tier and is the ONLY way to change a set tier (see Re-tier semantics and the `card_update` write-once rule). It has NO `force`. See Re-tier below.
+
+`card_archive` / `card_unarchive` are the GOVERNED, audited archive pair — gated on `canArchive` (derived from `card_archive` alone), distinct from `canWrite` and `canRetier`. They are the ONLY way to set/clear `archived_at`. Neither has `force`; `reason` is optional on the wire but every audit row records one (see Archive below).
 
 Escalations and artifacts referencing a **tombstoned** card remain valid and retrievable (deleted work still has an audit trail). A `card_id` the server has never known returns `not_found`.
 | `column_create` / `column_update` | column shape / patch | `{ "board": Board }` |
@@ -213,6 +221,7 @@ Escalations and artifacts referencing a **tombstoned** card remain valid and ret
 - `sync_token` is opaque, server-minted. Clients echo it verbatim into the next poll's `updated_since`. Clients never construct one.
 - If the server cannot honor an `updated_since` token (event log truncated, server state reset), it MUST fail with `sync_token_expired`. On receiving it, the client MUST discard its token and perform a full fetch. Clients MUST NOT retry an expired token.
 - When `updated_since` is provided, the response MUST include tombstones matching the window unconditionally — `include_deleted` is ignored for delta queries. `include_deleted` governs full fetches (no `updated_since`) only.
+- `include_archived` governs full fetches the same way: archived cards (`archived_at` non-null) are OMITTED from a full fetch by default and included when `include_archived: true`. The two flags COMPOSE independently: a card that is both deleted and archived appears only when BOTH `include_deleted` and `include_archived` are true. Within delta responses, archive/unarchive changes MUST ride unconditionally (they mint a new `version` like any mutation) — `include_archived`, like `include_deleted`, is ignored for delta queries.
 - Servers MUST return complete results for any query, or fail with `payload_too_large`. **Capping or truncating a successful response is non-conforming.** A `cursor` parameter is reserved for v2 pagination.
 
 **Full Fetch Semantics (no `updated_since`):**
@@ -247,6 +256,20 @@ Tier is the one field with a control gradient (tier 1 = self-accept, weakest ove
   - `reason` MUST be non-empty after trimming.
 - **Audit (record now, render later):** on success the server appends exactly ONE row to an append-only tier-audit ledger, ATOMICALLY with the tier change: `{ card_id, old_tier, new_tier, reduces_control, actor, reason, ts }`. `reduces_control` is true iff `new_tier < old_tier` (a LOWER tier weakens oversight). `actor` is derived from the authenticated credential, NEVER the payload (a placeholder `client:bearer` until per-user tokens; the field accepts a per-user id later with no schema change). `ts` is ISO-8601 UTC. There is NO ledger read tool in this version — the record is written for a later history surface (see Out of Scope).
 - On success the tier tag is rewritten in place (the new `tier:N` replaces the old; every OTHER tag is untouched) and the re-projected `{ card }` is returned.
+
+**Archive (`card_archive` / `card_unarchive`) — governed, audited visibility change:**
+Archiving takes a finished card out of the default working view without deleting anything. `archived_at` is an ORTHOGONAL nullable flag mirroring `deleted_at`'s shape — NOT a lifecycle state: the card keeps its `column_id`, its tags, and every other field, and stays fully readable and mutable. The pair is gated on `canArchive` (advertised iff `card_archive` is present), independent of `canWrite` and `canRetier`.
+
+- **Signature:** `{ id, expected_version, reason? }` → `{ card }` for both tools. There is NO `force`.
+- **Concurrency:** `expected_version` is REQUIRED. On mismatch the server returns `conflict` (meta carries the current card) — re-fetch and re-decide; a governed control never clobbers. Tombstoned cards are immutable as everywhere: either tool targeting one MUST fail with `conflict` (meta carries the tombstone). The not-found / tombstone / version gate runs FIRST — a tombstoned or stale target is a `conflict`, never a validation error.
+- **Loud idempotency** (each → `validation_failed`, checked AFTER the gate): `card_archive` on an ALREADY-ARCHIVED card fails with "already archived"; `card_unarchive` on a NOT-ARCHIVED card fails with "not archived". Deliberately NOT idempotent-silent: a healthy operation and a broken caller must not emit the same signal — bulk sweepers filter their own targets rather than blind-firing.
+- **Escalation gate** (`card_archive` ONLY, → `validation_failed`): a card with an OPEN escalation (one that is live and not yet resolved) CANNOT be archived — "cannot archive a task with an unresolved escalation". Archiving would bury a card awaiting human attention; resolve the escalation first. `card_unarchive` is ungated (restoring a card to view never buries anything).
+- **Reason** — two layers, deliberately split:
+  - the WIRE is ergonomic: `reason` is OPTIONAL; when omitted the server injects a deterministic default (`"manual_archive"` / `"manual_unarchive"`). Bulk/auto contexts pass their own canned strings.
+  - the LEDGER is hard: every audit row MUST carry a non-empty, non-whitespace reason — the server REJECTS (→ `validation_failed`) an explicitly empty/whitespace `reason` rather than defaulting it (explicit garbage is loud; omission is ergonomic). Result: 100% of ledger rows are reasoned.
+- **Audit (record now, render later):** on success the server appends exactly ONE row to an append-only archive-audit ledger, ATOMICALLY with the flag change: `{ card_id, action: "archive" | "unarchive", actor, reason, ts }`. `actor` is derived from the authenticated credential, NEVER the payload (the `client:bearer` placeholder until per-user tokens, exactly as the tier-audit ledger). `ts` is ISO-8601 UTC. A failed gate or invariant writes NO row. There is NO ledger read tool in this version (see Out of Scope).
+- **Versioning:** archive and unarchive are real mutations — each mints a new `version` (the token moves on archive and again on unarchive).
+- **Full-fetch purge interaction:** archived cards are absent from a DEFAULT full fetch by design, and absence there is NOT deletion. A client that holds a card with non-null `archived_at` MUST NOT purge it on absence from a default full fetch; purge authority over archived cards requires an `include_archived: true` fetch (and `include_deleted: true` for the deleted+archived case).
 
 ---
 
@@ -333,7 +356,7 @@ Client handling:
 - **Batch operations** — `card_batch` as a future optional tool.
 - **OAuth 2.1** — release-gating item.
 - **Attachment transfer** — schema shape reserved; no transfer tools.
-- **Audit log API** — actor fields make it buildable server-side, and `card_retier` now WRITES an append-only tier-audit ledger; there is still no protocol READ surface (record now, render later — a history tool is a later version).
+- **Audit log API** — actor fields make it buildable server-side, and `card_retier` / `card_archive` / `card_unarchive` now WRITE append-only tier- and archive-audit ledgers; there is still no protocol READ surface (record now, render later — a history tool is a later version).
 - **CRDT / collaborative editing** — version tokens + fractional ordering cover current scenarios; CRDT is the escalation path only if live co-editing becomes a goal.
 
 ---

@@ -4,7 +4,9 @@ v1 serves a FULL snapshot on every call (``updated_since`` is an accepted seam, 
 yet a delta) and mints a fresh ``sync_token`` each time. It NEVER truncates: an
 oversized snapshot fails with ``payload_too_large`` (complete-or-error, per the
 spec). Soft-deleted Tasks are omitted from the snapshot unless ``include_deleted``,
-in which case they ride along as tombstones (``deleted_at`` non-null).
+in which case they ride along as tombstones (``deleted_at`` non-null). Archived
+Tasks (the orthogonal ``archived_at`` flag) are likewise omitted unless
+``include_archived``; the two flags compose (a deleted+archived card needs both).
 
 Reads a fresh store connection per call: the spine opens WAL, so a reader never
 blocks the live writer and always sees the latest committed state. The tools are
@@ -62,6 +64,7 @@ def list_cards(
     column_id: Optional[str] = None,
     tag: Optional[str] = None,
     include_deleted: bool = False,
+    include_archived: bool = False,
     max_bytes: int,
 ) -> Dict[str, Any]:
     """Return ``{"cards": [...], "sync_token": ...}`` — a full snapshot of the live
@@ -79,6 +82,14 @@ def list_cards(
     if include_deleted:
         tombstones = [tombstone_card(t) for t in tasks if t.deleted_at is not None]
         cards = sorted(cards + tombstones, key=lambda c: (c["order"], c["id"]))
+
+    # Archived cards are OMITTED by default and included on request — mirroring the
+    # include_deleted branch, but as a subtractive filter (the projection itself never
+    # omits archived: archived ≠ deleted). Applied AFTER the tombstone merge so the two
+    # flags COMPOSE: a deleted+archived card needs include_deleted (to enter the list)
+    # AND include_archived (to survive this filter) to appear.
+    if not include_archived:
+        cards = [c for c in cards if c["archived_at"] is None]
 
     if column_id is not None:
         cards = [c for c in cards if c["column_id"] == column_id]
