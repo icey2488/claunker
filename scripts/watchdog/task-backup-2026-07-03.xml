@@ -1,0 +1,41 @@
+﻿<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>Health-checks the claunker spine on 127.0.0.1:8848 every 2 minutes (and at logon); auto-relaunches via logs/_relaunch_spine.py if unresponsive. Logs to logs/watchdog.log.</Description>
+    <URI>\ClaunkerSpineWatchdog</URI>
+  </RegistrationInfo>
+  <Principals>
+    <Principal id="Author">
+      <UserId>S-1-5-21-1252919146-566081992-2667879023-1001</UserId>
+      <LogonType>InteractiveToken</LogonType>
+    </Principal>
+  </Principals>
+  <Settings>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <ExecutionTimeLimit>PT5M</ExecutionTimeLimit>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+  </Settings>
+  <Triggers>
+    <LogonTrigger />
+    <TimeTrigger>
+      <StartBoundary>2026-07-03T00:00:00</StartBoundary>
+      <Repetition>
+        <Interval>PT2M</Interval>
+        <Duration>P3650D</Duration>
+      </Repetition>
+    </TimeTrigger>
+  </Triggers>
+  <Actions Context="Author">
+    <Exec>
+      <Command>C:\Users\Raide\code\claunker-hermes\.venv\Scripts\python.exe</Command>
+      <Arguments>"C:\Users\Raide\code\claunker-hermes\logs\_watchdog_spine.py"</Arguments>
+      <WorkingDirectory>C:\Users\Raide\code\claunker-hermes</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>
