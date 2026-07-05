@@ -23,6 +23,23 @@ from dataclasses import asdict, dataclass, fields
 from typing import Any, Dict, Optional
 
 
+class SpineError(ValueError):
+    """Validation error raised by the spine data layer on malformed entity fields."""
+
+
+def _validate_created_by(v: Any) -> None:
+    """Raise SpineError if v is not a valid created_by shape."""
+    if (
+        not isinstance(v, dict)
+        or v.get("type") not in ("human", "agent")
+        or not isinstance(v.get("id"), str)
+        or not v["id"]
+    ):
+        raise SpineError(
+            f"created_by must be {{\"type\": \"human\"|\"agent\", \"id\": <non-empty string>}}, got {v!r}"
+        )
+
+
 # ── state / kind vocabularies ────────────────────────────────────────────────
 class State:
     """The Task lifecycle. Pipeline: created → tiered → dispatched → judged →
@@ -131,6 +148,11 @@ class Task(_Entity):
     version: Optional[str] = None
     deleted_at: Optional[str] = None
     archived_at: Optional[str] = None
+    created_by: Optional[Dict[str, Any]] = None
+
+    def __post_init__(self) -> None:
+        if self.created_by is not None:
+            _validate_created_by(self.created_by)
 
 
 @dataclass

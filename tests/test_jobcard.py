@@ -94,3 +94,29 @@ def test_project_resolves_by_name(tmp_db, capsys):
 def test_project_unknown_errors(tmp_db):
     with pytest.raises(SystemExit, match="unknown project"):
         main(["create", "--project", "GhostProject", "task"])
+
+
+# ── create --actor round-trip ──────────────────────────────────────────────────
+
+def test_actor_agent_round_trip(tmp_db, capsys):
+    main(["create", "--actor", "claude-code", "my task"])
+    task_id = capsys.readouterr().out.strip()
+    with Store(tmp_db) as store:
+        task = store.tasks.get(task_id)
+    assert task.created_by == {"type": "agent", "id": "claude-code"}
+
+
+def test_actor_human_round_trip(tmp_db, capsys):
+    main(["create", "--actor", "icey2488", "--actor-type", "human", "my task"])
+    task_id = capsys.readouterr().out.strip()
+    with Store(tmp_db) as store:
+        task = store.tasks.get(task_id)
+    assert task.created_by == {"type": "human", "id": "icey2488"}
+
+
+def test_no_actor_gives_null_created_by(tmp_db, capsys):
+    main(["create", "my task"])
+    task_id = capsys.readouterr().out.strip()
+    with Store(tmp_db) as store:
+        task = store.tasks.get(task_id)
+    assert task.created_by is None

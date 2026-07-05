@@ -1,6 +1,6 @@
 # Claunker Spine — Entity Schema & Lifecycle (Ratified)
 
-**Status:** Ratified 2026-06-16, amended 2026-06-28 (supersedes the 2026-06-16 version, in Superseded).
+**Status:** Ratified 2026-06-16, amended 2026-06-28, amended 2026-07-05 (created_by).
 
 This document matches the as-built `spine/entity.py`, `spine/projection.py`, and `spine/spine.py`. Field names, enum values, and shapes below are the code's, not a parallel spec.
 
@@ -20,7 +20,9 @@ plus its own semantic fields:
 Project     { id, version, deleted_at, name, created_at }
 
 Task        { id, version, deleted_at, project_id, title, state, tier,
-              acceptance_criteria, order, created_at }
+              acceptance_criteria, order, created_at,
+              created_by: { "type": "human" | "agent", "id": string } | null,
+              archived_at }
 
 Artifact    { id, version, deleted_at, task_id, kind, ref, created_at }
 
@@ -88,3 +90,14 @@ The `blocked` row is the load-bearing one: a block raises an orthogonal Escalati
 - **MI-1.** Reject Artifact/Escalation creation whose `task_id` resolves to a tombstoned **or absent** Task. This is a create-admission check at the server boundary, not a merge rule. (No orphan children; no late children on a dead parent.)
 - **MI-2.** Escalation resolution is a single-field write of `resolved_at` — trivial now, because there is no paired state transition to keep in sync (`escalated` is no longer a state).
 - **MI-3 — DISSOLVED.** There is no `escalated` state to hold in a biconditional with the Escalation table, so the invariant that maintained that pairing no longer has anything to constrain.
+
+---
+
+## Amendments
+
+### Amendment 2026-07-05 — Task.created_by (additive, non-material)
+- **What:** Task gains `created_by: { "type": "human" | "agent", "id": string } | null`, null default, create-time only in v1 (no mutation path). NO schema_version bump — nullable-with-null-default, the archived_at precedent.
+- **Justification:** dispatch-lane ledger note (2026-07-03), Gap 1 — the ledger cannot distinguish a Hermes dispatch from a claude-async job from a hand-made card; first proven by backfill card 086a67c9. Card: d89e3f8d.
+- **Upstream:** R1–R6 and MI-* untouched; the merge stays schema-dumb (a new plain field, never merge-rewritten); write-once tier unaffected.
+- **Downstream:** projection passes created_by through to the spec's Card.created_by (absent → null, NEVER fabricated); jobcard gains --actor; the MCP write path continues to derive actor from authenticated context per spec (the CLI is local-trust, the wire is not); corpus mirror re-syncs after commit. The kanbantt-mcp-spec needs NO change — it has defined created_by since v0.1.0; this is the spine catching up to the spec.
+- **Materiality:** non-material, additive; Gemini review on record 2026-07-05; log-and-proceed per governance §3.

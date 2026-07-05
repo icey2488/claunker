@@ -80,12 +80,15 @@ def cmd_create(
     *,
     state: str = State.DISPATCHED,
     project_arg: Optional[str] = None,
+    actor: Optional[str] = None,
+    actor_type: str = "agent",
 ) -> None:
     if project_arg is None:
         project = _ensure_dispatch_log(spine)
     else:
         project = _resolve_project(spine, project_arg)
-    task = spine.create_task(project.id, title, state=state)
+    created_by = {"type": actor_type, "id": actor} if actor is not None else None
+    task = spine.create_task(project.id, title, state=state, created_by=created_by)
     # ONLY the id on stdout — callers capture it (e.g. `jobcard done $(jobcard create ...)`).
     print(task.id)
 
@@ -138,6 +141,19 @@ def main(argv=None) -> int:
         default=None,
         help="project name or id (default: Dispatch Log)",
     )
+    p_create.add_argument(
+        "--actor",
+        metavar="ID",
+        default=None,
+        help="actor id to record as created_by (omit to leave null)",
+    )
+    p_create.add_argument(
+        "--actor-type",
+        choices=["human", "agent"],
+        default="agent",
+        dest="actor_type",
+        help="actor type (default: agent); ignored when --actor is omitted",
+    )
 
     p_done = sub.add_parser("done", help="mark a pass card DELIVERED")
     p_done.add_argument("task_id", help="the task id printed by create")
@@ -159,7 +175,8 @@ def main(argv=None) -> int:
     with Store(_db_path()) as store:
         spine = Spine(store)
         if args.command == "create":
-            cmd_create(spine, args.title, state=args.state, project_arg=args.project)
+            cmd_create(spine, args.title, state=args.state, project_arg=args.project,
+                       actor=args.actor, actor_type=args.actor_type)
         elif args.command == "done":
             cmd_done(spine, args.task_id)
         elif args.command == "fail":

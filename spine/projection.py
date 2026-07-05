@@ -15,10 +15,11 @@ and deliberately flattening. The locked v1 mapping:
                          the lens itself projects them: archived ≠ deleted)
     gate_status        → extension field, hardcoded "COMMITTED"
     id, title, order, version, created_at → pass through
+    created_by         → pass through from Task.created_by (null when the task
+                         was created without actor attribution; NEVER fabricated)
     everything else    → Card schema defaults (priority "med", empty collections,
-                         nulls). The v1 entities carry no actor attribution or
-                         update timestamp, so created_by/updated_by/updated_at
-                         project as null.
+                         nulls). The v1 entities carry no update timestamp, so
+                         updated_by/updated_at project as null.
 
 Escalation is ORTHOGONAL to the board column: a badge never moves the card out of
 its ``state`` column (escalation is neither a column nor a tag). The badge reduces
@@ -127,7 +128,7 @@ def to_card(task: Optional[Task], badge: Optional[Dict[str, Any]] = None) -> Opt
         "archived_at": task.archived_at,    # echoed so archive state round-trips to the client
         "created_at": task.created_at,
         "updated_at": None,                 # v1 entities track no update timestamp
-        "created_by": None,                 # v1 entities carry no actor attribution
+        "created_by": task.created_by,      # pass through; null when entity has no actor
         "updated_by": None,
         "attachments": [],
         # ── Claunker extensions (preserved by the unknown-field round-trip rule) ─

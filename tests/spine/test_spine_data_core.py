@@ -34,6 +34,7 @@ from spine import (  # noqa: E402
     MAX_RANK_LENGTH,
     Project,
     Spine,
+    SpineError,
     State,
     Store,
     Task,
@@ -477,6 +478,79 @@ def test_wal_mode_enabled_on_file_db():
             except OSError:
                 pass
         os.rmdir(tmpdir)
+
+
+# ── Task.created_by: nullable actor, validation, projection passthrough ────────
+
+def test_task_created_by_defaults_to_null():
+    spine = Spine()
+    p = spine.create_project("p")
+    t = spine.create_task(p.id, "x", created_at=T[0])
+    assert t.created_by is None
+
+
+def test_task_created_by_valid_agent():
+    spine = Spine()
+    p = spine.create_project("p")
+    t = spine.create_task(p.id, "x", created_at=T[0], created_by={"type": "agent", "id": "claude-code"})
+    assert t.created_by == {"type": "agent", "id": "claude-code"}
+    assert spine.get_task(t.id).created_by == {"type": "agent", "id": "claude-code"}
+
+
+def test_task_created_by_valid_human():
+    spine = Spine()
+    p = spine.create_project("p")
+    t = spine.create_task(p.id, "x", created_at=T[0], created_by={"type": "human", "id": "icey2488"})
+    assert t.created_by == {"type": "human", "id": "icey2488"}
+
+
+def test_task_created_by_malformed_rejected():
+    # bad type string
+    _assert_raises(lambda: Task(id="t", project_id="p", title="x", created_by={"type": "robot", "id": "r1"}), SpineError)
+    # missing id
+    _assert_raises(lambda: Task(id="t", project_id="p", title="x", created_by={"type": "agent"}), SpineError)
+    # empty id
+    _assert_raises(lambda: Task(id="t", project_id="p", title="x", created_by={"type": "agent", "id": ""}), SpineError)
+    # not a dict
+    _assert_raises(lambda: Task(id="t", project_id="p", title="x", created_by="claude-code"), SpineError)
+
+
+def test_task_created_by_null_is_fine():
+    # null default is explicitly fine — no SpineError on None
+    t = Task(id="t", project_id="p", title="x", created_by=None)
+    assert t.created_by is None
+
+
+def test_projection_passthrough_created_by_agent():
+    spine = Spine()
+    p = spine.create_project("p")
+    t = spine.create_task(p.id, "x", created_at=T[0], created_by={"type": "agent", "id": "claude-code"})
+    card = _card_for(spine, t.id)
+    assert card["created_by"] == {"type": "agent", "id": "claude-code"}
+
+
+def test_projection_null_created_by_for_legacy_null():
+    spine = Spine()
+    p = spine.create_project("p")
+    t = spine.create_task(p.id, "x", created_at=T[0])
+    card = _card_for(spine, t.id)
+    assert card["created_by"] is None
+
+
+def test_legacy_blob_without_created_by_loads_untouched():
+    """A blob written before created_by existed carries no such key. from_dict ignores
+    unknown keys and defaults the missing one, so the task loads with created_by=None."""
+    store = Store()
+    legacy = {
+        "id": "t1", "project_id": "p", "title": "legacy", "state": "created",
+        "tier": None, "acceptance_criteria": None, "order": "i",
+        "created_at": T[0], "version": "1:deadbeef", "deleted_at": None, "archived_at": None,
+    }
+    assert "created_by" not in legacy
+    store.load({"tasks": [legacy]})
+    loaded = store.tasks.get("t1")
+    assert loaded.created_by is None
+    assert len(store.tasks.list_live()) == 1
 
 
 # ── pure-python fallback runner (no pytest) ───────────────────────────────────

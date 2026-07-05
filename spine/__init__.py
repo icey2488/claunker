@@ -37,6 +37,7 @@ from .entity import (  # noqa: F401
     ArtifactKind,
     Escalation,
     Project,
+    SpineError,
     State,
     Task,
 )

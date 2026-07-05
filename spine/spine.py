@@ -140,10 +140,13 @@ class Spine:
         acceptance_criteria: Optional[Any] = None,
         task_id: Optional[str] = None,
         created_at: Optional[str] = None,
+        created_by: Optional[Dict[str, Any]] = None,
     ) -> Task:
         """Create a task, append-at-end in board order. ``order`` is seeded after
         the current max live rank; ``rebalance`` is NEVER invoked here. Note: this
-        does not validate ``project_id`` exists (no such MI is specified)."""
+        does not validate ``project_id`` exists (no such MI is specified).
+        ``created_by`` is write-once and create-time only in v1; the Task constructor
+        validates the shape when non-null (SpineError on malformed)."""
         if state not in STATES:
             raise ValueError(f"unknown task state {state!r}")
         last_order = max((t.order for t in self.store.tasks.list_live()), default="")
@@ -156,6 +159,7 @@ class Spine:
             acceptance_criteria=acceptance_criteria,
             order=append_rank(last_order),
             created_at=created_at or utcnow_iso(),
+            created_by=created_by,
         )
         return self.store.tasks.put(task)
 
