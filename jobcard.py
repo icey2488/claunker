@@ -29,6 +29,7 @@ import sys
 from typing import Optional
 
 from spine import Spine, State, STATES, Store
+from spine.entity import ARTIFACT_KINDS
 from spine.storage import DB_PATH
 
 # The default project all passes are logged under. Looked up by name (idempotent):
@@ -110,6 +111,18 @@ def cmd_delete(spine: Spine, task_id: str) -> None:
         raise SystemExit(f"jobcard: no task with id {task_id!r} (nothing to delete)")
 
 
+def cmd_artifact(spine: Spine, task_id: str, kind: str, ref: str) -> None:
+    """Attach an artifact to a task. R6 durable-ref validation and MI-1 zombie-append
+    are enforced by the spine — the CLI surfaces those errors loudly and exits non-zero."""
+    try:
+        artifact = spine.create_artifact(task_id, kind, ref)
+    except KeyError as e:
+        raise SystemExit(f"jobcard artifact: not_found: {e}") from None
+    except ValueError as e:
+        raise SystemExit(f"jobcard artifact: {e}") from None
+    print(artifact.id)
+
+
 def cmd_set_state(spine: Spine, task_id: str, state: str) -> None:
     """Move a card to any ratified spine state. Deliberately permissive — no
     transition state-machine in the CLI (the spine is a ledger of already-governed
@@ -164,6 +177,13 @@ def main(argv=None) -> int:
     p_delete = sub.add_parser("delete", help="hard-remove a pass card's row entirely")
     p_delete.add_argument("task_id", help="the task id printed by create")
 
+    p_artifact = sub.add_parser("artifact", help="attach a durable artifact receipt to a card")
+    p_artifact.add_argument("task_id", help="the task id")
+    p_artifact.add_argument("--kind", choices=list(ARTIFACT_KINDS), required=True,
+                            help="artifact kind: diff, file, verdict, delivery")
+    p_artifact.add_argument("--ref", required=True,
+                            help="durable ref (git hash, URL, content address — local paths rejected)")
+
     p_set_state = sub.add_parser("set-state", help="move a card to any ratified state")
     p_set_state.add_argument("task_id", help="the task id")
     p_set_state.add_argument("state", choices=list(STATES), help="the new state")
@@ -183,6 +203,8 @@ def main(argv=None) -> int:
             cmd_fail(spine, args.task_id)
         elif args.command == "delete":
             cmd_delete(spine, args.task_id)
+        elif args.command == "artifact":
+            cmd_artifact(spine, args.task_id, args.kind, args.ref)
         elif args.command == "set-state":
             cmd_set_state(spine, args.task_id, args.state)
     return 0

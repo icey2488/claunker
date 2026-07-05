@@ -43,8 +43,31 @@ omitting, escalation-badged Card view.
 
 from __future__ import annotations
 
+import re
 import uuid
 from typing import Any, Dict, List, Optional
+
+# R6 — durable-ref validation: reject refs that are local filesystem paths.
+# A durable ref survives outside the executor environment (git hash, URL, content
+# address). A local absolute path is executor-specific and will not resolve on
+# replay. The check is structural (prefix-based), not semantic.
+#
+# Patterns rejected:
+#   /path     — Unix absolute path (starts with /)
+#   ~/path    — user-home relative (starts with ~)
+#   C:\path   — Windows drive letter + backslash
+#   C:/path   — Windows drive letter + forward slash (but NOT C://  which is URL-like)
+#   \\server  — UNC path
+#
+# URL-like refs (e.g. https://, git://, f://) are NOT rejected:
+# the :/(?!/) pattern requires the slash to NOT be followed by another slash,
+# so scheme:// (double slash) passes through cleanly.
+_LOCAL_PATH_RE = re.compile(r'^(?:[/~]|[a-zA-Z]:\\|[a-zA-Z]:/(?!/)|\\\\)')
+
+
+def _is_durable_ref(ref: str) -> bool:
+    """True iff ``ref`` is not a local filesystem path (R6)."""
+    return not bool(_LOCAL_PATH_RE.match(ref))
 
 from .entity import (
     ARTIFACT_KINDS,
@@ -493,9 +516,14 @@ class Spine:
         created_at: Optional[str] = None,
     ) -> Artifact:
         """Attach an artifact to a live task. MI-1: rejected if the task is
-        tombstoned (or absent)."""
+        tombstoned (or absent). R6: rejected if ``ref`` is a local filesystem path."""
         if kind not in ARTIFACT_KINDS:
             raise ValueError(f"unknown artifact kind {kind!r}")
+        if not _is_durable_ref(ref):
+            raise ValueError(
+                f"non_durable_ref: {ref!r} is a local filesystem path and will not "
+                f"resolve outside this executor — use a git hash, URL, or content address"
+            )
         self._require_live_parent(task_id)  # MI-1
         artifact = Artifact(
             id=artifact_id or str(uuid.uuid4()),

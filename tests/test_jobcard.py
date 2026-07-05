@@ -120,3 +120,55 @@ def test_no_actor_gives_null_created_by(tmp_db, capsys):
     with Store(tmp_db) as store:
         task = store.tasks.get(task_id)
     assert task.created_by is None
+
+
+# ── artifact subcommand ────────────────────────────────────────────────────────
+
+def test_artifact_git_hash_ref_accepted(tmp_db, capsys):
+    main(["create", "task"])
+    task_id = capsys.readouterr().out.strip()
+
+    main(["artifact", task_id, "--kind", "delivery", "--ref", "81d33c2a4b5e6f7890abcdef1234567890abcdef"])
+    artifact_id = capsys.readouterr().out.strip()
+    assert artifact_id  # got an id back
+
+    with Store(tmp_db) as store:
+        a = store.artifacts.get(artifact_id)
+    assert a.task_id == task_id
+    assert a.kind == "delivery"
+    assert a.ref == "81d33c2a4b5e6f7890abcdef1234567890abcdef"
+
+
+def test_artifact_unix_local_path_rejected_non_durable_ref(tmp_db, capsys):
+    main(["create", "task"])
+    task_id = capsys.readouterr().out.strip()
+    capsys.readouterr()
+
+    with pytest.raises(SystemExit, match="non_durable_ref"):
+        main(["artifact", task_id, "--kind", "file", "--ref", "/workspace/output.py"])
+
+
+def test_artifact_windows_local_path_rejected_non_durable_ref(tmp_db, capsys):
+    main(["create", "task"])
+    task_id = capsys.readouterr().out.strip()
+    capsys.readouterr()
+
+    with pytest.raises(SystemExit, match="non_durable_ref"):
+        main(["artifact", task_id, "--kind", "file", "--ref", "C:\\output\\result.txt"])
+
+
+def test_artifact_on_tombstoned_card_rejected_zombie_append(tmp_db, capsys):
+    main(["create", "task"])
+    task_id = capsys.readouterr().out.strip()
+    # Soft-delete (tombstone) via Spine so the row is retained but dead — MI-1 zombie case.
+    with Store(tmp_db) as store:
+        Spine(store).soft_delete_task(task_id)
+
+    with pytest.raises(SystemExit, match="tombstoned"):
+        main(["artifact", task_id, "--kind", "delivery", "--ref", "abc123def456abc123def456abc123def456abc1"])
+
+
+def test_artifact_unknown_card_rejected_not_found(tmp_db):
+    with pytest.raises(SystemExit, match="does not exist"):
+        main(["artifact", "00000000-0000-0000-0000-000000000000", "--kind", "diff",
+              "--ref", "abc123def456abc123def456abc123def456abc1"])

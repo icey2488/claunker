@@ -553,6 +553,37 @@ def test_legacy_blob_without_created_by_loads_untouched():
     assert len(store.tasks.list_live()) == 1
 
 
+# ── R6 durable-ref validation in create_artifact ──────────────────────────────
+
+def test_r6_git_hash_ref_accepted():
+    spine = Spine()
+    p = spine.create_project("p")
+    t = spine.create_task(p.id, "x", created_at=T[0])
+    a = spine.create_artifact(t.id, ArtifactKind.DELIVERY, "81d33c2a4b5e6f7890abcdef1234567890abcdef")
+    assert a.ref == "81d33c2a4b5e6f7890abcdef1234567890abcdef"
+
+
+def test_r6_unix_local_path_rejected():
+    spine = Spine()
+    p = spine.create_project("p")
+    t = spine.create_task(p.id, "x", created_at=T[0])
+    _assert_raises(lambda: spine.create_artifact(t.id, ArtifactKind.FILE, "/workspace/out.py"), ValueError)
+
+
+def test_r6_windows_local_path_rejected():
+    spine = Spine()
+    p = spine.create_project("p")
+    t = spine.create_task(p.id, "x", created_at=T[0])
+    _assert_raises(lambda: spine.create_artifact(t.id, ArtifactKind.FILE, "C:\\output\\result.txt"), ValueError)
+
+
+def test_r6_tilde_path_rejected():
+    spine = Spine()
+    p = spine.create_project("p")
+    t = spine.create_task(p.id, "x", created_at=T[0])
+    _assert_raises(lambda: spine.create_artifact(t.id, ArtifactKind.FILE, "~/output.py"), ValueError)
+
+
 # ── pure-python fallback runner (no pytest) ───────────────────────────────────
 def _main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
