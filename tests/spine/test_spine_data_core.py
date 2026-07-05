@@ -216,6 +216,23 @@ def test_every_projected_card_is_gate_status_committed_with_null_attribution():
         assert card["updated_at"] is None
 
 
+def test_due_less_task_projects_due_null_never_fabricated():
+    """A Task minted with no stored due field projects due=null.
+
+    Red-contrast: if the projection mistakenly used task.created_at as due, it
+    would emit a non-null ISO string (T[0]) — this test would fail, catching the
+    regression. The never-fabricate rule: only a genuinely stored due value may
+    appear; with no stored due, null is the only correct output."""
+    spine = Spine()
+    p = spine.create_project("p")
+    task = spine.create_task(p.id, "no-due task", created_at=T[0])
+    card = _card_for(spine, task.id)
+    # The task does have a created_at (red-contrast: a fabricating projection
+    # would leak T[0] here instead of null).
+    assert task.created_at == T[0]
+    assert card["due"] is None  # never fabricated — null, not T[0] or any other date
+
+
 def test_state_maps_one_to_one_to_column():
     spine = Spine()
     p = spine.create_project("p")
