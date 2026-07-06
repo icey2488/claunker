@@ -54,6 +54,8 @@ function Test-SpineHealth {
 
 Write-Log "WATCHDOG_START $([System.DateTime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ"))"
 
+$cycle = 0
+
 while ($true) {
     if (-not (Test-SpineHealth)) {
         # Delegate to the proven trampoline — do not inline its env or token logic
@@ -73,4 +75,8 @@ while ($true) {
     }
 
     Start-Sleep -Seconds $SLEEP_SECS
+    $cycle++
+    if ($cycle % 30 -eq 0) {
+        Write-Log "ALIVE $([System.DateTime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ"))"
+    }
 }
