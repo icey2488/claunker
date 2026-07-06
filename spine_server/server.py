@@ -67,7 +67,7 @@ from .result import (
 # MCP spec version it implements (0.4.0) and still distinct from the data schema
 # version (1).
 SERVER_NAME = "Claunker"
-SERVER_VERSION = "0.4.0"
+SERVER_VERSION = "0.5.0"
 
 
 def _patch_tier_to_int(value: Any) -> int:
@@ -296,9 +296,12 @@ def build_server(config: ServerConfig) -> FastMCP:
         name="card_update",
         description=(
             "Edit an operator card's mutable fields via a Card patch (title / "
-            "acceptance_criteria / effort / impact / tier). A free, ungoverned operator "
-            "write — NOT state or order (use card_move). expected_version is required "
-            "(optimistic concurrency); force skips the check."
+            "acceptance_criteria / effort / impact / due / depends_on / tier). "
+            "RFC 7386 key-presence semantics: absent key = unchanged; present null = "
+            "clear for {due, effort, impact}; depends_on uses [] to clear (null → "
+            "validation_failed). Guarded: {tier, archived_at, deleted_at} present-null "
+            "→ validation_failed. NOT state or order (use card_move). "
+            "expected_version required (optimistic concurrency); force skips the check."
         ),
         structured_output=False,
     )
@@ -308,25 +311,71 @@ def build_server(config: ServerConfig) -> FastMCP:
         expected_version: str,
         force: bool = False,
     ) -> types.CallToolResult:
-        # Map the spec's partial-Card `patch` onto the facade's field kwargs. Only the
-        # modeled mutable fields are honored; any other patch key is ignored
-        # (a patch touching ONLY unmodeled Card fields reduces to no change → the
-        # facade's "at least one field" validation_failed). `tier` rides as the
-        # "tier:N" tag-id string the projection emits, parsed to the internal int here.
+        # GUARDED FIELDS (amendment 2026-07-06): present-null → validation_failed,
+        # naming the governed tool. These fields move ONLY through their governed paths;
+        # closing the back-door lifecycle mutation via patch-null.
+        if "tier" in patch and patch["tier"] is None:
+            return domain_error_result(
+                VALIDATION_FAILED,
+                "tier cannot be cleared; use card_retier to change a set tier",
+                {"id": id},
+            )
+        if "archived_at" in patch and patch["archived_at"] is None:
+            return domain_error_result(
+                VALIDATION_FAILED,
+                "archived_at is governed by card_archive / card_unarchive; use those tools",
+                {"id": id},
+            )
+        if "deleted_at" in patch and patch["deleted_at"] is None:
+            return domain_error_result(
+                VALIDATION_FAILED,
+                "deleted_at is governed by card_delete; use that tool",
+                {"id": id},
+            )
+
+        # Map the spec's partial-Card patch onto the facade's field kwargs.
+        # RFC 7386 key-presence: absent = _UNSET (unchanged); present = value (None clears
+        # for clearable fields {effort, impact, due}). depends_on is type-strict: null →
+        # validation_failed here; [] clears; list replaces.
         kwargs: Dict[str, Any] = {}
         if "title" in patch:
             kwargs["title"] = patch["title"]
         if "acceptance_criteria" in patch:
             kwargs["acceptance_criteria"] = patch["acceptance_criteria"]
         if "effort" in patch:
-            kwargs["effort"] = patch["effort"]
+            kwargs["effort"] = patch["effort"]   # None clears (key-presence)
         if "impact" in patch:
-            kwargs["impact"] = patch["impact"]
+            kwargs["impact"] = patch["impact"]   # None clears
+        if "due" in patch:
+            kwargs["due"] = patch["due"]         # None clears; ISO-8601 string sets
+        if "depends_on" in patch:
+            dep = patch["depends_on"]
+            if dep is None:
+                return domain_error_result(
+                    VALIDATION_FAILED,
+                    "depends_on cannot be null; use [] to clear",
+                    {"id": id},
+                )
+            if not isinstance(dep, list):
+                return domain_error_result(
+                    VALIDATION_FAILED,
+                    "depends_on must be a list of task-id strings",
+                    {"id": id},
+                )
+            for entry in dep:
+                if not isinstance(entry, str) or not entry:
+                    return domain_error_result(
+                        VALIDATION_FAILED,
+                        "depends_on entries must be non-empty strings",
+                        {"id": id},
+                    )
+            kwargs["depends_on"] = dep
         if "tier" in patch:
             try:
                 kwargs["tier"] = _patch_tier_to_int(patch["tier"])
             except ValueError as exc:
                 return domain_error_result(VALIDATION_FAILED, str(exc), {"id": id})
+
         with Store(config.db_path) as store:
             spine = Spine(store)
             try:
@@ -338,7 +387,7 @@ def build_server(config: ServerConfig) -> FastMCP:
             except ConflictError as exc:
                 return _conflict_result(exc.current, store)
             except ValueError as exc:
-                # No modeled field given, or a bad tier value/range.
+                # No modeled field given, bad tier value/range, bad due, bad depends_on.
                 return domain_error_result(VALIDATION_FAILED, str(exc), {"id": id})
             card = project([task], store.escalations.list_all())[0]
             return ok_result({"card": card})

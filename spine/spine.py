@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import re
 import uuid
+from datetime import datetime as _datetime
 from typing import Any, Dict, List, Optional
 
 # R6 — durable-ref validation: reject refs that are local filesystem paths.
@@ -75,12 +76,28 @@ from .entity import (
     Artifact,
     Escalation,
     Project,
+    SpineError,
     Task,
     State,
 )
 from .ordering import append_rank
 from .projection import project
 from .storage import Store, utcnow_iso
+
+# Sentinel distinguishing "not provided" from "explicitly passed as None (=clear)".
+# Used in update_task for the clearable fields: effort, impact, due, depends_on.
+_UNSET = object()
+
+
+def _validate_due(v: Any) -> None:
+    """Raise ValueError if v is not a valid ISO-8601 datetime string."""
+    if not isinstance(v, str) or not v:
+        raise ValueError(f"due must be a non-empty ISO-8601 string, got {v!r}")
+    try:
+        _datetime.fromisoformat(v)
+    except ValueError:
+        raise ValueError(f"due must be a valid ISO-8601 datetime string, got {v!r}")
+
 
 # Actor recorded on every tier_audit row. A PLACEHOLDER: every authenticated client
 # shares the single Bearer token today, so "client:bearer" is the most specific TRUE
@@ -96,6 +113,9 @@ RETIER_ACTOR = "client:bearer"
 # parameter on ``archive_task`` / ``unarchive_task`` is the Stage-2 seam for a real
 # per-credential identity).
 ARCHIVE_ACTOR = "client:bearer"
+
+# Actor recorded on every edit_audit row — same placeholder, same Stage-2 seam.
+EDIT_ACTOR = "client:bearer"
 
 
 class ConflictError(Exception):
@@ -161,6 +181,8 @@ class Spine:
         state: str = State.CREATED,
         tier: Optional[int] = None,
         acceptance_criteria: Optional[Any] = None,
+        due: Optional[str] = None,
+        depends_on: Optional[List[str]] = None,
         task_id: Optional[str] = None,
         created_at: Optional[str] = None,
         created_by: Optional[Dict[str, Any]] = None,
@@ -169,17 +191,33 @@ class Spine:
         the current max live rank; ``rebalance`` is NEVER invoked here. Note: this
         does not validate ``project_id`` exists (no such MI is specified).
         ``created_by`` is write-once and create-time only in v1; the Task constructor
-        validates the shape when non-null (SpineError on malformed)."""
+        validates the shape when non-null (SpineError on malformed).
+        ``due`` must be null or a valid ISO-8601 string. ``depends_on`` must be a
+        list of non-empty strings; self-reference (own id in list) → SpineError."""
         if state not in STATES:
             raise ValueError(f"unknown task state {state!r}")
+        if due is not None:
+            _validate_due(due)
+        actual_deps: List[str] = depends_on if depends_on is not None else []
+        if depends_on is not None:
+            for entry in depends_on:
+                if not isinstance(entry, str) or not entry:
+                    raise SpineError(
+                        f"depends_on entries must be non-empty strings, got {entry!r}"
+                    )
+        tid = task_id or str(uuid.uuid4())
+        if actual_deps and tid in actual_deps:
+            raise SpineError(f"task {tid!r} cannot depend on itself")
         last_order = max((t.order for t in self.store.tasks.list_live()), default="")
         task = Task(
-            id=task_id or str(uuid.uuid4()),
+            id=tid,
             project_id=project_id,
             title=title,
             state=state,
             tier=tier,
             acceptance_criteria=acceptance_criteria,
+            due=due,
+            depends_on=actual_deps,
             order=append_rank(last_order),
             created_at=created_at or utcnow_iso(),
             created_by=created_by,
@@ -212,42 +250,46 @@ class Spine:
         *,
         title: Optional[str] = None,
         acceptance_criteria: Optional[Any] = None,
-        effort: Optional[str] = None,
-        impact: Optional[str] = None,
+        effort: Any = _UNSET,
+        impact: Any = _UNSET,
+        due: Any = _UNSET,
+        depends_on: Any = _UNSET,
         tier: Optional[int] = None,
         expected_version: Optional[str] = None,
         force: bool = False,
     ) -> Task:
-        """Operator edit of a task's MUTABLE fields — ``title`` / ``acceptance_criteria``
-        / ``effort`` / ``impact`` / ``tier`` — in a single get→set→put. NOT ``state`` and NOT ``order`` (those
-        move via ``move_task``). A FREE, ungoverned operator edit (the operator is the
-        tier-4 human): only input hygiene is checked, never a transition policy.
+        """Operator edit of a task's MUTABLE fields in a single get→set→put.
 
-          * at least one field must be provided (all-``None`` → ``ValueError``);
-          * ``tier``, when provided, must be in 1..4 (else ``ValueError``);
-          * ``title``, when provided, must be non-empty (else ``ValueError``);
-          * WRITE-ONCE TIER: ``tier`` here may only set an UNTIERED task's INITIAL tier
-            (the free first classification). Changing an ALREADY-SET tier via update is
-            REFUSED (``ValueError`` → validation_failed) — a set tier moves only through
-            the GOVERNED, audited ``retier_task`` / ``card_retier`` path. A same-value
-            tier, or no ``tier`` at all, is unaffected.
+        RFC 7386 KEY-PRESENCE SEMANTICS (amendment 2026-07-06): for the clearable
+        fields ``effort``, ``impact``, ``due``, and ``depends_on``, the caller uses
+        the sentinel ``_UNSET`` default to mean "not provided / leave unchanged",
+        and ``None`` (or ``[]`` for ``depends_on``) to mean "clear the field". The
+        server handler maps patch key-absence to ``_UNSET`` and patch key-presence to
+        the patch value (None clears; value sets).
 
-        Only the provided (non-``None``) fields change; ``None`` means "leave as-is".
-        Unknown ``task_id`` → ``KeyError`` (→ not_found).
+          * at least one field must be provided (all _UNSET/None → ``ValueError``);
+          * ``tier`` in 1..4 when provided (else ``ValueError``);
+          * ``title`` non-empty when provided (else ``ValueError``);
+          * ``due`` null or valid ISO-8601 when provided (else ``ValueError``);
+          * ``depends_on`` a list of non-empty strings when provided (else ``ValueError``);
+          * self-reference in ``depends_on`` → ``SpineError`` (→ validation_failed);
+          * WRITE-ONCE TIER: ``tier`` here may only set an UNTIERED task's INITIAL tier;
+            changing a SET tier → ``ValueError`` — governed path is ``retier_task``.
 
-        OPTIMISTIC CONCURRENCY (spec §Concurrency): ``expected_version`` is checked
-        against the task's current ``version`` token; on mismatch (and not ``force``)
-        a ``ConflictError`` carrying the current task is raised. A tombstoned task is
-        immutable — any edit raises ``ConflictError`` (the tombstone), even under
-        ``force``. See ``_guard_mutable``. Input hygiene is validated BEFORE the
-        concurrency gate, so a malformed edit is a ``ValueError`` (→ validation_failed)
-        regardless of version/tombstone; the write-once tier guard, needing the current
-        tier, is the one check that runs AFTER the gate."""
+        EDIT-AUDIT LEDGER (amendment 2026-07-06): one ``edit_audit`` row per field that
+        ACTUALLY changes (old ≠ new) among ``{effort, impact, due, depends_on}``,
+        staged atomically with the mutation (``commit=False`` + put commits both). A
+        failed guard or invariant writes NO row.
+
+        OPTIMISTIC CONCURRENCY: ``expected_version`` checked against current token;
+        mismatch → ``ConflictError``. Tombstone → ``ConflictError`` even under ``force``."""
         if (
             title is None
             and acceptance_criteria is None
-            and effort is None
-            and impact is None
+            and effort is _UNSET
+            and impact is _UNSET
+            and due is _UNSET
+            and depends_on is _UNSET
             and tier is None
         ):
             raise ValueError("update_task requires at least one field to change")
@@ -255,24 +297,74 @@ class Spine:
             raise ValueError(f"tier must be an int in 1..4, got {tier!r}")
         if title is not None and not title.strip():
             raise ValueError("title cannot be updated to an empty string")
+        # due: null is valid (clear); non-null must be valid ISO-8601
+        if due is not _UNSET and due is not None:
+            _validate_due(due)
+        # depends_on: must be a list of non-empty strings (null is rejected at the handler)
+        if depends_on is not _UNSET:
+            if not isinstance(depends_on, list):
+                raise ValueError("depends_on must be a list of task-id strings")
+            for entry in depends_on:
+                if not isinstance(entry, str) or not entry:
+                    raise ValueError(
+                        f"depends_on entries must be non-empty strings, got {entry!r}"
+                    )
+
         task = self._guard_mutable(task_id, expected_version=expected_version, force=force)
-        # WRITE-ONCE TIER GUARD (spec v0.3.0 §Re-tier): an already-set tier is immutable
-        # via this free edit — changing it must go through the governed, audited
-        # card_retier path. Initial classification (untiered → N) stays free; a same-tier
-        # patch (or none) is unaffected. Server-side, so it holds even if a client
-        # bypasses the UI that only *suggested* the lock.
+
+        # WRITE-ONCE TIER GUARD (spec v0.3.0 §Re-tier)
         if tier is not None and task.tier is not None and tier != task.tier:
             raise ValueError("tier is write-once; use card_retier to change a set tier")
+
+        # SELF-REFERENCE CHECK: needs current task.id, done after gate so tombstone
+        # immutability fires first (ConflictError > SpineError, preserving existing order).
+        if depends_on is not _UNSET and task_id in depends_on:
+            raise SpineError(f"task {task_id!r} cannot depend on itself")
+
+        # Capture old values for the edit-audit ledger BEFORE mutation.
+        now = utcnow_iso()
+        audit_entries: List[Dict[str, Any]] = []
+        if effort is not _UNSET and task.effort != effort:
+            audit_entries.append({"field": "effort", "old": task.effort, "new": effort})
+        if impact is not _UNSET and task.impact != impact:
+            audit_entries.append({"field": "impact", "old": task.impact, "new": impact})
+        if due is not _UNSET and task.due != due:
+            audit_entries.append({"field": "due", "old": task.due, "new": due})
+        if depends_on is not _UNSET and task.depends_on != depends_on:
+            audit_entries.append({
+                "field": "depends_on",
+                "old": list(task.depends_on),
+                "new": list(depends_on),
+            })
+
+        # Apply mutations.
         if title is not None:
             task.title = title
         if acceptance_criteria is not None:
             task.acceptance_criteria = acceptance_criteria
-        if effort is not None:
+        if effort is not _UNSET:
             task.effort = effort
-        if impact is not None:
+        if impact is not _UNSET:
             task.impact = impact
+        if due is not _UNSET:
+            task.due = due
+        if depends_on is not _UNSET:
+            task.depends_on = depends_on
         if tier is not None:
             task.tier = tier
+
+        # Stage edit-audit rows (commit=False); put commits everything atomically.
+        for entry in audit_entries:
+            self.store.append_edit_audit({
+                "id": str(uuid.uuid4()),
+                "card_id": task.id,
+                "field": entry["field"],
+                "old": entry["old"],
+                "new": entry["new"],
+                "actor": EDIT_ACTOR,
+                "ts": now,
+            }, commit=False)
+
         return self.store.tasks.put(task)
 
     def move_task(

@@ -65,6 +65,13 @@ TIER_AUDIT_TABLE = "tier_audit"
 # ``append_archive_audit`` / ``list_archive_audit``.
 ARCHIVE_AUDIT_TABLE = "archive_audit"
 
+# The append-only card-edit audit ledger (amendment 2026-07-06) — the SEVENTH table.
+# Records one row per set/change/clear of ``due``, ``effort``, ``impact``, or
+# ``depends_on``, written atomically with the mutation (same ``commit=False`` / put idiom
+# as ``tier_audit`` and ``archive_audit``). Schema: ``{id, card_id, field, old, new,
+# actor, ts}``. No MCP tool reads it (record-now-render-later, v1).
+EDIT_AUDIT_TABLE = "edit_audit"
+
 
 def utcnow_iso() -> str:
     """ISO-8601 UTC timestamp. Timestamps are display/audit metadata only — never a
@@ -158,6 +165,11 @@ class Store:
         self._conn.execute(
             f"CREATE TABLE IF NOT EXISTS {ARCHIVE_AUDIT_TABLE} (id TEXT PRIMARY KEY, data TEXT NOT NULL)"
         )
+        # The SEVENTH table: the append-only card-edit audit ledger (amendment 2026-07-06).
+        # Same (id, data) JSON-blob shape; INSERT-only; no version token, no soft delete.
+        self._conn.execute(
+            f"CREATE TABLE IF NOT EXISTS {EDIT_AUDIT_TABLE} (id TEXT PRIMARY KEY, data TEXT NOT NULL)"
+        )
         self._conn.commit()
 
         # Monotonic change counter — the version-token prefix and the merge clock.
@@ -241,6 +253,34 @@ class Store:
         later) — the audit read path for tests and a future history tool."""
         rows = self._conn.execute(
             f"SELECT data FROM {ARCHIVE_AUDIT_TABLE} ORDER BY rowid"
+        ).fetchall()
+        return [json.loads(r[0]) for r in rows]
+
+    # ── append-only card-edit audit ledger (edit_audit) ──────────────────────────
+    def append_edit_audit(self, row: Dict[str, Any], *, commit: bool = True) -> None:
+        """Append one row to the append-only ``edit_audit`` ledger — INSERT-only,
+        mirroring ``append_tier_audit``'s atomic idiom: ``commit=False`` STAGES the
+        insert on the shared connection so a following ``EntityStore.put`` commits
+        BOTH in a single transaction (``Spine.update_task`` stages all edit-audit rows
+        before the put; a failed guard leaves no orphan ledger row).
+
+        Row shape: ``{id, card_id, field, old, new, actor, ts}``. Written for every
+        set/change/clear of ``due``, ``effort``, ``impact``, or ``depends_on`` — one
+        row per field that actually changed value. No read API this version
+        (record-now-render-later)."""
+        self._conn.execute(
+            f"INSERT INTO {EDIT_AUDIT_TABLE} (id, data) VALUES (?, ?)",
+            (row["id"], json.dumps(row, default=str)),
+        )
+        if commit:
+            self._conn.commit()
+
+    def list_edit_audit(self) -> List[Dict[str, Any]]:
+        """Every ``edit_audit`` row as a parsed blob, in insert order (``rowid``).
+        No MCP tool exposes this in v1 (record-now-render-later); it is the audit
+        read path for tests and a future history tool."""
+        rows = self._conn.execute(
+            f"SELECT data FROM {EDIT_AUDIT_TABLE} ORDER BY rowid"
         ).fetchall()
         return [json.loads(r[0]) for r in rows]
 

@@ -19,8 +19,8 @@ token (everything EXCEPT ``version`` itself, which would be circular); ``to_dict
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, fields
-from typing import Any, Dict, Optional
+from dataclasses import asdict, dataclass, field, fields
+from typing import Any, Dict, List, Optional
 
 
 class SpineError(ValueError):
@@ -143,6 +143,8 @@ class Task(_Entity):
     acceptance_criteria: Optional[Any] = None
     effort: Optional[str] = None
     impact: Optional[str] = None
+    due: Optional[str] = None
+    depends_on: List[str] = field(default_factory=list)
     order: str = ""
     created_at: Optional[str] = None
     version: Optional[str] = None
@@ -153,6 +155,8 @@ class Task(_Entity):
     def __post_init__(self) -> None:
         if self.created_by is not None:
             _validate_created_by(self.created_by)
+        if self.depends_on is None:
+            self.depends_on = []
 
 
 @dataclass

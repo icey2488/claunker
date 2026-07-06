@@ -1,6 +1,6 @@
 # Claunker Spine — Entity Schema & Lifecycle (Ratified)
 
-**Status:** Ratified 2026-06-16, amended 2026-06-28, amended 2026-07-05 (created_by).
+**Status:** Ratified 2026-06-16, amended 2026-06-28, amended 2026-07-05 (created_by), amended 2026-07-06 (due, depends_on, patch semantics).
 
 This document matches the as-built `spine/entity.py`, `spine/projection.py`, and `spine/spine.py`. Field names, enum values, and shapes below are the code's, not a parallel spec.
 
@@ -20,7 +20,8 @@ plus its own semantic fields:
 Project     { id, version, deleted_at, name, created_at }
 
 Task        { id, version, deleted_at, project_id, title, state, tier,
-              acceptance_criteria, order, created_at,
+              acceptance_criteria, effort, impact, due, depends_on,
+              order, created_at,
               created_by: { "type": "human" | "agent", "id": string } | null,
               archived_at }
 
@@ -101,3 +102,12 @@ The `blocked` row is the load-bearing one: a block raises an orthogonal Escalati
 - **Upstream:** R1–R6 and MI-* untouched; the merge stays schema-dumb (a new plain field, never merge-rewritten); write-once tier unaffected.
 - **Downstream:** projection passes created_by through to the spec's Card.created_by (absent → null, NEVER fabricated); jobcard gains --actor; the MCP write path continues to derive actor from authenticated context per spec (the CLI is local-trust, the wire is not); corpus mirror re-syncs after commit. The kanbantt-mcp-spec needs NO change — it has defined created_by since v0.1.0; this is the spine catching up to the spec.
 - **Materiality:** non-material, additive; Gemini review on record 2026-07-05; log-and-proceed per governance §3.
+
+### Amendment 2026-07-06 — RFC 7386 patch semantics, Task.due, Task.depends_on, edit-audit ledger (spec v0.5.0)
+
+See full record: `docs/claunker-amendment-2026-07-06-v050.md`.
+
+- **A. card_update RFC 7386 patch semantics** — key-presence replaces value-presence: absent=unchanged, present-null=clear for `{due, effort, impact}`; `depends_on` clears via `[]` (null→validation_failed); guarded set `{tier, archived_at, deleted_at}` present-null→validation_failed naming the governed tool. Material 3(b).
+- **B. Task.depends_on** — `[task_id]`, empty-list default, additive. Display-only v1; write-admission rejects self-reference; cycles flagged at render. Clears via `[]`. Material 3(b).
+- **C. Task.due** — `ISO-8601 | null`, null default, additive drift closure (spec Card has declared `due` since v0.1.0). Non-material.
+- **D. Edit-audit ledger** — append-only `{id, card_id, field, old, new, actor, ts}`, one row per change on `{due, effort, impact, depends_on}`, atomic with mutation, no read API v1. Non-material.
