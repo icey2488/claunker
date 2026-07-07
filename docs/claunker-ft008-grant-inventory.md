@@ -1,10 +1,12 @@
-# Claunker — Standing Tool-Access Grant Inventory (FT-008) — v2
+# Claunker — Standing Tool-Access Grant Inventory (FT-008) — v2.1
 
-**Status:** Second inventory, 2026-07-03. Supersedes the 2026-06-16 first inventory (Drive corpus, moves to Superseded). Trigger: the re-inventory rule fired several times over — the Cloudflare Tunnel (a public edge + new credential), the OAuth Drive-auth rewrite (a new secret + redirect grant), and two new dispatch lanes (claude-async, Desktop Claude Code). This discharges punch-list #2 and is a Phase 4 entry criterion.
+**Status:** Second inventory, 2026-07-03. Supersedes the 2026-06-16 first inventory (Drive corpus, moves to Superseded). Trigger: the re-inventory rule fired several times over — the Cloudflare Tunnel (a public edge + new credential), the OAuth Drive-auth rewrite (a new secret + redirect grant), and two new dispatch lanes (claude-async, Desktop Claude Code). This discharges punch-list #2 and is a Phase 4 entry criterion. v2.1, 2026-07-07: touch-up — Grant #3 watch updated (Kanbantt remember-token opt-in shipped 2026-07-04, commit 6b7803b); Grant #9 added (ClaunkerElevatedRunner, standing elevation trampoline, verified 2026-07-06).
 
 **Audit stance (unchanged):** the point is a verdict per grant — deliberately scoped, over-broad, or fails open — not a list.
 
 **Verification note (v2):** every machine-checkable claim was read-only verified against live files on 2026-07-03 before this document was written. Claims bearing **[verified 2026-07-03]** were confirmed from source. Claims bearing **[asserted from record]** could not be machine-checked in this pass (historical state, Drive corpus, or external-system state) and rest on prior audit records. Corrections from the draft are marked **[CORRECTED]**.
+
+**Verification note (v2.1 addendum):** new claims in this revision were read-only verified on 2026-07-06. Grant #3 watch update rests on the Kanbantt commit record (6b7803b, 2026-07-04) [asserted from record]. Grant #9 (ClaunkerElevatedRunner): task action, run-level, run-as principal, trigger, and runner script contents were confirmed from `schtasks /query /tn ClaunkerElevatedRunner /fo LIST /v` and direct file read of `logs\_elevated_runner.ps1` on 2026-07-06 [verified 2026-07-06].
 
 ---
 
@@ -28,13 +30,13 @@ Unchanged from v1: Docker backend (`terminal.backend: docker` [verified 2026-07-
 
 ### 3. Kanbantt — spine URL + Bearer token; now also the OAuth Drive grant
 
-**Holds:** (a) spine base URL + Bearer `auth_token` via Connection settings (BYO-spine, shipped 2026-07-02): **[CORRECTED]** token is written to `localStorage['kanbantt_config']` on every connect via `handleSpineConnect` → `safeSet` → `localStorage.setItem` [verified 2026-07-03 from App.jsx]. There is NO in-memory-default / remember-token opt-in in the current implementation; the UI text confirms "Stored locally on this device only." Spec Auth v1 describes an in-memory-default as planned behavior; that property is not yet implemented. (b) The Google Drive OAuth grant for board sync: auth-code + PKCE, `client_id` public-by-design in the bundle, `client_secret` held server-side in the Cloudflare Pages Function env (`/api/auth/exchange`), redirect URI registered in the OAuth console. Google OAuth session tokens are kept in memory only (no localStorage) per `auth.js` [verified 2026-07-03].
+**Holds:** (a) spine base URL + Bearer `auth_token` via Connection settings (BYO-spine, shipped 2026-07-02): **[CORRECTED; updated v2.1]** as of the v2 cut (2026-07-03) the token was always-persisted to `localStorage['kanbantt_config']` on every connect. The remember-token opt-in shipped 2026-07-04 (Kanbantt commit 6b7803b). Current behavior: token is held in memory only by default; the user may explicitly opt in to localStorage persistence. Legacy configs (pre-6b7803b) were migrated as "remembered" (treated as opted-in). The operator has opted in on the daily device [asserted from record, 6b7803b]. (b) The Google Drive OAuth grant for board sync: auth-code + PKCE, `client_id` public-by-design in the bundle, `client_secret` held server-side in the Cloudflare Pages Function env (`/api/auth/exchange`), redirect URI registered in the OAuth console. Google OAuth session tokens are kept in memory only (no localStorage) per `auth.js` [verified 2026-07-03].
 
 **Reach:** full spine MCP surface (R+W) when connected; the user's Drive scope for board-blob sync.
 
-**Verdict: INTENTIONAL, secret correctly placed.** The `client_secret` is in the Function env, not the bundle — the decision the auth plan required. CSP blast door (`script-src 'self'`) is the compensating control for the always-persisted spine Bearer token XSS exposure.
+**Verdict: INTENTIONAL, secret correctly placed.** The `client_secret` is in the Function env, not the bundle — the decision the auth plan required. CSP blast door (`script-src 'self'`) is the compensating control for any opted-in persistent spine Bearer token.
 
-**Watch [CORRECTED]:** the spine Bearer token is always-persisted to localStorage on connect (not opt-in). The CSP control is therefore the only barrier between XSS and token exfiltration. Keep `script-src 'self'` strict; Google Fonts runtime injection is a known accepted carve-out. Read-only vs read-write board roles remain a pre-multi-user decision.
+**Watch [CORRECTED; updated v2.1]:** the remember-token opt-in shipped 2026-07-04 (Kanbantt 6b7803b); spine Bearer token is now in-memory-only by default, with explicit operator opt-in to localStorage persistence. Legacy configs were migrated as opted-in; the operator has opted in on the daily device (accepted). CSP (`script-src 'self'`) remains the compensating control — the only barrier between XSS and token exfiltration for opted-in sessions. Keep the CSP strict; Google Fonts runtime injection is a known accepted carve-out. Read-only vs read-write board roles remain a pre-multi-user decision.
 
 ### 4. Claude Code (dev-time) — Desktop-wide read (STILL OVER-BROAD, action still owed)
 
@@ -91,6 +93,18 @@ Executor allowlist fail-closed-by-default remains (FT-007 closed [asserted from 
 
 **Verdict: INTENTIONAL.** Correlated Claude proposer/executor pair behind a decorrelated Gemini review seat; tracked on the board via jobcard. The economics note: this lane substitutes for the rig at ~zero marginal cost, which reframes Phase 7's baseline.
 
+### 9. ClaunkerElevatedRunner — standing elevation trampoline (NEW)
+
+**Holds:** a Windows scheduled task (`\ClaunkerElevatedRunner`, `Run As User: Raide`, `RunLevel: HighestAvailable`) with a one-time trigger set to 2099-01-01 — it never fires on its own schedule and exists solely as an on-demand trampoline via `schtasks /run /tn ClaunkerElevatedRunner`. Last run confirmed at 2026-07-03 21:26 (task prompt states "in use 2026-07-04"; schtasks record shows 2026-07-03 — plausible documentation lag). [verified 2026-07-06]
+
+The action is **not a fixed operation**: it executes `logs\_elevated_runner.ps1`, which reads whatever PowerShell has been staged at `logs\elevated_command.ps1` and spawns it as a child `powershell.exe -ExecutionPolicy Bypass -File` process, capturing stdout/stderr to `elevated_result.json`. The command file is an ordinary user-writable path under the project tree — any process running as `Raide`, including non-elevated processes, can write it. `schtasks /run` does not require elevation; the task infrastructure supplies the token upgrade from the stored task credential. Runner script contents confirmed by direct file read [verified 2026-07-06].
+
+**Reach:** arbitrary PowerShell at HighestAvailable privilege, on demand, from any user-session process. Both prerequisites — write `logs\elevated_command.ps1`, call `schtasks /run` — are reachable without elevation. Via the claude-async lane (Grant #7): a dispatched job running at user-account permission level can stage the command file and fire the task. Section 5.6 reachability logic therefore applies: any claude-async dispatch is transitively elevation-capable, with no additional gate between the dispatch surface and HighestAvailable privilege.
+
+**Verdict: STANDING ELEVATION TRAMPOLINE — reachability accepted, capability surface unbounded.** The action is arbitrary PowerShell (not a fixed or allowlisted script), making this trampoline functionally equivalent to a persistent `RunAs Administrator` without a UAC gate. The design is intentional — it was built to solve a specific operational need (re-registering scheduled tasks without prompts). The risk is the combination: (a) an arbitrary-command execution target at HighestAvailable privilege, (b) reachable from any user-session process including non-elevated ones, (c) transitively reachable from the claude-async dispatch lane (Grant #7) with no classifier, allowlist, or judge gate on that lane, and (d) the only gate is filesystem write access to a path inside the operator's own project tree. This does not change the verdict on Grant #7 (accepted, operator is the gate) — it adds a transitive elevation dimension to it.
+
+**Watch:** the command file path (`logs\elevated_command.ps1`) is a user-writable path reachable from any user-session process, including claude-async jobs. A hardened posture would either (a) restrict the command file path to a location only an elevated actor can write, or (b) enumerate and allowlist specific permitted operations rather than executing arbitrary staged content. Until then, treat the claude-async lane as transitively holding HighestAvailable elevation authority, and weight that into any future expansion of who can trigger that lane.
+
 ---
 
 ## Audit summary
@@ -99,12 +113,13 @@ Executor allowlist fail-closed-by-default remains (FT-007 closed [asserted from 
 |---|---|---|---|
 | 1 | Hermes executor | sandbox host dir + container | INTENTIONAL — narrowed |
 | 2 | Spine server | spine.db, one local file | INTENTIONAL — **Drive-durability gap flagged** |
-| 3 | Kanbantt | spine surface R+W; Drive OAuth | INTENTIONAL — secret correctly server-side; **Bearer token always-persisted [CORRECTED]** |
+| 3 | Kanbantt | spine surface R+W; Drive OAuth | INTENTIONAL — secret correctly server-side; **Bearer token opt-in persistent as of 2026-07-04 [CORRECTED; updated v2.1]**; CSP remains the wall |
 | 4 | Claude Code | Desktop-wide read | **OVER-BROAD** — narrowing still owed |
 | 5 | Judge/executor pins | model-family authorization | **FT-013 config condition closed; code/allowlist mismatch BLOCKS judge; code backstop audit still owed [CORRECTED]** |
 | 6 | Tunnel + edge token | full spine surface, public internet | INTENTIONAL — hardened; rotation story owed |
 | 7 | claude-async | operator user account, remote-triggerable | **OVER-BROAD BY NATURE** — accepted; ledger is the control |
 | 8 | Desktop Claude Code | operator user account, interactive | INTENTIONAL — correlated lane, on-ledger |
+| 9 | ClaunkerElevatedRunner | arbitrary PowerShell at HighestAvailable, user-session-triggerable | **STANDING ELEVATION TRAMPOLINE** — reachability accepted; claude-async lane transitively elevation-capable |
 
 **Owed actions, consolidated (pre-Phase-4):**
 - #4 scope narrowing (carried from v1)
@@ -112,5 +127,7 @@ Executor allowlist fail-closed-by-default remains (FT-007 closed [asserted from 
 - #5b confirm/add hardcoded absent-allowlist backstop in Hermes plugin LLM trust gate (carried FT-013 code concern)
 - #2 Drive-durable spine sync (new)
 - #6 token rotation story (new)
+
+- #9 harden elevation trampoline: restrict `logs\elevated_command.ps1` to a location only an elevated actor can write, or enumerate/allowlist permitted operations — eliminates the arbitrary-command surface at HighestAvailable without removing the operational utility (deferred; accepted as-is until the claude-async lane's operator-only gate is no longer sufficient)
 
 **Re-inventory trigger (unchanged):** any new spine client, any new credential, any scope change. Each gets a row as it lands.
