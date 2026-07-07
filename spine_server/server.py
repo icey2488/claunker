@@ -39,6 +39,7 @@ Three write-path stances coexist here, DELIBERATELY asymmetric:
 
 from __future__ import annotations
 
+import os
 from typing import Any, Dict, Optional
 
 import mcp.types as types
@@ -47,6 +48,19 @@ from mcp.server.transport_security import TransportSecuritySettings
 from starlette.applications import Starlette
 
 from spine import ConflictError, Spine, Store, project
+
+# Drive backup singleton — DORMANT until SA key is present (set by main()).
+_backup: Optional[Any] = None
+
+
+def _set_backup(backup: Any) -> None:
+    global _backup
+    _backup = backup
+
+
+def _notify_dirty() -> None:
+    if _backup is not None:
+        _backup.mark_dirty()
 
 from .board import TIER_TAG_PREFIX, build_board
 from .cards import PayloadTooLarge, list_cards, tombstone_card
@@ -229,6 +243,7 @@ def build_server(config: ServerConfig) -> FastMCP:
         except ValueError as exc:
             # Bad resolution enum, or a rationale under the >=10-char semantic floor.
             return domain_error_result(VALIDATION_FAILED, str(exc), {"id": id})
+        _notify_dirty()
         return ok_result({"escalation": resolved.to_dict()})
 
     # ── operator card-write tools (FREE / ungoverned: the operator's hand) ───────
@@ -290,6 +305,7 @@ def build_server(config: ServerConfig) -> FastMCP:
         except ValueError as exc:
             # create_task validates the target state ∈ STATES.
             return domain_error_result(VALIDATION_FAILED, str(exc), {})
+        _notify_dirty()
         return ok_result({"card": card})
 
     @mcp.tool(
@@ -390,6 +406,7 @@ def build_server(config: ServerConfig) -> FastMCP:
                 # No modeled field given, bad tier value/range, bad due, bad depends_on.
                 return domain_error_result(VALIDATION_FAILED, str(exc), {"id": id})
             card = project([task], store.escalations.list_all())[0]
+            _notify_dirty()
             return ok_result({"card": card})
 
     @mcp.tool(
@@ -424,6 +441,7 @@ def build_server(config: ServerConfig) -> FastMCP:
                 # Unknown column_id (not one of the six Task states).
                 return domain_error_result(VALIDATION_FAILED, str(exc), {"id": id})
             card = project([task], store.escalations.list_all())[0]
+            _notify_dirty()
             return ok_result({"card": card})
 
     @mcp.tool(
@@ -446,6 +464,7 @@ def build_server(config: ServerConfig) -> FastMCP:
                 return _conflict_result(exc.current, store)
             # Spec: card_delete returns { card } (the tombstone). The board projection
             # omits a tombstone, so render it via the shared tombstone lens.
+            _notify_dirty()
             return ok_result({"card": tombstone_card(task)})
 
     # ── governed re-tier (audited; the matching write-once guard lives in card_update) ─
@@ -497,6 +516,7 @@ def build_server(config: ServerConfig) -> FastMCP:
                 # untiered card / tier out of range / no-op same tier / empty reason.
                 return domain_error_result(VALIDATION_FAILED, str(exc), {"id": id})
             card = project([task], store.escalations.list_all())[0]
+            _notify_dirty()
             return ok_result({"card": card})
 
     # ── governed archive pair (audited; mirrors card_retier's shape verbatim) ────
@@ -540,6 +560,7 @@ def build_server(config: ServerConfig) -> FastMCP:
                 # already archived / open escalation / explicit empty reason (ledger).
                 return domain_error_result(VALIDATION_FAILED, str(exc), {"id": id})
             card = project([task], store.escalations.list_all())[0]
+            _notify_dirty()
             return ok_result({"card": card})
 
     @mcp.tool(
@@ -575,6 +596,7 @@ def build_server(config: ServerConfig) -> FastMCP:
                 # not archived / explicit empty reason (ledger).
                 return domain_error_result(VALIDATION_FAILED, str(exc), {"id": id})
             card = project([task], store.escalations.list_all())[0]
+            _notify_dirty()
             return ok_result({"card": card})
 
     # ASYMMETRIC-ADVERTISING / DEFERRED CAPABILITY GAP (deliberate, NOT permanent):
@@ -602,13 +624,41 @@ def create_app(config: Optional[ServerConfig] = None) -> Starlette:
 
 def main() -> None:
     """Console entry point. Refuses to start without a configured token (no
-    unauthenticated fallback)."""
+    unauthenticated fallback). Initializes Drive backup (DORMANT when SA key absent)
+    and handles --restore-from-drive gated restore."""
+    import sys
     import uvicorn
 
     config = from_env()
     if not config.token:
         raise SystemExit("CLAUNKER_SPINE_TOKEN is required (no unauthenticated fallback).")
-    uvicorn.run(create_app(config), host=config.host, port=config.port)
+
+    from spine.drive_backup import DriveBackup, restore_from_drive
+
+    restore = "--restore-from-drive" in sys.argv
+
+    # Gated restore: only guard when backup is configured (SA key present).
+    # Build a temp backup to check dormancy before full init.
+    _probe = DriveBackup(config.db_path)
+    if not _probe.dormant:
+        db_exists = os.path.exists(config.db_path) and os.path.getsize(config.db_path) > 0
+        if not db_exists:
+            if restore:
+                restore_from_drive(config.db_path)
+            else:
+                raise SystemExit(
+                    "FATAL: Local ledger absent. "
+                    "To adopt remote Drive backup, restart with --restore-from-drive"
+                )
+
+    backup = DriveBackup(config.db_path)
+    _set_backup(backup)
+    backup.startup_flush()
+
+    try:
+        uvicorn.run(create_app(config), host=config.host, port=config.port)
+    finally:
+        backup.shutdown_flush()
 
 
 if __name__ == "__main__":
