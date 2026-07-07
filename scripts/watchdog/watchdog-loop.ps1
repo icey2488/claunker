@@ -5,6 +5,11 @@
 # any response (incl. 401) = alive, connection failure / timeout = down.
 # Revival path: delegates to _relaunch_spine.py, which holds the production
 # env config and the ACL-locked token — no credentials stored here.
+#
+# Trigger is at-logon ONLY, by decision 2026-07-07: cold-boot coverage requires
+# either stored credentials in the task or running as SYSTEM, and SYSTEM cannot
+# read the icacls-locked .env.spine-token. Tradeoff declined; the operator logs
+# in on boot.
 
 $ROOT         = "C:\Users\Raide\code\claunker-hermes"
 $PYTHON       = "$ROOT\.venv\Scripts\python.exe"
