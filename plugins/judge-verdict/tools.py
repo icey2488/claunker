@@ -1,6 +1,12 @@
 """Handler for judge_verdict — builds the judge prompt and runs a pinned, structured judge call."""
 
+import datetime
+import hashlib
 import json
+import os
+import pathlib
+import sys
+import time
 
 from .schemas import VERDICT_OUTPUT_SCHEMA
 
@@ -49,6 +55,12 @@ Rules:
 - Higher risk_tier raises your bar. On 'high', escalate when in doubt.
 - Be terse. Rationale is one paragraph. No praise, no hedging."""
 
+# Stable instructions string used both in the LLM call and the prompt hash.
+_JUDGE_INSTRUCTIONS = (
+    "Adjudicate the executor output against the task spec and "
+    "acceptance criteria provided below."
+)
+
 
 def build_judge_input(params):
     """Assemble the judge's user-message text from the tool params.
@@ -65,6 +77,37 @@ def build_judge_input(params):
         f"EXECUTOR OUTPUT (the deliverable to judge):\n{params['executor_output']}\n\n"
         "Return your verdict in the required JSON shape."
     )
+
+
+# --- FT-005: durable provenance log ----------------------------------------
+
+def _judge_log_path():
+    hermes_home = os.environ.get("HERMES_HOME")
+    if hermes_home:
+        return pathlib.Path(hermes_home) / "logs" / "judge_provenance.jsonl"
+    local_app = os.environ.get("LOCALAPPDATA")
+    if local_app:
+        return pathlib.Path(local_app) / "hermes" / "logs" / "judge_provenance.jsonl"
+    # Fallback: alongside this file (plugin's own directory)
+    return pathlib.Path(__file__).parent / "judge_provenance.jsonl"
+
+
+_LOG_PATH = _judge_log_path()
+
+
+def _utc_iso():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="milliseconds")
+
+
+def _append_log(entry):
+    # Fail-open: log failures must never propagate to the caller.
+    try:
+        _LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(_LOG_PATH, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry) + "\n")
+            fh.flush()
+    except Exception as log_exc:  # noqa: BLE001
+        print(f"[judge-verdict] FT-005 provenance log write failed: {log_exc}", file=sys.stderr)
 
 
 def make_handler(ctx):
@@ -84,6 +127,12 @@ def make_handler(ctx):
                 ),
             })
 
+        judge_input = build_judge_input(params)
+        request_sha256 = hashlib.sha256(
+            (JUDGE_SYSTEM + "\n" + _JUDGE_INSTRUCTIONS + "\n" + judge_input).encode()
+        ).hexdigest()
+        t0 = time.monotonic()
+
         try:
             # Route through the host's structured-completion helper, PINNED to
             # the decorrelated judge model via explicit provider=/model=. The
@@ -93,11 +142,8 @@ def make_handler(ctx):
             # we never silently run the wrong model.
             result = ctx.llm.complete_structured(
                 system_prompt=JUDGE_SYSTEM,
-                instructions=(
-                    "Adjudicate the executor output against the task spec and "
-                    "acceptance criteria provided below."
-                ),
-                input=[{"type": "text", "text": build_judge_input(params)}],
+                instructions=_JUDGE_INSTRUCTIONS,
+                input=[{"type": "text", "text": judge_input}],
                 json_schema=VERDICT_OUTPUT_SCHEMA,
                 provider=JUDGE_PROVIDER,
                 model=JUDGE_MODEL,
@@ -114,6 +160,14 @@ def make_handler(ctx):
             # every judge-unreachable condition: 503/5xx, timeout, auth failure,
             # connection error. RC-001 trust errors (pin changed off-allowlist)
             # also land here and escalate safely — never auto-accept.
+            _append_log({
+                "ts": _utc_iso(),
+                "provider": JUDGE_PROVIDER,
+                "model": JUDGE_MODEL,
+                "request_sha256": request_sha256,
+                "outcome": "trust_error" if type(exc).__name__ == "PluginLlmTrustError" else "api_error",
+                "duration_ms": round((time.monotonic() - t0) * 1000),
+            })
             return json.dumps({
                 "success": True,
                 "judge_available": False,
@@ -137,6 +191,14 @@ def make_handler(ctx):
             # Judge ran but produced no usable verdict — route exactly like an
             # outage: an unambiguous escalate (success=True, judge_available=
             # False), never a bare error the architect could improvise around.
+            _append_log({
+                "ts": _utc_iso(),
+                "provider": JUDGE_PROVIDER,
+                "model": JUDGE_MODEL,
+                "request_sha256": request_sha256,
+                "outcome": "api_error",
+                "duration_ms": round((time.monotonic() - t0) * 1000),
+            })
             return json.dumps({
                 "success": True,
                 "judge_available": False,
@@ -150,6 +212,15 @@ def make_handler(ctx):
                 "defects": [],
             })
 
+        _append_log({
+            "ts": _utc_iso(),
+            "provider": JUDGE_PROVIDER,
+            "model": JUDGE_MODEL,
+            "request_sha256": request_sha256,
+            "outcome": "verdict",
+            "verdict_verdict": verdict["verdict"],
+            "duration_ms": round((time.monotonic() - t0) * 1000),
+        })
         verdict.setdefault("defects", [])
         # Mark a real, judge-rendered verdict so the architect (and the FT-009
         # controls test) can distinguish a genuine accept/revise/escalate from
