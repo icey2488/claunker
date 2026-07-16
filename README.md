@@ -37,6 +37,7 @@ Every knob is an env var (defaults from `spine_server/config.py`):
 | `CLAUNKER_SPINE_PORT` | `8848` | Bind port. |
 | `CLAUNKER_SPINE_MAX_BYTES` | `8388608` (8 MiB) | Snapshot ceiling for `card_list`. The list never truncates: an over-ceiling snapshot fails with `payload_too_large`. |
 | `CLAUNKER_SPINE_ALLOWED_HOSTS` | empty | Extra Host-header values the transport accepts (comma-separated), on top of the configured host/port and the loopback aliases. |
+| `CLAUNKER_SPINE_SA_KEY` | `claunker-spine-sa-key.json` at repo root | Path to the Google service-account JSON key that activates the Drive-durable spine backup. Backup is dormant while the file is absent. Do NOT use the default: that path is not gitignored and this repo is public. Store the key outside the repo and point this variable at it. |
 
 ## The tool surface (8 tools)
 
