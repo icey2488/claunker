@@ -22,6 +22,8 @@ Unchanged from v1: Docker backend (`terminal.backend: docker` [verified 2026-07-
 
 **Holds:** durable orchestration state in `spine/spine.db` (SQLite, WAL mode per `PRAGMA journal_mode=WAL` in storage.py [verified 2026-07-03]) local to the Windows host, per the 2026-06-28 storage amendment. WAL sibling files (`spine.db-wal`, `spine.db-shm`) were absent at verification time — expected behavior after a checkpoint with no active writers, not an indication that WAL mode is off [verified 2026-07-03]. The v1 entry described a Drive credential for `claunker_spine_v1`; that reflects the pre-amendment design. NO Drive-sync controller is wired in the live persistence path: `storage.py` explicitly designates `dump()`/`load()` as "the seam for a *future* Google-Drive sync (sync-merge is out of scope this slice)" [verified 2026-07-03]. No `claunker_spine_v1` reference found anywhere in the live codebase [verified 2026-07-03].
 
+> **CORRECTION 2026-07-10:** superseded — the Drive-durable spine backup controller EXISTS (`spine/drive_backup.py`), built dormant. Activation is keyed solely on the existence of the SA key file (`CLAUNKER_SPINE_SA_KEY`, default `claunker-spine-sa-key.json` at repo root — default path NOT gitignored; the repo is public, so the key must live OUTSIDE the repo tree). Dormant = all backup methods no-op. See Grant #10.
+
 **Reach:** one local database file.
 
 **Verdict: INTENTIONAL per the amendment — but the durability property moved and is now a flagged gap.** §5.9's "spine state is Drive-durable" does not currently hold: the ledger's blast radius is one machine. The dump/merge/load sync seam is designed and unwired. Until wired, a disk loss is a total orchestration-ledger loss.
@@ -105,6 +107,13 @@ The action is **not a fixed operation**: it executes `logs\_elevated_runner.ps1`
 
 **Watch:** the command file path (`logs\elevated_command.ps1`) is a user-writable path reachable from any user-session process, including claude-async jobs. A hardened posture would either (a) restrict the command file path to a location only an elevated actor can write, or (b) enumerate and allowlist specific permitted operations rather than executing arbitrary staged content. Until then, treat the claude-async lane as transitively holding HighestAvailable elevation authority, and weight that into any future expansion of who can trigger that lane.
 
+### 10. Claunker Spine → Google Drive (Service Account) — PENDING ACTIVATION
+
+- Holder: the spine process (spine_server) on the operator's rig; key file path supplied via CLAUNKER_SPINE_SA_KEY (must point outside the repo tree; default repo-root path is not gitignored and the repo is public).
+- Scope: Drive `drive.file` as the SA's own identity; target folder `claunker-spine-backups` (find-or-create at runtime), blob `claunker_spine_v1.json.gz`.
+- Status 2026-07-10: key generation in progress. This grant is NOT live until the spine logs `drive_backup: ACTIVE` and a write-plus-restore smoke passes. Update this row with the activation date and verification receipt when confirmed.
+- Watch: the SA-created folder may live in the SA's own Drive space rather than the operator's My Drive (sharing-model note); duplicate blobs trigger the split-brain HALT (drive_backup.py guard); first live start on an empty local DB requires `--restore-from-drive`.
+
 ---
 
 ## Audit summary
@@ -120,6 +129,7 @@ The action is **not a fixed operation**: it executes `logs\_elevated_runner.ps1`
 | 7 | claude-async | operator user account, remote-triggerable | **OVER-BROAD BY NATURE** — accepted; ledger is the control |
 | 8 | Desktop Claude Code | operator user account, interactive | INTENTIONAL — correlated lane, on-ledger |
 | 9 | ClaunkerElevatedRunner | arbitrary PowerShell at HighestAvailable, user-session-triggerable | **STANDING ELEVATION TRAMPOLINE** — reachability accepted; claude-async lane transitively elevation-capable |
+| 10 | Spine → Drive (SA) | `drive.file` as SA identity; `claunker-spine-backups` folder | **PENDING** — dormant until SA key file exists; not live until `drive_backup: ACTIVE` + write-plus-restore smoke |
 
 **Owed actions, consolidated (pre-Phase-4):**
 - #4 scope narrowing (carried from v1)
