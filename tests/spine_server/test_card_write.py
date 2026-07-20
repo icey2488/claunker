@@ -6,10 +6,15 @@ Drives each tool through the SDK's in-memory client (same harness as
 test_escalation_resolve) against a file-backed spine, and asserts the ratified
 stance + the spec's optimistic-concurrency model:
 
-  * card_create persists a new Task and returns its projected Card; an empty title
-    and a bad tier are validation_failed; an unknown project is not_found.
-    (card_create is UNCHANGED by the conformance pass — its CardInput conformance is
-    a separate slice — so it keeps its int ``tier`` and flat fields.)
+  * card_create speaks the spec shape { card: CardInput, project_id } and persists a
+    new Task, returning its projected Card. HUMAN INTAKE defaults: column 'created',
+    UNTIERED (tier only when the input carries one — a "tier:N" tag or the
+    card_update-style tolerance). Idempotent on a duplicate id (live OR tombstone —
+    the existing card returns as success, before the project_id requirement so a
+    retry never trips targeting). project_id is REQUIRED (validation_failed naming
+    project_list when absent; unknown/tombstoned project → not_found — no phantom
+    projects, no silent default). Authority-owned CardInput fields are ignored;
+    created_by is stamped from the credential ({type: human, id: operator}).
   * card_update takes the spec shape { id, patch, expected_version, force? } and edits
     ONLY the modeled mutable fields in the patch (title / acceptance_criteria / effort /
     impact / tier); patch.tier rides as the "tier:N" tag-id string the projection emits
@@ -103,18 +108,20 @@ def _tombstone(path, task_id):
         spine.store.close()
 
 
-# ── card_create (UNCHANGED by the conformance pass) ───────────────────────────────
+# ── card_create — spec shape { card: CardInput, project_id } (the conformance pass) ──
 def test_card_create_persists_and_returns_projected_card():
     directory, path = make_temp_db()
     try:
         project_id, _ = _seed_task(path)  # gives us a real project to create into
         is_error, sc = anyio.run(
             _call, build_server(_config(path)), "card_create",
-            {"project_id": project_id, "title": "new card", "state": "tiered", "tier": 3},
+            {"card": {"title": "new card", "column_id": "tiered", "tags": ["tier:3"]},
+             "project_id": project_id},
         )
         assert is_error is False
         card = sc["card"]
-        # The projected Card: state→column, tier→tag, gate_status COMMITTED, no badge.
+        # The projected Card: column IS the state, tier rides as its tag,
+        # gate_status COMMITTED, no badge.
         assert card["title"] == "new card"
         assert card["column_id"] == "tiered"
         assert card["tags"] == ["tier:3"]
@@ -123,22 +130,88 @@ def test_card_create_persists_and_returns_projected_card():
         # Committed to disk (acceptance_criteria is stored though not in the Card lens).
         stored = _task_on_disk(path, card["id"])
         assert stored is not None and stored.state == "tiered" and stored.tier == 3
+        assert stored.project_id == project_id
     finally:
         cleanup(directory)
 
 
-def test_card_create_defaults_state_created_tier_one_empty_criteria():
+def test_card_create_defaults_are_human_intake_created_and_untiered():
     directory, path = make_temp_db()
     try:
         project_id, _ = _seed_task(path)
         is_error, sc = anyio.run(
             _call, build_server(_config(path)), "card_create",
-            {"project_id": project_id, "title": "defaulted"},
+            {"card": {"title": "intake"}, "project_id": project_id},
         )
         assert is_error is False
-        assert sc["card"]["column_id"] == "created"   # default state
-        assert sc["card"]["tags"] == ["tier:1"]        # default tier
-        assert _task_on_disk(path, sc["card"]["id"]).acceptance_criteria == ""  # default ""
+        # HUMAN INTAKE: the card enters 'created', UNTIERED (no tier:N tag), exactly
+        # like a hand-written card — the retired int tier=1 default pre-classified.
+        assert sc["card"]["column_id"] == "created"
+        assert sc["card"]["tags"] == []
+        stored = _task_on_disk(path, sc["card"]["id"])
+        assert stored.tier is None
+        assert stored.acceptance_criteria == ""            # default ""
+        # order is server-appended when the client mints none.
+        assert isinstance(stored.order, str) and stored.order
+        # created_by is derived from the credential (the operator token), never null.
+        assert stored.created_by == {"type": "human", "id": "operator"}
+    finally:
+        cleanup(directory)
+
+
+def test_card_create_honors_client_minted_id_and_order():
+    directory, path = make_temp_db()
+    try:
+        project_id, _ = _seed_task(path)
+        is_error, sc = anyio.run(
+            _call, build_server(_config(path)), "card_create",
+            {"card": {"id": "client-uuid-1", "title": "positioned", "order": "zz"},
+             "project_id": project_id},
+        )
+        assert is_error is False
+        assert sc["card"]["id"] == "client-uuid-1"     # servers MUST accept client ids
+        assert sc["card"]["order"] == "zz"             # client-minted LexoRank honored
+        assert _task_on_disk(path, "client-uuid-1").order == "zz"
+    finally:
+        cleanup(directory)
+
+
+def test_card_create_duplicate_id_returns_existing_card_as_success():
+    directory, path = make_temp_db()
+    try:
+        project_id, task_id = _seed_task(path, title="original")
+        # A retry replaying an id the spine knows returns the EXISTING card — success,
+        # no write, the different payload ignored. Runs before the project_id
+        # requirement (an untargeted retry of a landed create must not trip it), so
+        # this call deliberately omits project_id.
+        is_error, sc = anyio.run(
+            _call, build_server(_config(path)), "card_create",
+            {"card": {"id": task_id, "title": "totally different"}},
+        )
+        assert is_error is False
+        assert sc["card"]["id"] == task_id
+        assert sc["card"]["title"] == "original"                 # nothing overwritten
+        assert _task_on_disk(path, task_id).title == "original"
+        assert _version_of(path, task_id) == sc["card"]["version"]  # no version mint
+    finally:
+        cleanup(directory)
+
+
+def test_card_create_duplicate_tombstoned_id_returns_the_tombstone():
+    directory, path = make_temp_db()
+    try:
+        project_id, task_id = _seed_task(path, title="gone")
+        _tombstone(path, task_id)
+        is_error, sc = anyio.run(
+            _call, build_server(_config(path)), "card_create",
+            {"card": {"id": task_id, "title": "resurrect?"}, "project_id": project_id},
+        )
+        # Spec §Create: "including tombstoned" — the existing card comes back as
+        # success, and it IS the tombstone (deleted_at set): create never resurrects.
+        assert is_error is False
+        assert sc["card"]["id"] == task_id
+        assert sc["card"]["deleted_at"] is not None
+        assert _task_on_disk(path, task_id).title == "gone"
     finally:
         cleanup(directory)
 
@@ -149,7 +222,7 @@ def test_card_create_empty_title_is_validation_failed():
         project_id, _ = _seed_task(path)
         is_error, sc = anyio.run(
             _call, build_server(_config(path)), "card_create",
-            {"project_id": project_id, "title": "   "},  # whitespace-only is empty
+            {"card": {"title": "   "}, "project_id": project_id},  # whitespace-only is empty
         )
         assert is_error is True
         assert sc["code"] == "validation_failed"
@@ -161,26 +234,119 @@ def test_card_create_bad_tier_is_validation_failed():
     directory, path = make_temp_db()
     try:
         project_id, _ = _seed_task(path)
+        server = build_server(_config(path))
+        # Out-of-range via the card_update-style tier tolerance…
         is_error, sc = anyio.run(
-            _call, build_server(_config(path)), "card_create",
-            {"project_id": project_id, "title": "t", "tier": 7},
+            _call, server, "card_create",
+            {"card": {"title": "t", "tier": 7}, "project_id": project_id},
         )
-        assert is_error is True
-        assert sc["code"] == "validation_failed"
+        assert is_error is True and sc["code"] == "validation_failed"
+        # …out-of-range via the canonical tag form…
+        is_error, sc = anyio.run(
+            _call, server, "card_create",
+            {"card": {"title": "t", "tags": ["tier:0"]}, "project_id": project_id},
+        )
+        assert is_error is True and sc["code"] == "validation_failed"
+        # …and a malformed tier tag (not parseable to a tier int).
+        is_error, sc = anyio.run(
+            _call, server, "card_create",
+            {"card": {"title": "t", "tags": ["tier:abc"]}, "project_id": project_id},
+        )
+        assert is_error is True and sc["code"] == "validation_failed"
     finally:
         cleanup(directory)
 
 
-def test_card_create_unknown_project_is_not_found():
+def test_card_create_missing_project_id_is_validation_failed_naming_the_read():
+    directory, path = make_temp_db()
+    try:
+        _seed_task(path)  # projects exist; the caller just failed to target one
+        is_error, sc = anyio.run(
+            _call, build_server(_config(path)), "card_create",
+            {"card": {"title": "untargeted"}},
+        )
+        # LOUD, no default-project fallback: the error names the enumeration read.
+        assert is_error is True
+        assert sc["code"] == "validation_failed"
+        assert "project_list" in sc["message"]
+    finally:
+        cleanup(directory)
+
+
+def test_card_create_unknown_or_tombstoned_project_is_not_found():
     directory, path = make_temp_db()
     try:
         _seed_task(path)  # a real project exists, but we target a ghost id
+        server = build_server(_config(path))
+        is_error, sc = anyio.run(
+            _call, server, "card_create",
+            {"card": {"title": "orphan"}, "project_id": "ghost"},
+        )
+        assert is_error is True and sc["code"] == "not_found"
+        # A soft-deleted project is not a live create target either.
+        spine = Spine(Store(path))
+        try:
+            dead = spine.create_project("retired")
+            dead.deleted_at = "2026-01-01T00:00:00+00:00"
+            spine.store.projects.put(dead)
+            dead_id = dead.id
+        finally:
+            spine.store.close()
+        is_error, sc = anyio.run(
+            _call, server, "card_create",
+            {"card": {"title": "orphan"}, "project_id": dead_id},
+        )
+        assert is_error is True and sc["code"] == "not_found"
+    finally:
+        cleanup(directory)
+
+
+def test_card_create_ignores_authority_owned_fields():
+    directory, path = make_temp_db()
+    try:
+        project_id, _ = _seed_task(path)
         is_error, sc = anyio.run(
             _call, build_server(_config(path)), "card_create",
-            {"project_id": "ghost", "title": "orphan"},
+            {"card": {
+                "title": "forged",
+                "version": "999:forged",
+                "created_at": "1999-01-01T00:00:00+00:00",
+                "created_by": {"type": "agent", "id": "impostor"},
+                "deleted_at": "1999-01-01T00:00:00+00:00",
+            }, "project_id": project_id},
         )
-        assert is_error is True
-        assert sc["code"] == "not_found"
+        # Spec §Create: authority-owned fields supplied by a client MUST be ignored,
+        # not errored. The stamp comes from the store/credential, never the payload.
+        assert is_error is False
+        stored = _task_on_disk(path, sc["card"]["id"])
+        assert stored.version != "999:forged"
+        assert stored.created_by == {"type": "human", "id": "operator"}
+        assert stored.deleted_at is None
+        assert stored.created_at != "1999-01-01T00:00:00+00:00"
+    finally:
+        cleanup(directory)
+
+
+def test_card_create_passes_due_and_depends_on_through_facade_validation():
+    directory, path = make_temp_db()
+    try:
+        project_id, other_id = _seed_task(path)
+        server = build_server(_config(path))
+        is_error, sc = anyio.run(
+            _call, server, "card_create",
+            {"card": {"title": "dated", "due": "2026-08-01T00:00:00+00:00",
+                      "depends_on": [other_id]},
+             "project_id": project_id},
+        )
+        assert is_error is False
+        assert sc["card"]["due"] == "2026-08-01T00:00:00+00:00"
+        assert sc["card"]["depends_on"] == [other_id]
+        # A malformed due is the facade's ValueError → validation_failed.
+        is_error, sc = anyio.run(
+            _call, server, "card_create",
+            {"card": {"title": "dated", "due": "not-a-date"}, "project_id": project_id},
+        )
+        assert is_error is True and sc["code"] == "validation_failed"
     finally:
         cleanup(directory)
 

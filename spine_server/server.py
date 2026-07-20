@@ -1,14 +1,16 @@
 """FastMCP wiring + the Starlette ASGI app.
 
-Advertises TEN tools — the read-only mirror pair (``board_get``, ``card_list``),
-the one human-gated escalation control (``escalation_resolve``), the FIVE
-operator card-write tools (``card_create``, ``card_update``, ``card_move``,
+Advertises ELEVEN tools — the read-only mirror pair (``board_get``, ``card_list``),
+the project-targeting read (``project_list`` — the enumeration ``card_create``'s
+targeting rides on), the one human-gated escalation control (``escalation_resolve``),
+the FIVE operator card-write tools (``card_create``, ``card_update``, ``card_move``,
 ``card_delete``, ``card_retier``), and the governed archive pair (``card_archive``,
 ``card_unarchive``). With the card_* write path advertised the board is
 no longer a read-only mirror: Kanbantt gates features on advertised tool NAMES, so this
-surface lets Kanbantt's ``canWrite``, ``canRetier``, and ``canArchive`` flip
-(``canRetier`` derives true iff ``card_retier`` is present; ``canArchive`` iff
-``card_archive`` is). Escalations still render from the per-card badge that
+surface lets Kanbantt's ``canWrite``, ``canRetier``, ``canArchive``, and
+``canTargetProjects`` flip (``canRetier`` derives true iff ``card_retier`` is present;
+``canArchive`` iff ``card_archive`` is; ``canTargetProjects`` iff ``project_list``
+is). Escalations still render from the per-card badge that
 rides in ``card_list`` (no ``escalation_list`` is advertised; see the
 asymmetric-advertising note on ``escalation_resolve`` below).
 
@@ -78,10 +80,19 @@ from .result import (
 
 # serverInfo (arrives in the ``initialize`` handshake; Kanbantt shows it as
 # "MCP: Claunker"). The version is this server's own version, aligned to the Kanbantt
-# MCP spec version it implements (0.4.0) and still distinct from the data schema
-# version (1).
+# MCP spec version it implements (0.6.0 draft — project_list + the CardInput-shaped
+# card_create) and still distinct from the data schema version (1).
 SERVER_NAME = "Claunker"
-SERVER_VERSION = "0.5.0"
+SERVER_VERSION = "0.6.0"
+
+# Actor stamped as ``created_by`` on every card_create write. Derived from the
+# AUTHENTICATED CREDENTIAL, never the payload (the escalation_resolve actor stance
+# applied to attribution): the server authenticates exactly one Bearer token — the
+# operator's — so the creating actor is, by construction, the human operator. A
+# ``created_by`` riding in CardInput is an authority-owned field and is IGNORED per
+# spec §Create ("supplied by a client MUST be ignored, not errored"). At Stage 2
+# (per-user credentials) derive the real identity here.
+CARD_CREATE_ACTOR = {"type": "human", "id": "operator"}
 
 
 def _patch_tier_to_int(value: Any) -> int:
@@ -104,6 +115,31 @@ def _patch_tier_to_int(value: Any) -> int:
         if suffix.isdigit():
             return int(suffix)
     raise ValueError(f"tier must be the tag-id string 'tier:N' or an int 1..4, got {value!r}")
+
+
+def _tier_from_card_input(card: Dict[str, Any]) -> Optional[int]:
+    """Resolve the OPTIONAL tier a ``card_create`` CardInput carries, or ``None`` —
+    the UNTIERED default. The spec Card has no native ``tier`` field (tier lives in
+    ``tags`` as the projection's ``"tier:N"``), so the canonical carrier is a tier
+    tag; a native ``tier`` key is also accepted (the ``card_update`` patch tolerance,
+    via the same ``_patch_tier_to_int`` seam) and WINS when present. Non-tier tags
+    are ignored — the spine's ``tags`` carry only tier. A malformed tier value or a
+    non-list ``tags`` raises ``ValueError`` (→ ``validation_failed``); the 1..4 range
+    is the caller's check. NO DEFAULTING TO A TIER: an input carrying neither form is
+    genuinely untiered — board-created cards are human intake, and classification is
+    a later, separate rung (the old int ``tier=1`` default silently pre-classified
+    every create; that is exactly what this resolver retires)."""
+    if "tier" in card and card["tier"] is not None:
+        return _patch_tier_to_int(card["tier"])
+    tags = card.get("tags")
+    if tags is None:
+        return None
+    if not isinstance(tags, list):
+        raise ValueError(f"tags must be a list of tag-id strings, got {tags!r}")
+    for tag in tags:
+        if isinstance(tag, str) and tag.startswith(TIER_TAG_PREFIX):
+            return _patch_tier_to_int(tag)
+    return None
 
 
 def _conflict_result(current, store: Store) -> types.CallToolResult:
@@ -263,50 +299,142 @@ def build_server(config: ServerConfig) -> FastMCP:
     # `force: true` (update/move ONLY) crushes the version check; card_delete has NO
     # force — destructive ops never get a bypass. Tombstones are immutable: any of the
     # three targeting one returns `conflict` (meta.current = the tombstone), even under
-    # force. card_create is unchanged here (its CardInput conformance is a separate
-    # pass), so it keeps its int `tier`; card_update's patch.tier rides as the "tier:N"
-    # tag-id string the projection emits (see _patch_tier_to_int).
+    # force. card_create speaks the spec's { card: CardInput } shape (the conformance
+    # pass that was deferred), extended with a REQUIRED top-level project_id whose
+    # enumeration is the project_list read; tier rides as the "tier:N" tag-id string
+    # the projection emits (see _patch_tier_to_int / _tier_from_card_input).
+
+    @mcp.tool(
+        name="project_list",
+        description=(
+            "Return the spine's live Projects ({ projects: [{id, name, created_at}] }) "
+            "— the project-targeting read card_create's project_id rides on. "
+            "Read-only; clients gate their project picker on this tool's advertisement."
+        ),
+        structured_output=False,
+    )
+    def project_list() -> types.CallToolResult:
+        # Live projects only (a soft-deleted project is not a create target — the
+        # same liveness rule jobcard's resolver applies). Sorted (created_at, id):
+        # deterministic, oldest-first, with the opaque id as the stable tiebreak.
+        with Store(config.db_path) as store:
+            projects = [
+                {"id": p.id, "name": p.name, "created_at": p.created_at}
+                for p in store.projects.list_live()
+            ]
+        projects.sort(key=lambda p: (p["created_at"] or "", p["id"]))
+        return ok_result({"projects": projects})
 
     @mcp.tool(
         name="card_create",
-        description="Create a Task (an operator-authored card) in a project. A free, ungoverned operator write.",
+        description=(
+            "Create a card from spec CardInput ({ card, project_id }): an operator-"
+            "authored Task in a live project. A free, ungoverned operator write — "
+            "HUMAN INTAKE by default: column_id defaults to 'created' and the card is "
+            "UNTIERED unless the input itself carries a tier (a 'tier:N' tag, or the "
+            "card_update-style tier tolerance). Idempotent on a duplicate card id "
+            "(returns the existing card as success; safe to retry). project_id is "
+            "REQUIRED on this server — enumerate live projects via project_list."
+        ),
         structured_output=False,
     )
     def card_create(
-        project_id: str,
-        title: str,
-        state: str = "created",
-        tier: int = 1,
-        acceptance_criteria: str = "",
+        card: Dict[str, Any],
+        project_id: Optional[str] = None,
     ) -> types.CallToolResult:
-        # Input hygiene (→ validation_failed) is checked before the project lookup
+        # SPEC CONFORMANCE (kanbantt-mcp-spec §Create): CardInput is a Card minus the
+        # authority-owned fields — version / created_at / updated_at / created_by /
+        # updated_by / deleted_at supplied by a client are IGNORED, not errored (this
+        # handler simply never reads them; created_by is stamped from the credential,
+        # see CARD_CREATE_ACTOR). Fields the spine does not model (description,
+        # priority, checklist, attachments) flatten away at this boundary — the
+        # projection re-emits their Card defaults. project_id is the ONE extension
+        # over the spec input (this server's Tasks live in Projects); it rides at the
+        # top level NEXT TO the card so CardInput itself stays a pure Card subset.
+        #
+        # HUMAN-INTAKE SEMANTICS (the governance stance): a board-created card is
+        # intent capture ONLY. It defaults into 'created', UNTIERED — never
+        # auto-tiered, never dispatched; classification and dispatch are later,
+        # separate rungs on the Hermes side. This tool adds no gate (ungoverned
+        # operator write, exactly as card_update/card_move) and triggers nothing.
+
+        # Input hygiene (→ validation_failed) is checked before any lookup
         # (→ not_found), mirroring escalation_resolve's validate-before-lookup order.
-        if not title.strip():
-            return domain_error_result(VALIDATION_FAILED, "title must be a non-empty string", {})
-        if not (1 <= tier <= 4):
+        title = card.get("title")
+        if not isinstance(title, str) or not title.strip():
+            return domain_error_result(VALIDATION_FAILED, "card.title must be a non-empty string", {})
+        try:
+            tier = _tier_from_card_input(card)
+        except ValueError as exc:
+            return domain_error_result(VALIDATION_FAILED, str(exc), {})
+        if tier is not None and not (1 <= tier <= 4):
             return domain_error_result(
                 VALIDATION_FAILED, f"tier must be an int in 1..4, got {tier!r}", {"tier": tier}
             )
+        task_id = card.get("id")
+        if task_id is not None and (not isinstance(task_id, str) or not task_id):
+            return domain_error_result(
+                VALIDATION_FAILED, f"card.id must be a non-empty string, got {task_id!r}", {}
+            )
+        order = card.get("order")
+        if order is not None and (not isinstance(order, str) or not order):
+            return domain_error_result(
+                VALIDATION_FAILED, f"card.order must be a non-empty string, got {order!r}", {}
+            )
+
         try:
             with Store(config.db_path) as store:
                 spine = Spine(store)
-                if spine.get_project(project_id) is None:
+
+                # IDEMPOTENT CREATE (spec §Create): an id the spine already knows —
+                # live OR tombstoned — returns the existing card as SUCCESS, no write,
+                # no error. This runs BEFORE the project_id requirement so a retry of
+                # a create that already landed never trips targeting validation.
+                if task_id is not None:
+                    existing = spine.get_task(task_id)
+                    if existing is not None:
+                        if existing.deleted_at is not None:
+                            return ok_result({"card": tombstone_card(existing)})
+                        return ok_result(
+                            {"card": project([existing], store.escalations.list_all())[0]}
+                        )
+
+                # PROJECT TARGETING: required, explicit, live-only. No default-project
+                # fallback — an untargeted create must not land somewhere silently
+                # (and a typo must not mint a phantom project: unknown → not_found,
+                # never create-if-missing).
+                if project_id is None:
+                    return domain_error_result(
+                        VALIDATION_FAILED,
+                        "card_create on this server requires project targeting: "
+                        "pass project_id (enumerate live projects via project_list)",
+                        {},
+                    )
+                proj = spine.get_project(project_id)
+                if proj is None or proj.deleted_at is not None:
                     return domain_error_result(
                         NOT_FOUND, f"project {project_id!r} does not exist", {"project_id": project_id}
                     )
+
                 task = spine.create_task(
                     project_id,
                     title,
-                    state=state,
+                    state=card.get("column_id") or "created",  # column IS the state
                     tier=tier,
-                    acceptance_criteria=acceptance_criteria,
+                    acceptance_criteria=card.get("acceptance_criteria") or "",
+                    due=card.get("due"),
+                    depends_on=card.get("depends_on"),
+                    task_id=task_id,
+                    order=order,
+                    created_by=CARD_CREATE_ACTOR,
                 )
-                card = project([task], store.escalations.list_all())[0]
+                card_out = project([task], store.escalations.list_all())[0]
         except ValueError as exc:
-            # create_task validates the target state ∈ STATES.
+            # create_task validates the target state ∈ STATES, due ISO-8601, and
+            # depends_on shape/self-reference (SpineError is a ValueError).
             return domain_error_result(VALIDATION_FAILED, str(exc), {})
         _notify_dirty()
-        return ok_result({"card": card})
+        return ok_result({"card": card_out})
 
     @mcp.tool(
         name="card_update",

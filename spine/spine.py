@@ -184,14 +184,17 @@ class Spine:
         due: Optional[str] = None,
         depends_on: Optional[List[str]] = None,
         task_id: Optional[str] = None,
+        order: Optional[str] = None,
         created_at: Optional[str] = None,
         created_by: Optional[Dict[str, Any]] = None,
     ) -> Task:
-        """Create a task, append-at-end in board order. ``order`` is seeded after
-        the current max live rank; ``rebalance`` is NEVER invoked here. Note: this
-        does not validate ``project_id`` exists (no such MI is specified).
-        ``created_by`` is write-once and create-time only in v1; the Task constructor
-        validates the shape when non-null (SpineError on malformed).
+        """Create a task, append-at-end in board order. ``order`` defaults to a seed
+        after the current max live rank (``rebalance`` is NEVER invoked here); a
+        caller-supplied ``order`` (the spec's client-minted LexoRank CardInput field)
+        is honored verbatim — opaque, sort-by-string, exactly as ``reposition`` treats
+        it. Note: this does not validate ``project_id`` exists (no such MI is
+        specified). ``created_by`` is write-once and create-time only in v1; the Task
+        constructor validates the shape when non-null (SpineError on malformed).
         ``due`` must be null or a valid ISO-8601 string. ``depends_on`` must be a
         list of non-empty strings; self-reference (own id in list) → SpineError."""
         if state not in STATES:
@@ -208,7 +211,9 @@ class Spine:
         tid = task_id or str(uuid.uuid4())
         if actual_deps and tid in actual_deps:
             raise SpineError(f"task {tid!r} cannot depend on itself")
-        last_order = max((t.order for t in self.store.tasks.list_live()), default="")
+        if order is None:
+            last_order = max((t.order for t in self.store.tasks.list_live()), default="")
+            order = append_rank(last_order)
         task = Task(
             id=tid,
             project_id=project_id,
@@ -218,7 +223,7 @@ class Spine:
             acceptance_criteria=acceptance_criteria,
             due=due,
             depends_on=actual_deps,
-            order=append_rank(last_order),
+            order=order,
             created_at=created_at or utcnow_iso(),
             created_by=created_by,
         )

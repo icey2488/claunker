@@ -39,18 +39,22 @@ Every knob is an env var (defaults from `spine_server/config.py`):
 | `CLAUNKER_SPINE_ALLOWED_HOSTS` | empty | Extra Host-header values the transport accepts (comma-separated), on top of the configured host/port and the loopback aliases. |
 | `CLAUNKER_SPINE_SA_KEY` | `claunker-spine-sa-key.json` at repo root | Path to the Google service-account JSON key that activates the Drive-durable spine backup. Backup is dormant while the file is absent. Do NOT use the default: that path is not gitignored and this repo is public. Store the key outside the repo and point this variable at it. |
 
-## The tool surface (8 tools)
+## The tool surface (11 tools)
 
-`spine_server/server.py` advertises eight tools. Kanbantt derives `canWrite` from the
-four `card_*` write tools as a set, and `canRetier` from `card_retier` alone.
+`spine_server/server.py` advertises eleven tools. Kanbantt derives `canWrite` from the
+four `card_*` write tools as a set, `canRetier` from `card_retier` alone, `canArchive` /
+`canUnarchive` from the archive pair each alone, and `canTargetProjects` from
+`project_list` alone.
 
 - **`board_get`**: return the read-only board, six columns (one per Task state, derived from the `State` enum) plus the tier tags. No input.
-- **`card_list`**: return a full snapshot of the spine's live Tasks projected to Cards, plus a fresh `sync_token`. Filters: `updated_since`, `column_id`, `tag`, `include_deleted`. Never truncates; an over-ceiling snapshot fails with `payload_too_large`.
-- **`card_create`**: create a Task (an operator-authored card) in a project. An ungoverned operator write. Takes `project_id`, `title`, `state`, an int `tier` (1..4), and `acceptance_criteria`.
+- **`card_list`**: return a full snapshot of the spine's live Tasks projected to Cards, plus a fresh `sync_token`. Filters: `updated_since`, `column_id`, `tag`, `include_deleted`, `include_archived`. Never truncates; an over-ceiling snapshot fails with `payload_too_large`.
+- **`project_list`**: return the live Projects (`{ projects: [{id, name, created_at}] }`) — the project-targeting read `card_create` rides on. Read-only; clients gate their project picker on its advertisement.
+- **`card_create`**: create a card from the spec's `{ card: CardInput, project_id }` shape — an operator-authored Task in a live project. Human intake by default: `column_id` defaults to `created` and the card is **untiered** unless the input itself carries a tier (a `tier:N` tag, or the `card_update`-style tier tolerance). Idempotent on a duplicate card id (returns the existing card as success). `project_id` is required (`validation_failed` naming `project_list` when absent; unknown or tombstoned project → `not_found`).
 - **`card_update`**: edit a card's mutable fields via a `patch` (title, acceptance_criteria, tier). `expected_version` is required (optimistic concurrency); `force` skips only the version check. A set tier is write-once here: a `patch.tier` that differs from the current set tier is rejected with `validation_failed` and must go through `card_retier`.
 - **`card_move`**: move a card to a `column_id` (a Task state) at a LexoRank `order`. `expected_version` is required; `force` skips the version check. There is no transition-legality check.
 - **`card_delete`**: soft-delete a card to a recoverable tombstone (the row is retained, hidden from the board). Returns the tombstone card. `expected_version` is required, and there is no `force`: destructive ops never bypass the version check.
 - **`card_retier`**: the governed, audited tier change. Move an already-set tier to a different valid tier (1..4). `reason` is required (non-empty), `expected_version` is required, and there is no `force`. On success it appends exactly one `tier_audit` row atomically with the change.
+- **`card_archive`** / **`card_unarchive`**: the governed, audited archive pair — set/clear the orthogonal `archived_at` flag, appending one `archive_audit` row atomically with the change. `expected_version` required, no `force`; loud idempotency; an open escalation blocks archive.
 - **`escalation_resolve`**: the one human-gated control. Record an operator approve/deny decision with a rationale, writing the spine. It takes no `actor` parameter; the actor is derived from the authenticated credential (the Bearer token is the operator assertion), never from the payload.
 
 Conflict semantics are uniform across the writes. An `expected_version` mismatch returns
