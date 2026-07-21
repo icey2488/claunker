@@ -3,7 +3,7 @@
 The spine data core (``spine/``) is in-process truth with no network surface. This
 package puts a real MCP server in front of it so Kanbantt can drive the spine's
 Tasks as a board of Cards in six columns — conforming to the Kanbantt MCP spec
-v0.3.0 (synced to ``docs/kanbantt-mcp-spec.md``).
+v0.6.0 (synced to ``docs/kanbantt-mcp-spec.md``).
 
 Shape:
 
@@ -21,13 +21,14 @@ Shape:
                 domain-error shape (isError).
     http.py     pure-ASGI CORS + Bearer middleware (pure-ASGI so the SSE GET stream
                 is never buffered). Verbatim CORS headers; 401 at the transport.
-    server.py   FastMCP wiring: advertises the eight governed tools ``board_get``,
-                ``card_list``, ``card_create``, ``card_update``, ``card_move``,
-                ``card_delete``, ``card_retier``, and ``escalation_resolve``, plus
-                ``create_app`` (the Starlette ASGI app) and ``main``.
+    server.py   FastMCP wiring: advertises the eleven governed tools ``board_get``,
+                ``card_list``, ``project_list``, ``card_create``, ``card_update``,
+                ``card_move``, ``card_delete``, ``card_retier``, ``card_archive``,
+                ``card_unarchive``, and ``escalation_resolve``, plus ``create_app``
+                (the Starlette ASGI app) and ``main``.
 
 GOVERNED: the write tools mutate the spine store under optimistic-concurrency
-version checks; ``board_get`` and ``card_list`` stay read-only.
+version checks; ``board_get``, ``card_list``, and ``project_list`` stay read-only.
 """
 
 from .board import (  # noqa: F401
