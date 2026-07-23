@@ -1,6 +1,6 @@
 # Claunker Spine — Entity Schema & Lifecycle (Ratified)
 
-**Status:** Ratified 2026-06-16, amended 2026-06-28, amended 2026-07-05 (created_by), amended 2026-07-06 (due, depends_on, patch semantics).
+**Status:** Ratified 2026-06-16, amended 2026-06-28, amended 2026-07-05 (created_by), amended 2026-07-06 (due, depends_on, patch semantics), amended 2026-07-22 (created_by dispatch provenance).
 
 This document matches the as-built `spine/entity.py`, `spine/projection.py`, and `spine/spine.py`. Field names, enum values, and shapes below are the code's, not a parallel spec.
 
@@ -22,7 +22,9 @@ Project     { id, version, deleted_at, name, created_at }
 Task        { id, version, deleted_at, project_id, title, state, tier,
               acceptance_criteria, effort, impact, due, depends_on,
               order, created_at,
-              created_by: { "type": "human" | "agent", "id": string } | null,
+              created_by: { "type": "human" | "agent", "id": string,
+                            model?: string, effort?: string, job_id?: string,
+                            ...tolerated foreign keys } | null,
               archived_at }
 
 Artifact    { id, version, deleted_at, task_id, kind, ref, created_at }
@@ -111,3 +113,20 @@ See full record: `docs/claunker-amendment-2026-07-06-v050.md`.
 - **B. Task.depends_on** — `[task_id]`, empty-list default, additive. Display-only v1; write-admission rejects self-reference; cycles flagged at render. Clears via `[]`. Material 3(b).
 - **C. Task.due** — `ISO-8601 | null`, null default, additive drift closure (spec Card has declared `due` since v0.1.0). Non-material.
 - **D. Edit-audit ledger** — append-only `{id, card_id, field, old, new, actor, ts}`, one row per change on `{due, effort, impact, depends_on}`, atomic with mutation, no read API v1. Non-material.
+
+### Amendment 2026-07-22 — created_by dispatch provenance (additive, non-material; spec v0.7.0)
+
+- **What:** `created_by` gains OPTIONAL dispatch-provenance sub-keys — `model`, `effort`, `job_id` (each a string when present) — carried INSIDE the existing identity object, plus tolerance for unknown foreign keys:
+  ```
+  created_by: { "type": "human" | "agent", "id": string,
+                model?: string, effort?: string, job_id?: string,
+                ...tolerated foreign keys } | null
+  ```
+  No `schema_version` bump — additive-optional on the created_by/archived_at nullable precedent; legacy blobs (identity-only, or null) load untouched.
+- **Why the sub-keys live INSIDE created_by (load-bearing):** provenance describes HOW a card was MINTED (which reasoning model, which effort budget, which dispatch job), not the WORK. The Task already owns `effort`/`impact` as its **Matrix work-sizing axes** (mutable). A top-level dispatch `effort`/`model` would COLLIDE with that field's meaning. Homing provenance inside `created_by` sidesteps the collision AND inherits the write-once mint semantics. **Rule generalized:** never overload an existing field's semantics to carry provenance — additive-only, name-disjoint.
+- **Write-once / immutable:** provenance is set at MINT and never mutated — same rationale that makes `tier` write-once: the audit value is "what actually ran," which a mutable stamp destroys. `update_task` has no `created_by` parameter (structurally immutable); the MCP `card_update` handler REJECTS any patch carrying `created_by` with an EXPLICIT `validation_failed` (never a silent drop).
+- **Trust split at the wire (`card_create`):** IDENTITY (`type`/`id`) stays AUTHORITY-OWNED — always re-stamped from the authenticated credential, never the payload (anti-spoof, unchanged). PROVENANCE (`model`/`effort`/`job_id` + unknown non-identity keys) is descriptive metadata the minting client owns — READ from the payload and MERGED onto the credential identity. No provenance in → none stored (human intake). Validation of the merged shape happens in the entity layer (`_validate_created_by`): a non-string provenance value → `SpineError` → `validation_failed`.
+- **MCP interop:** the field and every sub-key are OPTIONAL; unknown keys inside `created_by` are TOLERATED both directions (a foreign server's extra keys never break our read/write path; our keys are additive to theirs). Projection passes the whole `created_by` object through verbatim (absent → null, NEVER fabricated).
+- **Downstream:** Kanbantt renders a quiet model+effort chip on the card face and a read-only provenance block in the card dialog — ONLY when provenance is present (human cards show nothing). The bridge (claude-async) emitting provenance at mint is a SEPARATE follow-up; this amendment is the RECEIVING half only.
+- **Documentation-drift note (for the record):** the provenance design brief asserted `created_by` was "added during v0.6.0 card_create and is NOT in the ratified four-entity schema doc." That is inaccurate — `created_by` was added in Amendment 2026-07-05 (above) with shape `{type, id}` and HAS been in §1 since. The v0.6.0 work was the `card_create` MCP tool wiring the stamp from the credential. The brief's `{kind, actor}` naming was likewise superseded by the as-built `{type, id}`; this amendment builds on the real shape, not the brief's.
+- **Materiality:** non-material, additive; log-and-proceed per governance §3.

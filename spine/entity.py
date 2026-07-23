@@ -27,8 +27,26 @@ class SpineError(ValueError):
     """Validation error raised by the spine data layer on malformed entity fields."""
 
 
+# Optional DISPATCH-PROVENANCE sub-keys carried INSIDE created_by (additive since the
+# provenance amendment). They describe HOW an agent-minted card was produced — the
+# reasoning ``model``, the reasoning ``effort`` budget, and the originating ``job_id``
+# — NOT the work. Homing them here (rather than at the Task top level) is LOAD-BEARING:
+# the Task already owns ``effort``/``impact`` as its Matrix work-sizing axes, and a
+# top-level dispatch ``effort`` would COLLIDE with that mutable work-size field. Inside
+# created_by there is no collision and the shape stays write-once with the rest of the
+# mint attribution. Each is an OPTIONAL string; a human card carries none.
+_PROVENANCE_STR_KEYS = ("model", "effort", "job_id")
+
+
 def _validate_created_by(v: Any) -> None:
-    """Raise SpineError if v is not a valid created_by shape."""
+    """Raise SpineError if v is not a valid created_by shape.
+
+    IDENTITY (``type`` + ``id``) is REQUIRED and unchanged: ``type`` ∈ {human, agent},
+    ``id`` a non-empty string. The optional provenance sub-keys (``model``/``effort``/
+    ``job_id``) are shape-checked as strings WHEN PRESENT. Any OTHER key is TOLERATED,
+    never rejected — additive-only forward-compat and MCP interop: a created_by minted
+    by a foreign server may carry keys we do not model, and that must not fail our write
+    or read path (the mirror rule: our keys must not break theirs either)."""
     if (
         not isinstance(v, dict)
         or v.get("type") not in ("human", "agent")
@@ -38,6 +56,11 @@ def _validate_created_by(v: Any) -> None:
         raise SpineError(
             f"created_by must be {{\"type\": \"human\"|\"agent\", \"id\": <non-empty string>}}, got {v!r}"
         )
+    for key in _PROVENANCE_STR_KEYS:
+        if key in v and not isinstance(v[key], str):
+            raise SpineError(
+                f"created_by.{key} provenance must be a string when present, got {v[key]!r}"
+            )
 
 
 # ── state / kind vocabularies ────────────────────────────────────────────────
@@ -150,6 +173,11 @@ class Task(_Entity):
     version: Optional[str] = None
     deleted_at: Optional[str] = None
     archived_at: Optional[str] = None
+    # WHO/HOW this task was minted, or ``None`` when unattributed. Identity is
+    # ``{type, id}``; an agent mint MAY additionally carry dispatch provenance
+    # (``model``/``effort``/``job_id``) plus tolerated foreign keys — see
+    # ``_validate_created_by``. WRITE-ONCE: set at create, never mutated (no
+    # ``update_task`` path touches it — the audit value is "what actually ran").
     created_by: Optional[Dict[str, Any]] = None
 
     def __post_init__(self) -> None:

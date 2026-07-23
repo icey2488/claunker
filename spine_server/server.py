@@ -80,10 +80,11 @@ from .result import (
 
 # serverInfo (arrives in the ``initialize`` handshake; Kanbantt shows it as
 # "MCP: Claunker"). The version is this server's own version, aligned to the Kanbantt
-# MCP spec version it implements (0.6.0 draft — project_list + the CardInput-shaped
-# card_create) and still distinct from the data schema version (1).
+# MCP spec version it implements (0.7.0 — dispatch provenance inside created_by, on top
+# of v0.6.x project_list + CardInput-shaped card_create) and still distinct from the
+# data schema version (1: provenance is additive-optional, no blob shape change).
 SERVER_NAME = "Claunker"
-SERVER_VERSION = "0.6.0"
+SERVER_VERSION = "0.7.0"
 
 # Actor stamped as ``created_by`` on every card_create write. Derived from the
 # AUTHENTICATED CREDENTIAL, never the payload (the escalation_resolve actor stance
@@ -93,6 +94,34 @@ SERVER_VERSION = "0.6.0"
 # spec §Create ("supplied by a client MUST be ignored, not errored"). At Stage 2
 # (per-user credentials) derive the real identity here.
 CARD_CREATE_ACTOR = {"type": "human", "id": "operator"}
+
+
+def _created_by_with_provenance(client_created_by: Any) -> Dict[str, Any]:
+    """Build the ``created_by`` stamp for a wire ``card_create``.
+
+    Splits ``created_by`` into two halves with DIFFERENT trust models:
+
+      * IDENTITY (``type`` + ``id``) is AUTHORITY-OWNED — always the authenticated
+        credential (``CARD_CREATE_ACTOR``), NEVER the client payload. This is the
+        anti-spoof invariant (spec §Create: authority-owned fields supplied by a client
+        MUST be ignored, not errored): a caller cannot claim a different actor.
+      * DISPATCH PROVENANCE (``model``/``effort``/``job_id`` + any other non-identity
+        keys) is DESCRIPTIVE metadata the minting client legitimately owns — it says
+        HOW the card was produced and carries NO authority — so it is READ from the
+        client's ``created_by`` and MERGED onto the credential identity.
+
+    A client that sends no ``created_by`` (human intake), or one carrying only
+    ``type``/``id``, yields exactly ``CARD_CREATE_ACTOR`` (no provenance → no chip on
+    the board). Unknown non-identity keys pass through (interop; ``created_by`` is
+    additive-optional). The merged shape is re-validated by the Task constructor, so a
+    non-string ``model``/``effort``/``job_id`` still fails as ``validation_failed``.
+    """
+    identity = dict(CARD_CREATE_ACTOR)
+    if not isinstance(client_created_by, dict):
+        return identity
+    provenance = {k: v for k, v in client_created_by.items() if k not in ("type", "id")}
+    # Identity always WINS the merge (anti-spoof); provenance never overrides type/id.
+    return {**provenance, **identity}
 
 
 def _patch_tier_to_int(value: Any) -> int:
@@ -426,7 +455,7 @@ def build_server(config: ServerConfig) -> FastMCP:
                     depends_on=card.get("depends_on"),
                     task_id=task_id,
                     order=order,
-                    created_by=CARD_CREATE_ACTOR,
+                    created_by=_created_by_with_provenance(card.get("created_by")),
                 )
                 card_out = project([task], store.escalations.list_all())[0]
         except ValueError as exc:
@@ -444,7 +473,8 @@ def build_server(config: ServerConfig) -> FastMCP:
             "RFC 7386 key-presence semantics: absent key = unchanged; present null = "
             "clear for {due, effort, impact}; depends_on uses [] to clear (null → "
             "validation_failed). Guarded: {tier, archived_at, deleted_at} present-null "
-            "→ validation_failed. NOT state or order (use card_move). "
+            "→ validation_failed; created_by present (any value) → validation_failed "
+            "(write-once mint provenance). NOT state or order (use card_move). "
             "expected_version required (optimistic concurrency); force skips the check."
         ),
         structured_output=False,
@@ -474,6 +504,18 @@ def build_server(config: ServerConfig) -> FastMCP:
             return domain_error_result(
                 VALIDATION_FAILED,
                 "deleted_at is governed by card_delete; use that tool",
+                {"id": id},
+            )
+        # WRITE-ONCE created_by (mint provenance): rejected on ANY presence, not just
+        # present-null. The audit value of created_by is "who/how this card was actually
+        # minted"; a mutable stamp destroys it — same rationale that made tier write-once.
+        # An EXPLICIT error, never a silent drop: silent-drop is the description bug we are
+        # not duplicating. Foreign clients that round-trip a full Card back as a patch are
+        # told plainly the field is immutable rather than having it vanish.
+        if "created_by" in patch:
+            return domain_error_result(
+                VALIDATION_FAILED,
+                "created_by is write-once mint provenance and cannot be changed by card_update",
                 {"id": id},
             )
 

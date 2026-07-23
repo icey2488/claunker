@@ -570,6 +570,45 @@ def test_legacy_blob_without_created_by_loads_untouched():
     assert len(store.tasks.list_live()) == 1
 
 
+# ── created_by dispatch provenance: model/effort/job_id inside created_by ──────
+# Provenance rides INSIDE created_by (never a top-level effort/model — the Task's own
+# effort/impact are the Matrix work-size axes and MUST NOT collide). Additive-optional:
+# a human/plain card carries none; the keys are validated as strings; unknown foreign
+# keys are tolerated; the whole stamp projects through the lens verbatim.
+
+def test_task_created_by_agent_with_provenance_persists_and_projects():
+    spine = Spine()
+    p = spine.create_project("p")
+    prov = {"type": "agent", "id": "claude-code", "model": "claude-sonnet-5",
+            "effort": "medium", "job_id": "job-42"}
+    t = spine.create_task(p.id, "x", created_at=T[0], created_by=prov)
+    assert t.created_by == prov
+    assert spine.get_task(t.id).created_by == prov      # survives the store round-trip
+    assert _card_for(spine, t.id)["created_by"] == prov  # projects verbatim
+
+
+def test_task_created_by_provenance_non_string_rejected():
+    # model/effort/job_id are shape-checked as strings WHEN PRESENT (write-admission).
+    _assert_raises(lambda: Task(id="t", project_id="p", title="x",
+                                created_by={"type": "agent", "id": "a", "model": 5}), SpineError)
+    _assert_raises(lambda: Task(id="t", project_id="p", title="x",
+                                created_by={"type": "agent", "id": "a", "effort": ["high"]}), SpineError)
+    _assert_raises(lambda: Task(id="t", project_id="p", title="x",
+                                created_by={"type": "agent", "id": "a", "job_id": 7}), SpineError)
+
+
+def test_task_created_by_unknown_keys_tolerated():
+    """MCP interop: a created_by minted by a FOREIGN server may carry keys we do not
+    model. They must NOT break our write or read path — additive-only, never rejected."""
+    spine = Spine()
+    p = spine.create_project("p")
+    foreign = {"type": "agent", "id": "some-other-agent", "model": "their-model",
+               "vendor_trace": {"span": "abc"}, "cost_cents": 3}
+    t = spine.create_task(p.id, "x", created_at=T[0], created_by=foreign)
+    assert t.created_by == foreign
+    assert _card_for(spine, t.id)["created_by"] == foreign  # unknown keys survive the lens
+
+
 # ── R6 durable-ref validation in create_artifact ──────────────────────────────
 
 def test_r6_git_hash_ref_accepted():
