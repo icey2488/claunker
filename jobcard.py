@@ -88,6 +88,7 @@ def cmd_create(
     model: Optional[str] = None,
     effort: Optional[str] = None,
     job_id: Optional[str] = None,
+    description: Optional[str] = None,
 ) -> None:
     if project_arg is None:
         project = _ensure_dispatch_log(spine)
@@ -103,7 +104,10 @@ def cmd_create(
             created_by["effort"] = effort
         if job_id is not None:
             created_by["job_id"] = job_id
-    task = spine.create_task(project.id, title, state=state, created_by=created_by)
+    # description: the narrative body (spec v0.8.0). Omitted = absent (None), never a
+    # coerced empty string — matches the wire card_create's absent-means-null handling.
+    task = spine.create_task(project.id, title, state=state, created_by=created_by,
+                             description=description)
     # ONLY the id on stdout — callers capture it (e.g. `jobcard done $(jobcard create ...)`).
     print(task.id)
 
@@ -200,6 +204,12 @@ def main(argv=None) -> int:
         help="dispatch provenance: originating claude-async job id to record in created_by "
              "(optional; ignored when --actor is omitted)",
     )
+    p_create.add_argument(
+        "--description",
+        default=None,
+        help="the card's narrative body (spec v0.8.0); a short Markdown summary of what "
+             "the card is about. Omitted = no body (never an empty string).",
+    )
 
     p_done = sub.add_parser("done", help="mark a pass card DELIVERED")
     p_done.add_argument("task_id", help="the task id printed by create")
@@ -230,7 +240,8 @@ def main(argv=None) -> int:
         if args.command == "create":
             cmd_create(spine, args.title, state=args.state, project_arg=args.project,
                        actor=args.actor, actor_type=args.actor_type,
-                       model=args.model, effort=args.effort, job_id=args.job_id)
+                       model=args.model, effort=args.effort, job_id=args.job_id,
+                       description=args.description)
         elif args.command == "done":
             cmd_done(spine, args.task_id)
         elif args.command == "fail":

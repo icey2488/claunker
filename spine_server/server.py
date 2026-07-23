@@ -50,6 +50,28 @@ from mcp.server.transport_security import TransportSecuritySettings
 from starlette.applications import Starlette
 
 from spine import ConflictError, Spine, Store, project
+from spine.projection import CARD_FIELD_KEYS
+
+# Input-only reserved keys a CardInput / patch may carry that are NOT projected Card
+# fields but must still NEVER be preserved as foreign metadata: ``tier`` (the native-int
+# tier carrier folded into the ``tier:N`` tag by ``_tier_from_card_input``) and
+# ``project_id`` (the top-level create-targeting sibling). Everything OUTSIDE
+# ``CARD_FIELD_KEYS ∪ _NON_METADATA_INPUT_KEYS`` is an unmodeled foreign key the write
+# boundary PRESERVES into ``Task.metadata`` (spec §Schema Versioning) rather than dropping.
+_NON_METADATA_INPUT_KEYS = frozenset({"tier", "project_id"})
+
+
+def _foreign_metadata(card: Dict[str, Any]) -> Dict[str, Any]:
+    """The unmodeled foreign keys of a CardInput / patch — everything the spine does not
+    model as a first-class Card field or consume as an input-only carrier. These are
+    PRESERVED (stored in ``Task.metadata``, echoed on projection) instead of flattened
+    away, honouring the spec's preserve-and-round-trip rule while forward-compat keys from
+    a newer client survive. The size/depth of the result is bounded downstream by
+    ``check_metadata_limits`` at the create/update boundary."""
+    return {
+        k: v for k, v in card.items()
+        if k not in CARD_FIELD_KEYS and k not in _NON_METADATA_INPUT_KEYS
+    }
 
 # Drive backup singleton — DORMANT until SA key is present (set by main()).
 _backup: Optional[Any] = None
@@ -80,11 +102,13 @@ from .result import (
 
 # serverInfo (arrives in the ``initialize`` handshake; Kanbantt shows it as
 # "MCP: Claunker"). The version is this server's own version, aligned to the Kanbantt
-# MCP spec version it implements (0.7.0 — dispatch provenance inside created_by, on top
-# of v0.6.x project_list + CardInput-shaped card_create) and still distinct from the
-# data schema version (1: provenance is additive-optional, no blob shape change).
+# MCP spec version it implements (0.8.0 — the narrative `description` body is now modeled
+# and projected (no longer a constant ""), and unmodeled foreign keys are PRESERVED and
+# round-tripped rather than flattened; on top of v0.7.0 dispatch provenance) and still
+# distinct from the data schema version (1: `description` is additive-nullable and the
+# preserved-metadata map rides in the existing blob, so old rows load untouched).
 SERVER_NAME = "Claunker"
-SERVER_VERSION = "0.7.0"
+SERVER_VERSION = "0.8.0"
 
 # Actor stamped as ``created_by`` on every card_create write. Derived from the
 # AUTHENTICATED CREDENTIAL, never the payload (the escalation_resolve actor stance
@@ -378,11 +402,16 @@ def build_server(config: ServerConfig) -> FastMCP:
         # authority-owned fields — version / created_at / updated_at / created_by /
         # updated_by / deleted_at supplied by a client are IGNORED, not errored (this
         # handler simply never reads them; created_by is stamped from the credential,
-        # see CARD_CREATE_ACTOR). Fields the spine does not model (description,
-        # priority, checklist, attachments) flatten away at this boundary — the
-        # projection re-emits their Card defaults. project_id is the ONE extension
-        # over the spec input (this server's Tasks live in Projects); it rides at the
-        # top level NEXT TO the card so CardInput itself stays a pure Card subset.
+        # see CARD_CREATE_ACTOR). ``description`` IS now modeled (the narrative body) and
+        # is read straight from the input — absent means null, NOT "" (no coercion, so the
+        # absent/present distinction survives). UNMODELED foreign keys are PRESERVED into
+        # Task.metadata (``_foreign_metadata``) and echoed on projection — no longer
+        # flattened away (the silent-drop this contract ends). The still-unmodeled KNOWN
+        # Card fields ``priority``/``checklist``/``attachments`` keep their projected
+        # documented defaults (a recorded divergence — see SPEC-DIVERGENCES.md). project_id
+        # is the ONE extension over the spec input (this server's Tasks live in Projects);
+        # it rides at the top level NEXT TO the card so CardInput itself stays a pure Card
+        # subset (and is excluded from foreign metadata by ``_NON_METADATA_INPUT_KEYS``).
         #
         # HUMAN-INTAKE SEMANTICS (the governance stance): a board-created card is
         # intent capture ONLY. It defaults into 'created', UNTIERED — never
@@ -454,11 +483,13 @@ def build_server(config: ServerConfig) -> FastMCP:
                     state=card.get("column_id") or "created",  # column IS the state
                     tier=tier,
                     acceptance_criteria=card.get("acceptance_criteria") or "",
+                    description=card.get("description"),  # absent → null (no "" coercion)
                     due=card.get("due"),
                     depends_on=card.get("depends_on"),
                     task_id=task_id,
                     order=order,
                     created_by=_created_by_with_provenance(card.get("created_by")),
+                    metadata=_foreign_metadata(card),  # preserve unmodeled foreign keys
                 )
                 card_out = project([task], store.escalations.list_all())[0]
         except ValueError as exc:
@@ -472,13 +503,14 @@ def build_server(config: ServerConfig) -> FastMCP:
         name="card_update",
         description=(
             "Edit an operator card's mutable fields via a Card patch (title / "
-            "acceptance_criteria / effort / impact / due / depends_on / tier). "
-            "RFC 7386 key-presence semantics: absent key = unchanged; present null = "
-            "clear for {due, effort, impact}; depends_on uses [] to clear (null → "
-            "validation_failed). Guarded: {tier, archived_at, deleted_at} present-null "
-            "→ validation_failed; created_by present (any value) → validation_failed "
-            "(write-once mint provenance). NOT state or order (use card_move). "
-            "expected_version required (optimistic concurrency); force skips the check."
+            "description / acceptance_criteria / effort / impact / due / depends_on / "
+            "tier). RFC 7386 key-presence semantics: absent key = unchanged; present null "
+            "= clear for {description, due, effort, impact}; depends_on uses [] to clear "
+            "(null → validation_failed). Unmodeled foreign keys merge into the card's "
+            "preserved metadata (null removes a key). Guarded: {tier, archived_at, "
+            "deleted_at} present-null → validation_failed; created_by present (any value) "
+            "→ validation_failed (write-once mint provenance). NOT state or order (use "
+            "card_move). expected_version required (optimistic concurrency); force skips it."
         ),
         structured_output=False,
     )
@@ -531,6 +563,8 @@ def build_server(config: ServerConfig) -> FastMCP:
             kwargs["title"] = patch["title"]
         if "acceptance_criteria" in patch:
             kwargs["acceptance_criteria"] = patch["acceptance_criteria"]
+        if "description" in patch:
+            kwargs["description"] = patch["description"]  # None clears (key-presence); mutable body
         if "effort" in patch:
             kwargs["effort"] = patch["effort"]   # None clears (key-presence)
         if "impact" in patch:
@@ -564,6 +598,13 @@ def build_server(config: ServerConfig) -> FastMCP:
                 kwargs["tier"] = _patch_tier_to_int(patch["tier"])
             except ValueError as exc:
                 return domain_error_result(VALIDATION_FAILED, str(exc), {"id": id})
+        # PRESERVE-AND-ROUND-TRIP: unmodeled foreign keys in the patch merge into the card's
+        # metadata map (RFC 7386 — a null value removes that key), never silently ignored.
+        # Governed/authority keys (tier/archived_at/deleted_at/created_by/column_id/order)
+        # are guarded or handled above and live in CARD_FIELD_KEYS, so they are excluded.
+        foreign = _foreign_metadata(patch)
+        if foreign:
+            kwargs["metadata"] = foreign
 
         with Store(config.db_path) as store:
             spine = Spine(store)

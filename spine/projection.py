@@ -53,6 +53,21 @@ GATE_STATUS_COMMITTED = "COMMITTED"
 # Card spec default when a card carries no explicit priority.
 DEFAULT_PRIORITY = "med"
 
+# The complete set of keys ``to_card`` emits — the known Card surface (native spec fields
+# + Claunker extensions ``acceptance_criteria`` / ``gate_status`` / ``badge``). SINGLE
+# SOURCE OF TRUTH for "what the spine models": the server subtracts this set (plus the
+# input-only ``tier``/``project_id`` carriers) from a CardInput/patch to find the UNMODELED
+# foreign keys it must PRESERVE into ``Task.metadata`` rather than flatten away. Keeping it
+# here — next to the projection that defines the shape — stops it drifting from ``to_card``.
+# Also the guard on the metadata overlay: a preserved foreign key can NEVER clobber a
+# modeled/authority/extension field, even from a hand-tampered row.
+CARD_FIELD_KEYS = frozenset({
+    "id", "title", "description", "acceptance_criteria", "column_id", "order",
+    "tags", "checklist", "due", "depends_on", "priority", "effort", "impact",
+    "version", "deleted_at", "archived_at", "created_at", "updated_at",
+    "created_by", "updated_by", "attachments", "gate_status", "badge",
+})
+
 
 def _tags_for(task: Task) -> List[str]:
     """tier → a tag id in the Card ``tags`` array (omitted until a tier is set)."""
@@ -109,11 +124,13 @@ def to_card(task: Optional[Task], badge: Optional[Dict[str, Any]] = None) -> Opt
     if task is None or task.deleted_at is not None:
         return None
 
-    return {
+    card = {
         # ── native Card fields (kanbantt-mcp-spec §Card) ──────────────────────
         "id": task.id,
         "title": task.title,
-        "description": "",
+        "description": task.description,    # the real narrative body (null when unset);
+                                            # NO LONGER a constant "" — that was the silent
+                                            # drop this contract fixes
         "acceptance_criteria": task.acceptance_criteria,  # echoed so a write round-trips
         "column_id": task.state,            # state → column, one-to-one
         "order": task.order,
@@ -136,6 +153,14 @@ def to_card(task: Optional[Task], badge: Optional[Dict[str, Any]] = None) -> Opt
         "gate_status": GATE_STATUS_COMMITTED,
         "badge": badge,
     }
+    # PRESERVE-AND-ROUND-TRIP: echo the unmodeled foreign keys the write boundary stored
+    # in ``Task.metadata`` (spec §Schema Versioning). The guard is belt-and-suspenders —
+    # metadata holds only non-Card keys by construction (the server excludes CARD_FIELD_KEYS
+    # at write) — so a foreign key can never clobber a modeled/authority/extension field.
+    for key, value in (task.metadata or {}).items():
+        if key not in CARD_FIELD_KEYS:
+            card[key] = value
+    return card
 
 
 def _badges_by_task(escalations: Iterable[Escalation]) -> Dict[str, Dict[str, Any]]:

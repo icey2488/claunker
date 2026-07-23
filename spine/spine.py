@@ -80,6 +80,8 @@ from .entity import (
     Task,
     State,
     check_created_by_limits,
+    check_description_limits,
+    check_metadata_limits,
 )
 from .ordering import append_rank
 from .projection import project
@@ -182,12 +184,14 @@ class Spine:
         state: str = State.CREATED,
         tier: Optional[int] = None,
         acceptance_criteria: Optional[Any] = None,
+        description: Optional[str] = None,
         due: Optional[str] = None,
         depends_on: Optional[List[str]] = None,
         task_id: Optional[str] = None,
         order: Optional[str] = None,
         created_at: Optional[str] = None,
         created_by: Optional[Dict[str, Any]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> Task:
         """Create a task, append-at-end in board order. ``order`` defaults to a seed
         after the current max live rank (``rebalance`` is NEVER invoked here); a
@@ -217,6 +221,10 @@ class Spine:
         # rather than stored immutably forever. Shape (value types) is enforced by the
         # Task constructor; this bounds size. Restore/load bypass this — already admitted.
         check_created_by_limits(created_by)
+        # Same admission discipline for the mutable-but-still-bounded body and the foreign
+        # metadata map: reject an over-limit write at the boundary, never truncate silently.
+        check_description_limits(description)
+        check_metadata_limits(metadata)
         if order is None:
             last_order = max((t.order for t in self.store.tasks.list_live()), default="")
             order = append_rank(last_order)
@@ -227,11 +235,13 @@ class Spine:
             state=state,
             tier=tier,
             acceptance_criteria=acceptance_criteria,
+            description=description,
             due=due,
             depends_on=actual_deps,
             order=order,
             created_at=created_at or utcnow_iso(),
             created_by=created_by,
+            metadata=metadata or {},
         )
         return self.store.tasks.put(task)
 
@@ -261,10 +271,12 @@ class Spine:
         *,
         title: Optional[str] = None,
         acceptance_criteria: Optional[Any] = None,
+        description: Any = _UNSET,
         effort: Any = _UNSET,
         impact: Any = _UNSET,
         due: Any = _UNSET,
         depends_on: Any = _UNSET,
+        metadata: Any = _UNSET,
         tier: Optional[int] = None,
         expected_version: Optional[str] = None,
         force: bool = False,
@@ -297,10 +309,12 @@ class Spine:
         if (
             title is None
             and acceptance_criteria is None
+            and description is _UNSET
             and effort is _UNSET
             and impact is _UNSET
             and due is _UNSET
             and depends_on is _UNSET
+            and metadata is _UNSET
             and tier is None
         ):
             raise ValueError("update_task requires at least one field to change")
@@ -308,6 +322,18 @@ class Spine:
             raise ValueError(f"tier must be an int in 1..4, got {tier!r}")
         if title is not None and not title.strip():
             raise ValueError("title cannot be updated to an empty string")
+        # description: MUTABLE (unlike write-once created_by). Key-presence semantics like
+        # effort/impact/due — present-null CLEARS the body, present-string sets it. Shape +
+        # size validated here (the put path does not re-run entity validation).
+        if description is not _UNSET and description is not None:
+            if not isinstance(description, str):
+                raise ValueError(f"description must be a string or null, got {description!r}")
+            check_description_limits(description)
+        # metadata: an RFC 7386 MERGE-PATCH of the foreign-key map (a dict; null values
+        # remove a key). Validated/merged after the mutable-guard below so the merged whole
+        # is size-bounded once. A non-dict patch is rejected up front.
+        if metadata is not _UNSET and not isinstance(metadata, dict):
+            raise ValueError("metadata patch must be an object of foreign keys")
         # due: null is valid (clear); non-null must be valid ISO-8601
         if due is not _UNSET and due is not None:
             _validate_due(due)
@@ -353,6 +379,8 @@ class Spine:
             task.title = title
         if acceptance_criteria is not None:
             task.acceptance_criteria = acceptance_criteria
+        if description is not _UNSET:
+            task.description = description  # None clears (key-presence)
         if effort is not _UNSET:
             task.effort = effort
         if impact is not _UNSET:
@@ -361,6 +389,18 @@ class Spine:
             task.due = due
         if depends_on is not _UNSET:
             task.depends_on = depends_on
+        if metadata is not _UNSET:
+            # RFC 7386 merge into the stored foreign-key map: a null value REMOVES a key,
+            # any other value sets it. Bound the merged whole at the write boundary so a
+            # sequence of updates cannot grow metadata past the admission cap.
+            merged = dict(task.metadata or {})
+            for key, value in metadata.items():
+                if value is None:
+                    merged.pop(key, None)
+                else:
+                    merged[key] = value
+            check_metadata_limits(merged)
+            task.metadata = merged
         if tier is not None:
             task.tier = tier
 

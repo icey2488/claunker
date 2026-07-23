@@ -184,6 +184,93 @@ def check_created_by_limits(v: Any) -> None:
         )
 
 
+# ── description ADMISSION CAP (write-boundary policy; see ``check_description_limits``) ──
+# ``description`` is the spec-conformant, agent-agnostic narrative Card BODY (Markdown).
+# Unlike a provenance VALUE (a model id / effort word / uuid, capped at 512 chars), it is
+# free-form prose and needs a far larger ceiling — but it is still bounded at the CREATE/
+# UPDATE boundary, the same prevention-at-admission discipline the ``created_by`` caps
+# apply: an unbounded body is a storage-abuse vector. 16 KiB (16384 chars) admits a rich
+# multi-paragraph Markdown body — headings, a list, a fenced code block, ~8 pages of prose
+# — while rejecting a megabyte paste. It is ~32× the per-provenance-value cap and is
+# counted in CHARACTERS, matching ``MAX_PROVENANCE_VALUE_LEN``'s unit (a body is a single
+# string, so a char cap is the natural measure; a byte cap would penalise non-ASCII prose).
+MAX_DESCRIPTION_LEN = 16384
+
+
+def check_description_limits(v: Any) -> None:
+    """Enforce the ``description`` length cap at the write boundary (→ SpineError, which
+    the server maps to ``validation_failed``). ``None`` is a no-op (absent body — the
+    write-once-vs-mutable distinction is the caller's, not this cap's). A NON-string is a
+    SHAPE error owned by the Task constructor (``_validate_description``); this size layer
+    measures strings only. Fails CLOSED and NAMES the limit — never truncates: silent
+    truncation of the body is exactly the failure mode this whole contract exists to end."""
+    if v is None:
+        return
+    if isinstance(v, str) and len(v) > MAX_DESCRIPTION_LEN:
+        raise SpineError(
+            f"description exceeds the {MAX_DESCRIPTION_LEN}-character limit "
+            f"({len(v)} chars); trim the body or link out to external storage"
+        )
+
+
+def _validate_description(v: Any) -> None:
+    """Raise SpineError unless ``v`` is a string or ``None``. SHAPE only — runs on
+    construct AND load (``__post_init__``); the SIZE cap is admission policy
+    (``check_description_limits``), so restore/load never re-polices an admitted body."""
+    if v is not None and not isinstance(v, str):
+        raise SpineError(f"description must be a string or null, got {v!r}")
+
+
+# ── metadata (UNMODELED FOREIGN CARD KEYS) ADMISSION CAPS ────────────────────────────
+# The spec's unknown-field rule (§Schema Versioning & Forward Compatibility: "unknown
+# fields are preserved and round-tripped, never stripped, never an error") applies to the
+# whole Card body, not just to ``created_by``. Keys the spine does not model as first-class
+# Card fields are PRESERVED in this typed map — stored intact, echoed on projection —
+# instead of being silently flattened away at the write boundary (the old ``description``-
+# drop failure mode, generalized). This is the forward-compat guarantee: a v0.8 client's
+# new field survives a round trip through a v0.7 server rather than vanishing.
+#
+# Same admission discipline as ``created_by``: unknown-key tolerance + no cleanup API ⇒
+# the payload MUST be bounded at create/update. Foreign card metadata is the SAME class of
+# interop passthrough as a foreign ``created_by`` dialect, so it inherits the ``created_by``
+# budget rather than inventing a parallel set — the aliases below keep the two from drifting.
+MAX_METADATA_KEYS = MAX_PROVENANCE_KEYS
+MAX_METADATA_VALUE_LEN = MAX_PROVENANCE_VALUE_LEN
+MAX_METADATA_DEPTH = MAX_PROVENANCE_DEPTH
+MAX_METADATA_BYTES = MAX_CREATED_BY_BYTES
+
+
+def check_metadata_limits(v: Any) -> None:
+    """Enforce the metadata ADMISSION CAPS at the write boundary (→ SpineError →
+    ``validation_failed``). Mirrors ``check_created_by_limits`` — reusing ``_exceeds_depth``
+    and the shared numeric budget — but counts ALL keys (metadata carries no identity to
+    exclude). Fails CLOSED, naming the specific limit; the whole write is rejected, never
+    truncated. Non-dict ``v`` is a no-op (shape is owned by the Task constructor)."""
+    if not isinstance(v, dict):
+        return
+    if len(v) > MAX_METADATA_KEYS:
+        raise SpineError(
+            f"metadata carries too many keys ({len(v)} > {MAX_METADATA_KEYS} max)"
+        )
+    for key, val in v.items():
+        if isinstance(val, str) and len(val) > MAX_METADATA_VALUE_LEN:
+            raise SpineError(
+                f"metadata.{key} value too long "
+                f"({len(val)} > {MAX_METADATA_VALUE_LEN} char max)"
+            )
+    if _exceeds_depth(v, MAX_METADATA_DEPTH):
+        raise SpineError(
+            f"metadata nests deeper than the allowed limit "
+            f"(max nesting depth {MAX_METADATA_DEPTH})"
+        )
+    serialized_bytes = len(json.dumps(v, default=str, sort_keys=True).encode("utf-8"))
+    if serialized_bytes > MAX_METADATA_BYTES:
+        raise SpineError(
+            f"metadata serialized size exceeds cap "
+            f"({serialized_bytes} > {MAX_METADATA_BYTES} byte max)"
+        )
+
+
 # ── state / kind vocabularies ────────────────────────────────────────────────
 class State:
     """The Task lifecycle. Pipeline: created → tiered → dispatched → judged →
@@ -285,6 +372,13 @@ class Task(_Entity):
     state: str = State.CREATED
     tier: Optional[int] = None
     acceptance_criteria: Optional[Any] = None
+    # The spec-conformant, agent-agnostic narrative BODY (Markdown), or ``None`` when
+    # the card has no body. Additive nullable field (the ``archived_at`` precedent: no
+    # blob-shape break, old rows load with ``description=None`` via ``from_dict``).
+    # MUTABLE — unlike write-once ``created_by``, a body is edited over a card's life.
+    # Shape validated on construct/load (``_validate_description``); SIZE bounded at the
+    # write boundary (``check_description_limits``).
+    description: Optional[str] = None
     effort: Optional[str] = None
     impact: Optional[str] = None
     due: Optional[str] = None
@@ -300,12 +394,21 @@ class Task(_Entity):
     # ``_validate_created_by``. WRITE-ONCE: set at create, never mutated (no
     # ``update_task`` path touches it — the audit value is "what actually ran").
     created_by: Optional[Dict[str, Any]] = None
+    # UNMODELED FOREIGN Card keys the spine has no first-class field for, PRESERVED here
+    # rather than flattened away (spec §Schema Versioning: unknown fields round-trip).
+    # The server fills this at the write boundary (keys outside the known Card schema) and
+    # the projection echoes it back. MUTABLE via ``card_update`` (RFC 7386 merge-patch).
+    # Bounded at admission (``check_metadata_limits``) so preservation is not unbounded.
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.created_by is not None:
             _validate_created_by(self.created_by)
+        _validate_description(self.description)
         if self.depends_on is None:
             self.depends_on = []
+        if self.metadata is None:
+            self.metadata = {}
 
 
 @dataclass
