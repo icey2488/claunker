@@ -249,15 +249,20 @@ def _validate_description(v: Any) -> None:
 # list (``[{"id": <uuid>, "ref": <~200-char url>}]`` ≈ 15×265 ≈ 4.0 KB) + ``priority`` + a
 # handful of genuinely-foreign keys ⇒ ~10-12 KB realistic. Each cap justified inline:
 #
-#   MAX_METADATA_KEYS = 24 — TOP-LEVEL key fan-out (a collection is ONE key holding many
-#       items, so item count does not spend this). Room for the 3 known-unmodeled Card fields
-#       + ~21 foreign-dialect keys while still bounding fan-out. (Provenance stays at 12.)
-#   MAX_METADATA_VALUE_LEN = 2048 — chars per TOP-LEVEL STRING value (a foreign note/URL, or
-#       ``priority``). NOTE the reviewer's remedy was INCOMPLETE: raising this alone is near-
-#       useless because the long strings live INSIDE ``checklist``/``attachments`` arrays, not
-#       as top-level string values — the byte TOTAL is what actually bounds them. So this is
-#       raised (512→2048, a longer foreign string/URL) AND the total below is raised; a 2048
-#       value now fits comfortably under the 32 KiB total. (Provenance stays at 512.)
+#   MAX_METADATA_KEYS = 24 — PER-OBJECT key fan-out, enforced on EVERY object at EVERY depth
+#       (NOT top-level-only). A collection is ONE key holding many items, so item COUNT does not
+#       spend this. Room for the 3 known-unmodeled Card fields + ~21 foreign-dialect keys while
+#       still bounding fan-out. RECURSIVE because the top-level-only check left a hole: a nested
+#       object stuffed with 500 keys sailed past the granular cap and hit only the byte backstop
+#       — a vague "too big" error for a specific "too wide" abuse. (Provenance stays at 12 and
+#       top-level-only — its 4 KiB byte cap makes the same nested-fan-out hole immaterial there.)
+#   MAX_METADATA_VALUE_LEN = 2048 — chars per STRING value at ANY depth (a foreign note/URL,
+#       ``priority``, or a checklist item's ``text``). Enforced RECURSIVELY: the long strings that
+#       matter live INSIDE ``checklist``/``attachments`` arrays, not as top-level string values, so
+#       a top-level-only check was near-useless (only the byte TOTAL bounded them, with a vague
+#       error). Now every string the walk reaches is length-checked and NAMES its locus; the byte
+#       total remains the backstop. Raised 512→2048 for a longer foreign string/URL. (Provenance
+#       stays at 512 and top-level-only.)
 #   MAX_METADATA_DEPTH = 4 — metadata dict (level 1) → ``checklist``/``attachments`` array
 #       (2) → item object (3) → one container of HEADROOM (4) for a nested foreign value or a
 #       slightly richer item. A ``[{text,done}]`` checklist reaches depth 3. (Provenance
@@ -274,29 +279,72 @@ MAX_METADATA_DEPTH = 4
 MAX_METADATA_BYTES = 32768
 
 
+def _walk_metadata_granular_caps(v: Any) -> None:
+    """Enforce the GRANULAR metadata caps RECURSIVELY, at EVERY depth, in one iterative walk:
+      * per-object key-count (``MAX_METADATA_KEYS``) on EVERY dict — not just the top one;
+      * per-string-value length (``MAX_METADATA_VALUE_LEN``) on EVERY string the walk reaches;
+      * nesting depth (``MAX_METADATA_DEPTH``) — only CONTAINERS occupy a level, a scalar leaf
+        sits at its parent's depth (matching ``_exceeds_depth``).
+
+    Why recursive: the OLD top-level-only checks left two holes now that ``checklist``/
+    ``attachments`` route through metadata — nested strings are the NORMAL case, not the
+    exception. A 30 KB string inside an array, or a 500-key object nested one level down, both
+    slipped past the granular caps and hit only the 32 KiB byte backstop: a vague "too big"
+    error instead of the specific limit that was actually blown. This walk closes both.
+
+    ITERATIVE with an explicit stack (never recurses through the payload), so a maliciously
+    deep/wide value can't drive the CHECK into a RecursionError — it is rejected in O(nodes)
+    before the recursive ``json.dumps`` byte-count ever sees it. Each SpineError names the
+    specific limit AND the locus (a JSONPath-ish ``metadata.checklist[3].text``) so a client
+    can act. Fails CLOSED; never truncates."""
+    stack = [(v, 1, "metadata")]
+    while stack:
+        node, depth, path = stack.pop()
+        if isinstance(node, dict):
+            if depth > MAX_METADATA_DEPTH:
+                raise SpineError(
+                    f"metadata nests deeper than the allowed limit at {path} "
+                    f"(max nesting depth {MAX_METADATA_DEPTH})"
+                )
+            if len(node) > MAX_METADATA_KEYS:
+                raise SpineError(
+                    f"metadata carries too many keys at {path} "
+                    f"({len(node)} > {MAX_METADATA_KEYS} max)"
+                )
+            for key, child in node.items():
+                stack.append((child, depth + 1, f"{path}.{key}"))
+        elif isinstance(node, list):
+            if depth > MAX_METADATA_DEPTH:
+                raise SpineError(
+                    f"metadata nests deeper than the allowed limit at {path} "
+                    f"(max nesting depth {MAX_METADATA_DEPTH})"
+                )
+            for i, child in enumerate(node):
+                stack.append((child, depth + 1, f"{path}[{i}]"))
+        elif isinstance(node, str):
+            if len(node) > MAX_METADATA_VALUE_LEN:
+                raise SpineError(
+                    f"metadata string value too long at {path} "
+                    f"({len(node)} > {MAX_METADATA_VALUE_LEN} char max)"
+                )
+
+
 def check_metadata_limits(v: Any) -> None:
     """Enforce the metadata ADMISSION CAPS at the write boundary (→ SpineError →
-    ``validation_failed``). Mirrors ``check_created_by_limits`` — reusing ``_exceeds_depth``
-    and the shared numeric budget — but counts ALL keys (metadata carries no identity to
-    exclude). Fails CLOSED, naming the specific limit; the whole write is rejected, never
-    truncated. Non-dict ``v`` is a no-op (shape is owned by the Task constructor)."""
+    ``validation_failed``). Unlike ``check_created_by_limits`` (whose 4 KiB byte cap makes a
+    nested-fan-out hole immaterial, so it checks the top level only), metadata legitimately
+    carries larger nested COLLECTIONS (``checklist``/``attachments``), so its granular caps —
+    per-object key-count AND per-string length — are enforced RECURSIVELY at every depth by
+    ``_walk_metadata_granular_caps`` (which also does the depth check, before serialization,
+    so a parser-bomb payload never reaches the recursive ``json.dumps`` below). The serialized-
+    byte ceiling remains the backstop for total size and long key names. Fails CLOSED, naming
+    the specific limit AND its locus; the whole write is rejected, never truncated. Non-dict
+    ``v`` is a no-op (shape is owned by the Task constructor)."""
     if not isinstance(v, dict):
         return
-    if len(v) > MAX_METADATA_KEYS:
-        raise SpineError(
-            f"metadata carries too many keys ({len(v)} > {MAX_METADATA_KEYS} max)"
-        )
-    for key, val in v.items():
-        if isinstance(val, str) and len(val) > MAX_METADATA_VALUE_LEN:
-            raise SpineError(
-                f"metadata.{key} value too long "
-                f"({len(val)} > {MAX_METADATA_VALUE_LEN} char max)"
-            )
-    if _exceeds_depth(v, MAX_METADATA_DEPTH):
-        raise SpineError(
-            f"metadata nests deeper than the allowed limit "
-            f"(max nesting depth {MAX_METADATA_DEPTH})"
-        )
+    # Granular caps + depth, recursively — the iterative walk rejects a deeply-nested or
+    # widely-fanned payload BEFORE the recursive json.dumps byte-count is ever handed it.
+    _walk_metadata_granular_caps(v)
     serialized_bytes = len(json.dumps(v, default=str, sort_keys=True).encode("utf-8"))
     if serialized_bytes > MAX_METADATA_BYTES:
         raise SpineError(

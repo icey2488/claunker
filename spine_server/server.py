@@ -375,21 +375,31 @@ def build_server(config: ServerConfig) -> FastMCP:
     )
     def project_list() -> types.CallToolResult:
         # Live projects only (a soft-deleted project is not a create target — the same
-        # liveness rule jobcard's resolver applies). Oldest-first: a STABLE sort by
-        # ``created_at`` over the INSERTION-ORDERED scan (``list_live`` → ``list_all``'s
-        # ``ORDER BY rowid``). The former ``(created_at, id)`` tiebreak was a REAL DEFECT,
-        # not a flake: ``created_at`` is a display value (never an ordering primitive), so
-        # two projects minted in the same clock tick collided on it and fell back to the
-        # tiebreak — but ``id`` is a RANDOM UUIDv4 that bears no relation to creation order,
-        # so same-tick projects sorted at random (~50% inverted). Python's sort is STABLE,
-        # so keying on ``created_at`` ALONE preserves the rowid (creation) order within a
-        # tick — a total, deterministic, oldest-first order that no random id can perturb.
+        # liveness rule jobcard's resolver applies). Ordered by a DATA-BOUND TOTAL ORDER:
+        # sort key ``(created_at, id)``, oldest-first.
+        #
+        # This depends ONLY on row CONTENTS, so it is deterministic for identical data and
+        # stable across process restart, dump/reload, restore, and the replica-merge story —
+        # anything a consumer can recompute from the rows themselves. That is the property the
+        # PRIOR fix only DISGUISED: it stable-sorted by ``created_at`` ALONE over an
+        # ``ORDER BY rowid`` scan and relied on that scan to break same-tick ties in creation
+        # order. But ``rowid`` is a physical storage artifact — it does NOT survive dump/reload,
+        # restore, or a merge — so that "determinism" evaporated the moment the store was
+        # reloaded. Adding ``id`` as the tiebreak makes the order intrinsic to the data.
+        #
+        # HONEST NOTE on the within-tick order: because ``id`` is a random UUIDv4, two projects
+        # minted in the SAME clock tick sort by that id, which is NOT their creation order. That
+        # is deliberate and correct: ``created_at`` is documented as display-only and NEVER an
+        # ordering primitive, so the API does not — and must not — promise creation order within
+        # a tick. It promises a TOTAL, REPRODUCIBLE order. A consumer that truly needs within-tick
+        # creation order needs a monotonic key (a LexoRank-style ``order``, as cards already have);
+        # that is a future card, not this read.
         with Store(config.db_path) as store:
             projects = [
                 {"id": p.id, "name": p.name, "created_at": p.created_at}
                 for p in store.projects.list_live()
             ]
-        projects.sort(key=lambda p: p["created_at"] or "")
+        projects.sort(key=lambda p: (p["created_at"] or "", p["id"]))
         return ok_result({"projects": projects})
 
     @mcp.tool(

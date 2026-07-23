@@ -84,12 +84,26 @@ from .entity import (
     check_metadata_limits,
 )
 from .ordering import append_rank
-from .projection import project
+from .projection import PROTECTED_CARD_KEYS, project
 from .storage import Store, utcnow_iso
 
 # Sentinel distinguishing "not provided" from "explicitly passed as None (=clear)".
 # Used in update_task for the clearable fields: effort, impact, due, depends_on.
 _UNSET = object()
+
+
+def _without_modeled_collisions(metadata: Dict[str, Any]) -> Dict[str, Any]:
+    """FIELD GRADUATION HYGIENE: a copy of ``metadata`` with any key colliding with a MODELED /
+    authority Card field (``PROTECTED_CARD_KEYS``) removed.
+
+    When a field that used to round-trip through ``metadata`` GRADUATES to a first-class column,
+    its stale metadata twin is already suppressed on READ by the projection overlay guard (a
+    preserved key never clobbers a protected field); this drops it on the next WRITE of the entity
+    so the shadow can never resurface. PURE REMOVAL — it never raises, so unlike the admission
+    caps it does not re-police already-admitted data; it only shrinks the map by dropping keys
+    that should not live there. The normal write boundary already excludes protected keys from the
+    preserved set, so for a card minted after graduation this is a no-op."""
+    return {k: v for k, v in metadata.items() if k not in PROTECTED_CARD_KEYS}
 
 
 def _validate_due(v: Any) -> None:
@@ -399,8 +413,16 @@ class Spine:
                     merged.pop(key, None)
                 else:
                     merged[key] = value
+            # Graduation hygiene BEFORE the admission check: drop any stale twin of a now-modeled
+            # field so it neither counts toward the cap nor survives the write.
+            merged = _without_modeled_collisions(merged)
             check_metadata_limits(merged)
             task.metadata = merged
+        elif task.metadata:
+            # No metadata patch, but STILL scrub on this write of the entity (graduation hygiene):
+            # drop a stale protected-key twin from the stored map. Pure removal — no re-validation
+            # of already-admitted data, so an unrelated field edit never re-polices metadata.
+            task.metadata = _without_modeled_collisions(task.metadata)
         if tier is not None:
             task.tier = tier
 
