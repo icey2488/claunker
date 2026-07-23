@@ -112,11 +112,12 @@ def _created_by_with_provenance(client_created_by: Any) -> Dict[str, Any]:
 
     A client that sends no ``created_by`` (human intake), or one carrying only
     ``type``/``id``, yields exactly ``CARD_CREATE_ACTOR`` (no provenance → no chip on
-    the board). Unknown non-identity keys pass through (interop; ``created_by`` is
-    additive-optional). The merged shape is re-validated downstream: the Task constructor
-    rejects any non-string provenance value (closing the nested-object/array hole, not
-    just the modeled keys), and ``check_created_by_limits`` bounds the payload size at the
-    create boundary — both surface as ``validation_failed``.
+    the board). Unknown non-identity keys pass through with ANY JSON value (interop;
+    ``created_by`` is additive-optional and a foreign server may carry a structured
+    dialect). The merged shape is re-validated downstream: the Task constructor requires
+    the modeled keys (``model``/``effort``/``job_id``) to be strings, and
+    ``check_created_by_limits`` bounds the payload size AND nesting depth at the create
+    boundary — all surface as ``validation_failed``.
     """
     identity = dict(CARD_CREATE_ACTOR)
     if not isinstance(client_created_by, dict):

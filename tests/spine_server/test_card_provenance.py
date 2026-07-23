@@ -166,21 +166,47 @@ def test_card_create_non_string_provenance_is_validation_failed():
 # Unknown-key tolerance + write-once immutability = a payload the spine accepts and can
 # never clean up, so the WRITE boundary must bound it. Over-limit → validation_failed
 # naming the specific limit; fail closed (whole create rejected, never truncated).
-def test_card_create_nested_provenance_value_is_rejected():
-    """CLOSES THE NESTING HOLE: a nested object under an UNKNOWN key was previously
-    admitted (only model/effort/job_id were string-checked). It must now fail as
-    validation_failed — non-string provenance values, including nesting, are not valid."""
+def test_card_create_nested_provenance_value_under_depth_is_accepted():
+    """INTEROP PROMISE (the test the string-only over-correction broke): a foreign server
+    sending a STRUCTURED value under an unknown key — e.g. a nested vendor_trace object —
+    must NOT have its whole card_create hard-rejected. The nested value round-trips
+    verbatim and reaches the projected Card. Bounded by the depth + byte caps, not a
+    flat-value rule."""
     directory, path = make_temp_db()
     try:
         project_id = _seed_project(path)
         is_error, sc = anyio.run(
             _call, build_server(_config(path)), "card_create",
-            {"card": {"title": "x", "created_by": {"model": "m", "vendor_trace": {"span": "abc"}}},
+            {"card": {"title": "x", "created_by": {
+                "model": "m", "vendor_trace": {"span": "abc", "duration": 12}}},
+             "project_id": project_id},
+        )
+        assert is_error is False
+        stored = _task_on_disk(path, sc["card"]["id"])
+        assert stored.created_by == {
+            "type": "human", "id": "operator",
+            "model": "m", "vendor_trace": {"span": "abc", "duration": 12},
+        }
+        assert sc["card"]["created_by"]["vendor_trace"] == {"span": "abc", "duration": 12}
+    finally:
+        cleanup(directory)
+
+
+def test_card_create_over_depth_provenance_is_rejected():
+    """The relaxation keeps a depth cap: a deeply-recursive foreign value is a parser-bomb
+    surface and is rejected → validation_failed naming the depth limit. depth 4 is one past
+    the depth-3 cap (created_by → vt → a → b)."""
+    directory, path = make_temp_db()
+    try:
+        project_id = _seed_project(path)
+        is_error, sc = anyio.run(
+            _call, build_server(_config(path)), "card_create",
+            {"card": {"title": "x", "created_by": {"vt": {"a": {"b": {"c": 1}}}}},
              "project_id": project_id},
         )
         assert is_error is True
         assert sc["code"] == "validation_failed"
-        assert "vendor_trace" in sc["message"]
+        assert "depth" in sc["message"]
     finally:
         cleanup(directory)
 

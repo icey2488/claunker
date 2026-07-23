@@ -573,8 +573,9 @@ def test_legacy_blob_without_created_by_loads_untouched():
 # ── created_by dispatch provenance: model/effort/job_id inside created_by ──────
 # Provenance rides INSIDE created_by (never a top-level effort/model — the Task's own
 # effort/impact are the Matrix work-size axes and MUST NOT collide). Additive-optional:
-# a human/plain card carries none; the keys are validated as strings; unknown foreign
-# keys are tolerated; the whole stamp projects through the lens verbatim.
+# a human/plain card carries none; the MODELED keys (model/effort/job_id) are validated
+# as strings; unknown foreign keys are tolerated with ANY JSON value (bounded by the
+# depth + byte admission caps); the whole stamp projects through the lens verbatim.
 
 def test_task_created_by_agent_with_provenance_persists_and_projects():
     spine = Spine()
@@ -610,25 +611,45 @@ def test_task_created_by_unknown_string_keys_tolerated():
     assert _card_for(spine, t.id)["created_by"] == foreign  # unknown STRING keys survive the lens
 
 
-def test_task_created_by_unknown_nonstring_value_rejected():
-    """Unknown-KEY tolerance does NOT extend to non-string VALUES: a nested object or
-    array (or number) under a foreign key is rejected, closing the nesting/depth hole
-    (previously only the modeled model/effort/job_id keys were type-checked, so a nested
-    unknown value was silently admitted and then immutable forever)."""
-    _assert_raises(lambda: Task(id="t", project_id="p", title="x",
-                                created_by={"type": "agent", "id": "a", "vendor_trace": {"span": "abc"}}),
-                   SpineError)
-    _assert_raises(lambda: Task(id="t", project_id="p", title="x",
-                                created_by={"type": "agent", "id": "a", "cost_cents": 3}),
-                   SpineError)
+def test_task_created_by_unknown_nonstring_value_accepted_under_depth():
+    """INTEROP PROMISE: unknown-KEY tolerance now extends to non-string VALUES. A foreign
+    server may carry a structured provenance dialect — a nested object, an array, a number,
+    a bool, null — under a key we do not model, and it must round-trip verbatim (NOT be
+    hard-rejected). The abuse surface is bounded by the depth + byte caps, not a flat-value
+    rule. This is the test the string-only over-correction broke."""
+    spine = Spine()
+    p = spine.create_project("p")
+    structured = {"type": "agent", "id": "a",
+                  "vendor_trace": {"span": "abc", "duration": 12},  # nested object (depth 2)
+                  "retries": [1, 2, 3], "cost_cents": 3, "cached": True, "note": None}
+    t = spine.create_task(p.id, "x", created_at=T[0], created_by=structured)
+    assert t.created_by == structured
+    assert spine.get_task(t.id).created_by == structured      # survives the store round-trip
+    assert _card_for(spine, t.id)["created_by"] == structured  # projects verbatim
+
+
+def test_task_created_by_over_depth_rejected():
+    """A payload nested deeper than MAX_PROVENANCE_DEPTH is a parser-bomb surface and is
+    rejected at admission, naming the depth limit. depth 4 = created_by(1) → a(2) → b(3)
+    → c(4), one past the depth-3 cap."""
+    from spine.entity import MAX_PROVENANCE_DEPTH
+    spine = Spine()
+    p = spine.create_project("p")
+    deep = {"type": "agent", "id": "a", "vt": {"a": {"b": {"c": 1}}}}  # deepest container at depth 4
+    try:
+        spine.create_task(p.id, "x", created_by=deep)
+        assert False, "over-depth created_by should have raised"
+    except SpineError as e:
+        assert "depth" in str(e)
+    assert MAX_PROVENANCE_DEPTH == 3  # pin the documented contract number
 
 
 def test_created_by_admission_caps_enforced_at_create_task():
     """The size caps guard create_task itself (the CLI / local-trust path), not only the
-    wire tool: too-many keys, an oversized value, and an oversized total all raise at
-    mint. A realistic payload passes. Proves BOTH write paths are bounded."""
-    from spine.entity import (MAX_CREATED_BY_BYTES, MAX_PROVENANCE_KEYS,
-                              MAX_PROVENANCE_VALUE_LEN)
+    wire tool: too-many keys, an oversized value, an over-depth nest, and an oversized total
+    all raise at mint. A realistic payload passes. Proves BOTH write paths are bounded."""
+    from spine.entity import (MAX_CREATED_BY_BYTES, MAX_PROVENANCE_DEPTH,
+                              MAX_PROVENANCE_KEYS, MAX_PROVENANCE_VALUE_LEN)
     spine = Spine()
     p = spine.create_project("p")
     base = {"type": "agent", "id": "a"}
@@ -638,6 +659,9 @@ def test_created_by_admission_caps_enforced_at_create_task():
     # oversized single value
     _assert_raises(lambda: spine.create_task(
         p.id, "x", created_by={**base, "model": "m" * (MAX_PROVENANCE_VALUE_LEN + 1)}), SpineError)
+    # over-depth nest (a small-byte but deeply-recursive foreign value)
+    _assert_raises(lambda: spine.create_task(
+        p.id, "x", created_by={**base, "vt": {"a": {"b": {"c": 1}}}}), SpineError)
     # oversized total (each value ≤ cap, key count ≤ cap, but total over the byte cap)
     _assert_raises(lambda: spine.create_task(
         p.id, "x", created_by={**base, **{f"k{i}": "v" * 500 for i in range(10)}}), SpineError)
@@ -645,7 +669,7 @@ def test_created_by_admission_caps_enforced_at_create_task():
     ok = spine.create_task(p.id, "x", created_at=T[0],
                            created_by={**base, "model": "claude-sonnet-5", "effort": "high", "job_id": "job-1"})
     assert ok.created_by["model"] == "claude-sonnet-5"
-    assert MAX_CREATED_BY_BYTES == 4096  # pin the documented contract number
+    assert MAX_CREATED_BY_BYTES == 4096 and MAX_PROVENANCE_DEPTH == 3  # pin the contract numbers
 
 
 # ── R6 durable-ref validation in create_artifact ──────────────────────────────

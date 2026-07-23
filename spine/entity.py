@@ -36,9 +36,13 @@ class SpineError(ValueError):
 # top-level dispatch ``effort`` would COLLIDE with that mutable work-size field. Inside
 # created_by there is no collision and the shape stays write-once with the rest of the
 # mint attribution. Each is an OPTIONAL string; a human card carries none.
-# The provenance sub-keys THIS server models. Documentary: validation no longer keys off
-# this list — EVERY non-identity value is string-checked (see ``_validate_created_by``),
-# so a foreign key is held to the same shape rule as a modeled one.
+# The provenance sub-keys THIS server MODELS. These three are OUR contract, so their
+# VALUES are string-validated (see ``_validate_created_by``). Every OTHER (unknown/foreign)
+# key is NOT ours to shape: its value may be any JSON-serializable value — string, number,
+# boolean, null, object, or array — to honour the spec's unknown-key interop promise. The
+# abuse surface that opens (an unbounded / deeply-nested foreign value) is closed by SIZE
+# admission caps, not by a value-type rule: a serialized-byte ceiling and a nesting-depth
+# ceiling (see ``check_created_by_limits``), not by forcing every value flat to a string.
 _PROVENANCE_STR_KEYS = ("model", "effort", "job_id")
 
 # ── created_by ADMISSION CAPS (write-boundary policy; see ``check_created_by_limits``) ──
@@ -53,29 +57,44 @@ _PROVENANCE_STR_KEYS = ("model", "effort", "job_id")
 #                           models 3 (model/effort/job_id); 12 leaves generous headroom
 #                           for a foreign server's provenance dialect while bounding
 #                           key fan-out. A real mint uses 3–4.
-#   MAX_PROVENANCE_VALUE_LEN — chars per provenance value. Model ids, effort words, and
-#                           job uuids are all < 100 chars; 512 admits a long vendor trace
+#   MAX_PROVENANCE_VALUE_LEN — chars per provenance STRING value. Model ids, effort words,
+#                           and job uuids are all < 100 chars; 512 admits a long vendor trace
 #                           or URL while rejecting prose / base64 blobs stuffed into a key.
-#   MAX_CREATED_BY_BYTES  — hard ceiling on the serialized whole object (the backstop that
-#                           also bounds long KEY NAMES, which the per-value cap does not).
+#                           Applies to string values only; NON-string values (numbers, bools,
+#                           null, nested objects/arrays) are measured solely by the byte cap on
+#                           the serialized whole (below), which is the true guard on their size.
+#   MAX_PROVENANCE_DEPTH  — max nesting depth of the serialized created_by, the created_by
+#                           object itself counting as level 1 (so foreign values may nest up to
+#                           MAX_PROVENANCE_DEPTH − 1 containers below the top). Now that unknown
+#                           keys admit any JSON value again, this stops a deeply-recursive payload
+#                           being used as a parser bomb — and is enforced with an ITERATIVE walk
+#                           that bails at the limit, so the check itself can never blow the stack.
+#                           A real vendor trace ({"span":…,"duration":…}) sits at depth 2.
+#   MAX_CREATED_BY_BYTES  — hard ceiling on the serialized whole object (the PRIMARY defense: it
+#                           bounds long KEY NAMES the per-value cap misses AND the total size of
+#                           any non-string values the per-value cap no longer measures).
 #                           A real created_by serializes to ~150 bytes; 4 KiB is ~25×
 #                           headroom yet blocks any multi-megabyte payload outright.
 MAX_PROVENANCE_KEYS = 12
 MAX_PROVENANCE_VALUE_LEN = 512
+MAX_PROVENANCE_DEPTH = 3
 MAX_CREATED_BY_BYTES = 4096
 
 
 def _validate_created_by(v: Any) -> None:
-    """Raise SpineError if v is not a valid created_by SHAPE (identity + value types).
+    """Raise SpineError if v is not a valid created_by SHAPE (identity + modeled-key types).
 
     IDENTITY (``type`` + ``id``) is REQUIRED and unchanged: ``type`` ∈ {human, agent},
-    ``id`` a non-empty string. Every OTHER key is dispatch provenance and its VALUE MUST
-    be a string — this holds for the modeled keys (``model``/``effort``/``job_id``) AND
-    for any unknown foreign key alike. Unknown KEYS are still tolerated (additive-only
-    forward-compat / MCP interop: a foreign server may carry keys we do not model), but a
-    non-string VALUE is rejected: it closes the nesting/depth hole (a nested object or
-    array under an unknown key was previously admitted, since only the three modeled keys
-    were type-checked) and keeps every value length-boundable by ``check_created_by_limits``.
+    ``id`` a non-empty string. The three MODELED provenance keys — ``model``/``effort``/
+    ``job_id`` — are OUR contract, so each MUST be a string WHEN PRESENT.
+
+    Every OTHER (unknown/foreign) key is tolerated with ANY JSON-serializable value —
+    string, number, boolean, null, object, or array. This honours the spec's unknown-key
+    interop promise: a foreign MCP server may carry a structured provenance dialect (e.g.
+    ``{"vendor_trace": {"span": "abc", "duration": 12}}``) and we must not hard-reject its
+    whole ``card_create``. The abuse surface that opens (an unbounded or deeply-recursive
+    foreign value) is closed at admission by SIZE caps — a serialized-byte ceiling and a
+    nesting-depth ceiling in ``check_created_by_limits`` — NOT by forcing values flat here.
 
     This is SHAPE validation only — it runs on construct AND on load (``from_dict``). The
     SIZE caps are admission policy and live in ``check_created_by_limits``, called at the
@@ -89,14 +108,33 @@ def _validate_created_by(v: Any) -> None:
         raise SpineError(
             f"created_by must be {{\"type\": \"human\"|\"agent\", \"id\": <non-empty string>}}, got {v!r}"
         )
-    for key, val in v.items():
-        if key in ("type", "id"):
-            continue
-        if not isinstance(val, str):
+    for key in _PROVENANCE_STR_KEYS:
+        if key in v and not isinstance(v[key], str):
             raise SpineError(
-                f"created_by.{key} provenance must be a string, got {val!r} "
-                "(non-string values — including nested objects and arrays — are not permitted)"
+                f"created_by.{key} provenance must be a string, got {v[key]!r} "
+                "(the modeled keys model/effort/job_id are our contract and must be strings)"
             )
+
+
+def _exceeds_depth(value: Any, limit: int) -> bool:
+    """True iff any object/array in ``value`` nests deeper than ``limit`` levels, the
+    top ``value`` counting as level 1. Only CONTAINERS (dict/list) add a level — a scalar
+    leaf sits at its parent's depth, so ``{"a": {"b": 1}}`` is depth 2, not 3.
+
+    ITERATIVE with an explicit stack, so a maliciously deep payload can never drive the
+    check itself into a RecursionError: an over-depth container is found and returned on
+    in O(depth) work, before ``json.dumps`` (recursive) is ever handed the payload."""
+    stack = [(value, 1)]
+    while stack:
+        node, depth = stack.pop()
+        if not isinstance(node, (dict, list)):
+            continue
+        if depth > limit:
+            return True
+        children = node.values() if isinstance(node, dict) else node
+        for child in children:
+            stack.append((child, depth + 1))
+    return False
 
 
 def check_created_by_limits(v: Any) -> None:
@@ -105,10 +143,17 @@ def check_created_by_limits(v: Any) -> None:
     exceeded — the whole create is rejected, never silently truncated (silent truncation
     is the ``description``-drop failure mode we are not duplicating).
 
-    Assumes ``_validate_created_by`` has already established the shape (every non-identity
-    value is a string); this layer bounds SIZE only. Non-dict ``v`` is a no-op — shape
-    validation owns that rejection. Documented in kanbantt-mcp-spec §created_by so a
-    foreign MCP agent knows the contract."""
+    Assumes ``_validate_created_by`` has already established the shape (identity present,
+    modeled keys are strings). Unknown keys may hold any JSON value, so this layer bounds
+    SIZE and DEPTH — the real guards now that value-type is no longer forced flat:
+      * key-count cap — bounds fan-out;
+      * per-value length cap — STRING values only (non-strings are size-bounded by bytes);
+      * DEPTH cap — checked BEFORE serialization so a parser-bomb payload is rejected by the
+        iterative walk, never by the recursive ``json.dumps`` below;
+      * serialized-byte cap — the PRIMARY defense: bounds long key names AND the total size
+        of any non-string values.
+    Non-dict ``v`` is a no-op — shape validation owns that rejection. Documented in
+    kanbantt-mcp-spec §created_by so a foreign MCP agent knows the contract."""
     if not isinstance(v, dict):
         return
     provenance_keys = [k for k in v if k not in ("type", "id")]
@@ -124,6 +169,13 @@ def check_created_by_limits(v: Any) -> None:
                 f"created_by.{key} provenance value too long "
                 f"({len(val)} > {MAX_PROVENANCE_VALUE_LEN} char max)"
             )
+    # DEPTH before bytes: the iterative walk safely rejects a deeply-nested payload that
+    # would otherwise recurse through json.dumps.
+    if _exceeds_depth(v, MAX_PROVENANCE_DEPTH):
+        raise SpineError(
+            f"created_by nests deeper than the allowed limit "
+            f"(max nesting depth {MAX_PROVENANCE_DEPTH})"
+        )
     serialized_bytes = len(json.dumps(v, default=str, sort_keys=True).encode("utf-8"))
     if serialized_bytes > MAX_CREATED_BY_BYTES:
         raise SpineError(
