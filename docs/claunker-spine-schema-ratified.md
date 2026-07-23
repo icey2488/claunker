@@ -1,6 +1,6 @@
 # Claunker Spine — Entity Schema & Lifecycle (Ratified)
 
-**Status:** Ratified 2026-06-16, amended 2026-06-28, amended 2026-07-05 (created_by), amended 2026-07-06 (due, depends_on, patch semantics), amended 2026-07-22 (created_by dispatch provenance).
+**Status:** Ratified 2026-06-16, amended 2026-06-28, amended 2026-07-05 (created_by), amended 2026-07-06 (due, depends_on, patch semantics), amended 2026-07-22 (created_by dispatch provenance), amended 2026-07-23 (description body + preserved foreign metadata; spec v0.8.0).
 
 This document matches the as-built `spine/entity.py`, `spine/projection.py`, and `spine/spine.py`. Field names, enum values, and shapes below are the code's, not a parallel spec.
 
@@ -20,12 +20,13 @@ plus its own semantic fields:
 Project     { id, version, deleted_at, name, created_at }
 
 Task        { id, version, deleted_at, project_id, title, state, tier,
-              acceptance_criteria, effort, impact, due, depends_on,
+              acceptance_criteria, description, effort, impact, due, depends_on,
               order, created_at,
               created_by: { "type": "human" | "agent", "id": string,
                             model?: string, effort?: string, job_id?: string,
                             ...tolerated foreign keys } | null,
-              archived_at }
+              archived_at,
+              metadata: { ...unmodeled foreign Card keys } }
 
 Artifact    { id, version, deleted_at, task_id, kind, ref, created_at }
 
@@ -129,4 +130,15 @@ See full record: `docs/claunker-amendment-2026-07-06-v050.md`.
 - **MCP interop:** the field and every sub-key are OPTIONAL; unknown keys inside `created_by` are TOLERATED both directions (a foreign server's extra keys never break our read/write path; our keys are additive to theirs). Projection passes the whole `created_by` object through verbatim (absent → null, NEVER fabricated).
 - **Downstream:** Kanbantt renders a quiet model+effort chip on the card face and a read-only provenance block in the card dialog — ONLY when provenance is present (human cards show nothing). The bridge (claude-async) emitting provenance at mint is a SEPARATE follow-up; this amendment is the RECEIVING half only.
 - **Documentation-drift note (for the record):** the provenance design brief asserted `created_by` was "added during v0.6.0 card_create and is NOT in the ratified four-entity schema doc." That is inaccurate — `created_by` was added in Amendment 2026-07-05 (above) with shape `{type, id}` and HAS been in §1 since. The v0.6.0 work was the `card_create` MCP tool wiring the stamp from the credential. The brief's `{kind, actor}` naming was likewise superseded by the as-built `{type, id}`; this amendment builds on the real shape, not the brief's.
+- **Materiality:** non-material, additive; log-and-proceed per governance §3.
+
+### Amendment 2026-07-23 — Task.description + Task.metadata (additive; spec v0.8.0)
+
+- **What:** Task gains two additive fields:
+  - `description: string | null` (null default) — the spec-conformant, agent-agnostic narrative BODY (Markdown). It had been in the kanbantt-mcp-spec Card since v0.1.0 but the spine modeled NOBODY and the projection emitted a constant `""` — a silent drop, established as a spec breach by adversarial review (Gemini). Now stored, projected as the real value (null when unset — NOT coerced to `""`), and MUTABLE (unlike write-once `created_by`): `update_task`/`card_update` set it, present-`null` clears it (RFC 7386 key-presence).
+  - `metadata: { ...foreign keys }` (empty-dict default) — the typed map of UNMODELED foreign Card keys the spine now PRESERVES and round-trips instead of flattening away (resolving spec Design Principle 5 / the unknown-field rule vs the old "flatten away" Create clause). The server fills it at the write boundary with every CardInput/patch key outside the known Card surface (`spine.projection.CARD_FIELD_KEYS`, plus the input-only `tier`/`project_id` carriers); the projection overlays it back onto the Card. `card_update` merges it as an RFC 7386 patch (null value removes a key).
+  No `schema_version` bump — both are additive on the `created_by`/`archived_at` nullable precedent; legacy blobs (missing both keys) load untouched (`from_dict` defaults them, `metadata` None → `{}` in `__post_init__`). Confirmed against `storage.SCHEMA_VERSION` (still 1 — that constant governs the dump/load ENVELOPE, bumped only on a breaking blob-shape change; an additive nullable field is not one).
+- **Write-admission caps (prevention at the boundary, like the MI-1 / created_by caps):** `description` ≤ 16384 chars; `metadata` reuses the `created_by` interop budget (≤12 keys / 512-char string values / depth 3 / 4096 bytes, aliased so they cannot drift). Over any cap → `SpineError` → `validation_failed` naming the limit; fail closed, never truncate.
+- **Boundary discipline (why foreign-only):** `metadata` holds ONLY keys outside the known Card surface. Governance/authority/first-class-modeled keys (`column_id`/`order`/`tier`/`created_by`/`version`/`archived_at`/`deleted_at`/`gate_status`/`badge`/…) are excluded at write AND skipped again at the projection overlay, so a client can neither smuggle a spoofed extension field through `metadata` nor bypass a governed path. KNOWN-but-unmodeled Card fields (`priority`/`checklist`/`attachments`) keep their documented-default projection — a published divergence (SPEC-DIVERGENCES.md), not a silent drop.
+- **Downstream:** projection stops emitting `""` and projects the real body; jobcard gains `--description`; the claude-async bridge derives a bounded intent summary from the dispatch prompt for the body; the board (Kanbantt) edits `description` in the MCP-writable dialog alongside the distinct `acceptance_criteria`. kanbantt-mcp-spec bumped to v0.8.0 (the spine catching up to a field the spec already declared, plus the preserve-and-round-trip behavior change).
 - **Materiality:** non-material, additive; log-and-proceed per governance §3.
