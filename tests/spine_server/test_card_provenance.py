@@ -25,6 +25,11 @@ import anyio  # noqa: E402
 from mcp.shared.memory import create_connected_server_and_client_session as connect  # noqa: E402
 
 from spine import Spine, Store  # noqa: E402
+from spine.entity import (  # noqa: E402
+    MAX_CREATED_BY_BYTES,
+    MAX_PROVENANCE_KEYS,
+    MAX_PROVENANCE_VALUE_LEN,
+)
 from spine_server.config import ServerConfig  # noqa: E402
 from spine_server.server import build_server  # noqa: E402
 from tests.spine_server._util import cleanup, make_temp_db  # noqa: E402
@@ -153,6 +158,107 @@ def test_card_create_non_string_provenance_is_validation_failed():
         )
         assert is_error is True
         assert sc["code"] == "validation_failed"
+    finally:
+        cleanup(directory)
+
+
+# ── FINDING 2: created_by admission caps (red-on-violation) ───────────────────
+# Unknown-key tolerance + write-once immutability = a payload the spine accepts and can
+# never clean up, so the WRITE boundary must bound it. Over-limit → validation_failed
+# naming the specific limit; fail closed (whole create rejected, never truncated).
+def test_card_create_nested_provenance_value_is_rejected():
+    """CLOSES THE NESTING HOLE: a nested object under an UNKNOWN key was previously
+    admitted (only model/effort/job_id were string-checked). It must now fail as
+    validation_failed — non-string provenance values, including nesting, are not valid."""
+    directory, path = make_temp_db()
+    try:
+        project_id = _seed_project(path)
+        is_error, sc = anyio.run(
+            _call, build_server(_config(path)), "card_create",
+            {"card": {"title": "x", "created_by": {"model": "m", "vendor_trace": {"span": "abc"}}},
+             "project_id": project_id},
+        )
+        assert is_error is True
+        assert sc["code"] == "validation_failed"
+        assert "vendor_trace" in sc["message"]
+    finally:
+        cleanup(directory)
+
+
+def test_card_create_too_many_provenance_keys_is_rejected():
+    """Over the key-count cap → validation_failed naming the limit."""
+    directory, path = make_temp_db()
+    try:
+        project_id = _seed_project(path)
+        too_many = {f"k{i}": "v" for i in range(MAX_PROVENANCE_KEYS + 1)}
+        is_error, sc = anyio.run(
+            _call, build_server(_config(path)), "card_create",
+            {"card": {"title": "x", "created_by": too_many}, "project_id": project_id},
+        )
+        assert is_error is True
+        assert sc["code"] == "validation_failed"
+        assert "too many provenance keys" in sc["message"]
+    finally:
+        cleanup(directory)
+
+
+def test_card_create_oversized_provenance_value_is_rejected():
+    """A single value over the per-value length cap → validation_failed naming the key."""
+    directory, path = make_temp_db()
+    try:
+        project_id = _seed_project(path)
+        is_error, sc = anyio.run(
+            _call, build_server(_config(path)), "card_create",
+            {"card": {"title": "x", "created_by": {"model": "m" * (MAX_PROVENANCE_VALUE_LEN + 1)}},
+             "project_id": project_id},
+        )
+        assert is_error is True
+        assert sc["code"] == "validation_failed"
+        assert "too long" in sc["message"] and "model" in sc["message"]
+    finally:
+        cleanup(directory)
+
+
+def test_card_create_oversized_total_created_by_is_rejected():
+    """Under the key-count AND per-value caps but over the total-bytes backstop →
+    validation_failed. 10 keys × 500-char values isolate the serialized-size cap."""
+    directory, path = make_temp_db()
+    try:
+        project_id = _seed_project(path)
+        bulky = {f"k{i}": "v" * 500 for i in range(10)}  # 10 ≤ 12 keys, 500 ≤ 512 each
+        is_error, sc = anyio.run(
+            _call, build_server(_config(path)), "card_create",
+            {"card": {"title": "x", "created_by": bulky}, "project_id": project_id},
+        )
+        assert is_error is True
+        assert sc["code"] == "validation_failed"
+        assert "serialized size exceeds cap" in sc["message"]
+        # Sanity: this payload genuinely exceeds the byte cap while obeying the other two.
+        assert 10 <= MAX_PROVENANCE_KEYS and 500 <= MAX_PROVENANCE_VALUE_LEN
+        assert 10 * 500 > MAX_CREATED_BY_BYTES
+    finally:
+        cleanup(directory)
+
+
+def test_card_create_normal_provenance_passes_under_caps():
+    """A realistic agent provenance payload sits comfortably under every cap and is
+    stored — the caps bound abuse, not legitimate mints."""
+    directory, path = make_temp_db()
+    try:
+        project_id = _seed_project(path)
+        is_error, sc = anyio.run(
+            _call, build_server(_config(path)), "card_create",
+            {"card": {"title": "x", "created_by": {
+                "type": "agent", "id": "impostor",
+                "model": "claude-sonnet-5", "effort": "high", "job_id": "job-abc-123",
+            }}, "project_id": project_id},
+        )
+        assert is_error is False
+        stored = _task_on_disk(path, sc["card"]["id"])
+        assert stored.created_by == {
+            "type": "human", "id": "operator",
+            "model": "claude-sonnet-5", "effort": "high", "job_id": "job-abc-123",
+        }
     finally:
         cleanup(directory)
 

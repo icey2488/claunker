@@ -19,6 +19,7 @@ token (everything EXCEPT ``version`` itself, which would be circular); ``to_dict
 
 from __future__ import annotations
 
+import json
 from dataclasses import asdict, dataclass, field, fields
 from typing import Any, Dict, List, Optional
 
@@ -35,18 +36,50 @@ class SpineError(ValueError):
 # top-level dispatch ``effort`` would COLLIDE with that mutable work-size field. Inside
 # created_by there is no collision and the shape stays write-once with the rest of the
 # mint attribution. Each is an OPTIONAL string; a human card carries none.
+# The provenance sub-keys THIS server models. Documentary: validation no longer keys off
+# this list — EVERY non-identity value is string-checked (see ``_validate_created_by``),
+# so a foreign key is held to the same shape rule as a modeled one.
 _PROVENANCE_STR_KEYS = ("model", "effort", "job_id")
+
+# ── created_by ADMISSION CAPS (write-boundary policy; see ``check_created_by_limits``) ──
+# Unknown-key tolerance (interop) + write-once immutability (audit) together mean the
+# spine accepts arbitrary keys into ``created_by`` and then offers NO API to clean them
+# up. Byte size must therefore be bounded at the CREATE boundary — otherwise a
+# hallucinating or hostile agent could store a multi-megabyte string that is immutable
+# forever. These caps are the prevention-at-admission analogue of the MI-1 zombie-append
+# guard: reject the bad write, never relax immutability or add a cleanup path.
+#
+#   MAX_PROVENANCE_KEYS   — non-identity keys allowed alongside type/id. This server
+#                           models 3 (model/effort/job_id); 12 leaves generous headroom
+#                           for a foreign server's provenance dialect while bounding
+#                           key fan-out. A real mint uses 3–4.
+#   MAX_PROVENANCE_VALUE_LEN — chars per provenance value. Model ids, effort words, and
+#                           job uuids are all < 100 chars; 512 admits a long vendor trace
+#                           or URL while rejecting prose / base64 blobs stuffed into a key.
+#   MAX_CREATED_BY_BYTES  — hard ceiling on the serialized whole object (the backstop that
+#                           also bounds long KEY NAMES, which the per-value cap does not).
+#                           A real created_by serializes to ~150 bytes; 4 KiB is ~25×
+#                           headroom yet blocks any multi-megabyte payload outright.
+MAX_PROVENANCE_KEYS = 12
+MAX_PROVENANCE_VALUE_LEN = 512
+MAX_CREATED_BY_BYTES = 4096
 
 
 def _validate_created_by(v: Any) -> None:
-    """Raise SpineError if v is not a valid created_by shape.
+    """Raise SpineError if v is not a valid created_by SHAPE (identity + value types).
 
     IDENTITY (``type`` + ``id``) is REQUIRED and unchanged: ``type`` ∈ {human, agent},
-    ``id`` a non-empty string. The optional provenance sub-keys (``model``/``effort``/
-    ``job_id``) are shape-checked as strings WHEN PRESENT. Any OTHER key is TOLERATED,
-    never rejected — additive-only forward-compat and MCP interop: a created_by minted
-    by a foreign server may carry keys we do not model, and that must not fail our write
-    or read path (the mirror rule: our keys must not break theirs either)."""
+    ``id`` a non-empty string. Every OTHER key is dispatch provenance and its VALUE MUST
+    be a string — this holds for the modeled keys (``model``/``effort``/``job_id``) AND
+    for any unknown foreign key alike. Unknown KEYS are still tolerated (additive-only
+    forward-compat / MCP interop: a foreign server may carry keys we do not model), but a
+    non-string VALUE is rejected: it closes the nesting/depth hole (a nested object or
+    array under an unknown key was previously admitted, since only the three modeled keys
+    were type-checked) and keeps every value length-boundable by ``check_created_by_limits``.
+
+    This is SHAPE validation only — it runs on construct AND on load (``from_dict``). The
+    SIZE caps are admission policy and live in ``check_created_by_limits``, called at the
+    write boundary so restore/load never re-polices already-admitted data."""
     if (
         not isinstance(v, dict)
         or v.get("type") not in ("human", "agent")
@@ -56,11 +89,47 @@ def _validate_created_by(v: Any) -> None:
         raise SpineError(
             f"created_by must be {{\"type\": \"human\"|\"agent\", \"id\": <non-empty string>}}, got {v!r}"
         )
-    for key in _PROVENANCE_STR_KEYS:
-        if key in v and not isinstance(v[key], str):
+    for key, val in v.items():
+        if key in ("type", "id"):
+            continue
+        if not isinstance(val, str):
             raise SpineError(
-                f"created_by.{key} provenance must be a string when present, got {v[key]!r}"
+                f"created_by.{key} provenance must be a string, got {val!r} "
+                "(non-string values — including nested objects and arrays — are not permitted)"
             )
+
+
+def check_created_by_limits(v: Any) -> None:
+    """Enforce the created_by ADMISSION CAPS at the write boundary (→ SpineError, which
+    the server maps to ``validation_failed``). Fails CLOSED and names the specific limit
+    exceeded — the whole create is rejected, never silently truncated (silent truncation
+    is the ``description``-drop failure mode we are not duplicating).
+
+    Assumes ``_validate_created_by`` has already established the shape (every non-identity
+    value is a string); this layer bounds SIZE only. Non-dict ``v`` is a no-op — shape
+    validation owns that rejection. Documented in kanbantt-mcp-spec §created_by so a
+    foreign MCP agent knows the contract."""
+    if not isinstance(v, dict):
+        return
+    provenance_keys = [k for k in v if k not in ("type", "id")]
+    if len(provenance_keys) > MAX_PROVENANCE_KEYS:
+        raise SpineError(
+            f"created_by carries too many provenance keys "
+            f"({len(provenance_keys)} > {MAX_PROVENANCE_KEYS} max)"
+        )
+    for key in provenance_keys:
+        val = v[key]
+        if isinstance(val, str) and len(val) > MAX_PROVENANCE_VALUE_LEN:
+            raise SpineError(
+                f"created_by.{key} provenance value too long "
+                f"({len(val)} > {MAX_PROVENANCE_VALUE_LEN} char max)"
+            )
+    serialized_bytes = len(json.dumps(v, default=str, sort_keys=True).encode("utf-8"))
+    if serialized_bytes > MAX_CREATED_BY_BYTES:
+        raise SpineError(
+            f"created_by serialized size exceeds cap "
+            f"({serialized_bytes} > {MAX_CREATED_BY_BYTES} byte max)"
+        )
 
 
 # ── state / kind vocabularies ────────────────────────────────────────────────

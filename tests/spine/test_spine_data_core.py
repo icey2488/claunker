@@ -597,16 +597,55 @@ def test_task_created_by_provenance_non_string_rejected():
                                 created_by={"type": "agent", "id": "a", "job_id": 7}), SpineError)
 
 
-def test_task_created_by_unknown_keys_tolerated():
-    """MCP interop: a created_by minted by a FOREIGN server may carry keys we do not
-    model. They must NOT break our write or read path — additive-only, never rejected."""
+def test_task_created_by_unknown_string_keys_tolerated():
+    """MCP interop: a created_by minted by a FOREIGN server may carry KEYS we do not
+    model. Unknown keys with STRING values must NOT break our write or read path —
+    additive-only, preserved verbatim through store and lens."""
     spine = Spine()
     p = spine.create_project("p")
     foreign = {"type": "agent", "id": "some-other-agent", "model": "their-model",
-               "vendor_trace": {"span": "abc"}, "cost_cents": 3}
+               "vendor_trace": "span-abc", "cost_note": "3c"}
     t = spine.create_task(p.id, "x", created_at=T[0], created_by=foreign)
     assert t.created_by == foreign
-    assert _card_for(spine, t.id)["created_by"] == foreign  # unknown keys survive the lens
+    assert _card_for(spine, t.id)["created_by"] == foreign  # unknown STRING keys survive the lens
+
+
+def test_task_created_by_unknown_nonstring_value_rejected():
+    """Unknown-KEY tolerance does NOT extend to non-string VALUES: a nested object or
+    array (or number) under a foreign key is rejected, closing the nesting/depth hole
+    (previously only the modeled model/effort/job_id keys were type-checked, so a nested
+    unknown value was silently admitted and then immutable forever)."""
+    _assert_raises(lambda: Task(id="t", project_id="p", title="x",
+                                created_by={"type": "agent", "id": "a", "vendor_trace": {"span": "abc"}}),
+                   SpineError)
+    _assert_raises(lambda: Task(id="t", project_id="p", title="x",
+                                created_by={"type": "agent", "id": "a", "cost_cents": 3}),
+                   SpineError)
+
+
+def test_created_by_admission_caps_enforced_at_create_task():
+    """The size caps guard create_task itself (the CLI / local-trust path), not only the
+    wire tool: too-many keys, an oversized value, and an oversized total all raise at
+    mint. A realistic payload passes. Proves BOTH write paths are bounded."""
+    from spine.entity import (MAX_CREATED_BY_BYTES, MAX_PROVENANCE_KEYS,
+                              MAX_PROVENANCE_VALUE_LEN)
+    spine = Spine()
+    p = spine.create_project("p")
+    base = {"type": "agent", "id": "a"}
+    # too many keys
+    _assert_raises(lambda: spine.create_task(
+        p.id, "x", created_by={**base, **{f"k{i}": "v" for i in range(MAX_PROVENANCE_KEYS + 1)}}), SpineError)
+    # oversized single value
+    _assert_raises(lambda: spine.create_task(
+        p.id, "x", created_by={**base, "model": "m" * (MAX_PROVENANCE_VALUE_LEN + 1)}), SpineError)
+    # oversized total (each value ≤ cap, key count ≤ cap, but total over the byte cap)
+    _assert_raises(lambda: spine.create_task(
+        p.id, "x", created_by={**base, **{f"k{i}": "v" * 500 for i in range(10)}}), SpineError)
+    # realistic mint passes comfortably
+    ok = spine.create_task(p.id, "x", created_at=T[0],
+                           created_by={**base, "model": "claude-sonnet-5", "effort": "high", "job_id": "job-1"})
+    assert ok.created_by["model"] == "claude-sonnet-5"
+    assert MAX_CREATED_BY_BYTES == 4096  # pin the documented contract number
 
 
 # ── R6 durable-ref validation in create_artifact ──────────────────────────────

@@ -79,6 +79,7 @@ from .entity import (
     SpineError,
     Task,
     State,
+    check_created_by_limits,
 )
 from .ordering import append_rank
 from .projection import project
@@ -211,6 +212,11 @@ class Spine:
         tid = task_id or str(uuid.uuid4())
         if actual_deps and tid in actual_deps:
             raise SpineError(f"task {tid!r} cannot depend on itself")
+        # created_by ADMISSION CAPS (write-boundary, like MI-1): bound the provenance
+        # payload BEFORE minting so an unbounded/hostile created_by is rejected at create
+        # rather than stored immutably forever. Shape (value types) is enforced by the
+        # Task constructor; this bounds size. Restore/load bypass this — already admitted.
+        check_created_by_limits(created_by)
         if order is None:
             last_order = max((t.order for t in self.store.tasks.list_live()), default="")
             order = append_rank(last_order)
