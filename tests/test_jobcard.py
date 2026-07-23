@@ -122,6 +122,49 @@ def test_no_actor_gives_null_created_by(tmp_db, capsys):
     assert task.created_by is None
 
 
+# ── create --model/--effort/--job-id (dispatch provenance) ────────────────────
+
+def test_provenance_flags_round_trip(tmp_db, capsys):
+    main(["create", "--actor", "claude-code", "--model", "claude-sonnet-5",
+          "--effort", "medium", "--job-id", "job-abc-123", "my task"])
+    task_id = capsys.readouterr().out.strip()
+    with Store(tmp_db) as store:
+        task = store.tasks.get(task_id)
+    assert task.created_by == {
+        "type": "agent", "id": "claude-code",
+        "model": "claude-sonnet-5", "effort": "medium", "job_id": "job-abc-123",
+    }
+
+
+def test_provenance_flags_omitted_produce_todays_behavior(tmp_db, capsys):
+    """Omitted --model/--effort/--job-id → absent means absent, no empty/null keys."""
+    main(["create", "--actor", "claude-code", "my task"])
+    task_id = capsys.readouterr().out.strip()
+    with Store(tmp_db) as store:
+        task = store.tasks.get(task_id)
+    assert task.created_by == {"type": "agent", "id": "claude-code"}
+    assert "model" not in task.created_by
+    assert "effort" not in task.created_by
+    assert "job_id" not in task.created_by
+
+
+def test_provenance_flags_partial_only_sets_given_keys(tmp_db, capsys):
+    main(["create", "--actor", "claude-code", "--model", "claude-opus-4-8", "my task"])
+    task_id = capsys.readouterr().out.strip()
+    with Store(tmp_db) as store:
+        task = store.tasks.get(task_id)
+    assert task.created_by == {"type": "agent", "id": "claude-code", "model": "claude-opus-4-8"}
+
+
+def test_provenance_flags_ignored_without_actor(tmp_db, capsys):
+    """No --actor → created_by stays null, so provenance flags have nothing to ride on."""
+    main(["create", "--model", "claude-sonnet-5", "--effort", "high", "my task"])
+    task_id = capsys.readouterr().out.strip()
+    with Store(tmp_db) as store:
+        task = store.tasks.get(task_id)
+    assert task.created_by is None
+
+
 # ── artifact subcommand ────────────────────────────────────────────────────────
 
 def test_artifact_git_hash_ref_accepted(tmp_db, capsys):

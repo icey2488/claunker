@@ -12,6 +12,8 @@ Usage::
     python jobcard.py create "<title>"                  # Dispatch Log, DISPATCHED
     python jobcard.py create --state created "<title>"  # Dispatch Log, CREATED
     python jobcard.py create --project "<name-or-id>" "<title>"  # named project
+    python jobcard.py create --actor claude-code --model claude-sonnet-5 \
+        --effort medium --job-id 1234-abcd "<title>"    # dispatch provenance
     python jobcard.py done      <task_id>   # set state to DELIVERED
     python jobcard.py fail      <task_id>   # set state to FAILED
     python jobcard.py set-state <task_id> <state>  # move to any ratified state
@@ -83,12 +85,24 @@ def cmd_create(
     project_arg: Optional[str] = None,
     actor: Optional[str] = None,
     actor_type: str = "agent",
+    model: Optional[str] = None,
+    effort: Optional[str] = None,
+    job_id: Optional[str] = None,
 ) -> None:
     if project_arg is None:
         project = _ensure_dispatch_log(spine)
     else:
         project = _resolve_project(spine, project_arg)
     created_by = {"type": actor_type, "id": actor} if actor is not None else None
+    if created_by is not None:
+        # Optional dispatch-provenance sub-keys (spec v0.7.0, entity._PROVENANCE_STR_KEYS).
+        # Absent means absent — no empty-string/null placeholders in created_by.
+        if model is not None:
+            created_by["model"] = model
+        if effort is not None:
+            created_by["effort"] = effort
+        if job_id is not None:
+            created_by["job_id"] = job_id
     task = spine.create_task(project.id, title, state=state, created_by=created_by)
     # ONLY the id on stdout — callers capture it (e.g. `jobcard done $(jobcard create ...)`).
     print(task.id)
@@ -167,6 +181,25 @@ def main(argv=None) -> int:
         dest="actor_type",
         help="actor type (default: agent); ignored when --actor is omitted",
     )
+    p_create.add_argument(
+        "--model",
+        default=None,
+        help="dispatch provenance: reasoning model to record in created_by (optional; "
+             "ignored when --actor is omitted)",
+    )
+    p_create.add_argument(
+        "--effort",
+        default=None,
+        help="dispatch provenance: reasoning effort to record in created_by (optional; "
+             "ignored when --actor is omitted)",
+    )
+    p_create.add_argument(
+        "--job-id",
+        dest="job_id",
+        default=None,
+        help="dispatch provenance: originating claude-async job id to record in created_by "
+             "(optional; ignored when --actor is omitted)",
+    )
 
     p_done = sub.add_parser("done", help="mark a pass card DELIVERED")
     p_done.add_argument("task_id", help="the task id printed by create")
@@ -196,7 +229,8 @@ def main(argv=None) -> int:
         spine = Spine(store)
         if args.command == "create":
             cmd_create(spine, args.title, state=args.state, project_arg=args.project,
-                       actor=args.actor, actor_type=args.actor_type)
+                       actor=args.actor, actor_type=args.actor_type,
+                       model=args.model, effort=args.effort, job_id=args.job_id)
         elif args.command == "done":
             cmd_done(spine, args.task_id)
         elif args.command == "fail":
