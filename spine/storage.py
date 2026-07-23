@@ -100,8 +100,16 @@ class EntityStore:
         return self._from_dict(json.loads(row[0])) if row else None
 
     def list_all(self) -> List[_Entity]:
-        """Every row, tombstones included."""
-        rows = self._conn.execute(f"SELECT data FROM {self._table}").fetchall()
+        """Every row, tombstones included, in INSERTION (creation) order — ``ORDER BY rowid``.
+        SQLite leaves scan order UNDEFINED without an ORDER BY, so relying on the implicit
+        rowid scan was undefined behaviour; pinning ``rowid`` makes the order deterministic
+        and equal to creation order (rowid is monotonic per insert for these entity rows,
+        which v1 never REPLACEs in place except a soft-delete re-put that keeps the id).
+        This is the stable creation-order tiebreak ``project_list`` relies on: two projects
+        minted in the SAME clock tick share ``created_at`` (a display-only value, never an
+        ordering primitive), so a STABLE sort over this rowid-ordered scan keeps them oldest-
+        first instead of falling back to the random UUID id that made the read non-deterministic."""
+        rows = self._conn.execute(f"SELECT data FROM {self._table} ORDER BY rowid").fetchall()
         return [self._from_dict(json.loads(r[0])) for r in rows]
 
     def list_live(self) -> List[_Entity]:

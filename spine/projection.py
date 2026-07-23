@@ -68,6 +68,27 @@ CARD_FIELD_KEYS = frozenset({
     "created_by", "updated_by", "attachments", "gate_status", "badge",
 })
 
+# Spec-DEFINED Card fields the spine does not model as first-class columns. The spec
+# declares them (``priority``/``checklist``/``attachments``), but the v1 work model has no
+# native column for any of them. v0.8.0 STOPS DROPPING them: rather than projecting a fixed
+# documented default and discarding the client's value (which punished spec compliance while
+# a genuinely-foreign key was preserved — the backwards scope this fix corrects), a client-
+# supplied value for one of these is PRESERVED through the SAME ``metadata`` path as an
+# unknown foreign key and echoed on read. When the client sends none, ``to_card`` still emits
+# the documented default below (``priority: "med"``, empty collections). They are the ONLY
+# keys the metadata overlay may write onto the projected Card among CARD_FIELD_KEYS — see
+# PROTECTED_CARD_KEYS.
+UNMODELED_CARD_KEYS = frozenset({"priority", "checklist", "attachments"})
+
+# The MODELED / authority / extension Card keys the metadata overlay may NEVER clobber — the
+# full known surface MINUS the known-but-unmodeled fields that legitimately round-trip through
+# metadata. This is the guard on projection: a preserved key can overwrite a projected default
+# ONLY for a key in UNMODELED_CARD_KEYS; ``id``/``title``/``description``/``created_by``/
+# ``gate_status``/… stay authority-owned even against a hand-tampered row. It is also what the
+# server subtracts (plus the input-only ``tier``/``project_id`` carriers) to decide which
+# CardInput keys to PRESERVE into ``Task.metadata`` — so the known-but-unmodeled trio flow in.
+PROTECTED_CARD_KEYS = CARD_FIELD_KEYS - UNMODELED_CARD_KEYS
+
 
 def _tags_for(task: Task) -> List[str]:
     """tier → a tag id in the Card ``tags`` array (omitted until a tier is set)."""
@@ -135,10 +156,12 @@ def to_card(task: Optional[Task], badge: Optional[Dict[str, Any]] = None) -> Opt
         "column_id": task.state,            # state → column, one-to-one
         "order": task.order,
         "tags": _tags_for(task),
-        "checklist": [],
+        "checklist": [],                    # documented default; a client-supplied checklist
+                                            # overrides this from metadata (see overlay below)
         "due": task.due,
         "depends_on": task.depends_on,
-        "priority": DEFAULT_PRIORITY,
+        "priority": DEFAULT_PRIORITY,       # documented default; client value overrides via
+                                            # the metadata overlay (known-but-unmodeled field)
         "effort": task.effort,
         "impact": task.impact,
         "version": task.version,
@@ -148,17 +171,23 @@ def to_card(task: Optional[Task], badge: Optional[Dict[str, Any]] = None) -> Opt
         "updated_at": None,                 # v1 entities track no update timestamp
         "created_by": task.created_by,      # pass through; null when entity has no actor
         "updated_by": None,
-        "attachments": [],
+        "attachments": [],                  # documented default; client value overrides via
+                                            # the metadata overlay (known-but-unmodeled field)
         # ── Claunker extensions (preserved by the unknown-field round-trip rule) ─
         "gate_status": GATE_STATUS_COMMITTED,
         "badge": badge,
     }
-    # PRESERVE-AND-ROUND-TRIP: echo the unmodeled foreign keys the write boundary stored
-    # in ``Task.metadata`` (spec §Schema Versioning). The guard is belt-and-suspenders —
-    # metadata holds only non-Card keys by construction (the server excludes CARD_FIELD_KEYS
-    # at write) — so a foreign key can never clobber a modeled/authority/extension field.
+    # PRESERVE-AND-ROUND-TRIP: echo the preserved keys the write boundary stored in
+    # ``Task.metadata`` (spec §Schema Versioning). Two kinds ride here — genuinely-foreign
+    # keys, and the known-but-unmodeled Card trio (``priority``/``checklist``/``attachments``,
+    # v0.8.0). The guard skips only PROTECTED_CARD_KEYS: a foreign key can never clobber a
+    # modeled/authority/extension field (``id``/``title``/``created_by``/``gate_status``/…),
+    # even from a hand-tampered row — but a preserved value for a key in UNMODELED_CARD_KEYS
+    # is ALLOWED to OVERRIDE its documented default above, which is exactly how the trio round-
+    # trips. (A foreign key that happens to equal an unmodeled key overrides the same slot; the
+    # server only ever stores the trio there deliberately, so this is the intended behaviour.)
     for key, value in (task.metadata or {}).items():
-        if key not in CARD_FIELD_KEYS:
+        if key not in PROTECTED_CARD_KEYS:
             card[key] = value
     return card
 

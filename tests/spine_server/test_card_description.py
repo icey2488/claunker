@@ -214,14 +214,16 @@ def test_card_update_merges_and_removes_foreign_keys():
 def test_card_create_over_limit_foreign_metadata_rejects_loudly():
     directory, path = make_temp_db()
     try:
-        # Over the total-bytes backstop while under key-count/per-value caps.
-        bulky = {f"k{i}": "v" * 500 for i in range(10)}
+        # Over the total-bytes backstop while UNDER key-count and per-value caps — proving
+        # the byte TOTAL is the binding guard (not merely the per-value cap, which no single
+        # value can exceed anyway). 20 keys × 2000 chars ≈ 40 KB > the 32 KiB total.
+        bulky = {f"k{i}": "v" * 2000 for i in range(20)}
         is_error, sc = _create(path, {"title": "t", **bulky})
         assert is_error is True
         assert sc["code"] == "validation_failed"
         assert "metadata serialized size exceeds cap" in sc["message"]
-        assert 10 <= MAX_METADATA_KEYS and 500 <= MAX_METADATA_VALUE_LEN
-        assert 10 * 500 > MAX_METADATA_BYTES
+        assert 20 <= MAX_METADATA_KEYS and 2000 <= MAX_METADATA_VALUE_LEN  # under both other caps
+        assert 20 * 2000 > MAX_METADATA_BYTES                              # yet over the total
     finally:
         cleanup(directory)
 
@@ -253,16 +255,121 @@ def test_client_cannot_smuggle_extension_field_via_metadata():
         cleanup(directory)
 
 
-def test_unmodeled_known_card_fields_keep_documented_defaults():
-    """priority/checklist/attachments are KNOWN Card fields the spine does not model; a
-    client value for them is projected as the documented default (a recorded divergence —
-    SPEC-DIVERGENCES.md), NOT preserved as foreign metadata. This pins that boundary."""
+def test_unmodeled_known_card_fields_round_trip():
+    """RESOLVED v0.8.0 (was ``..._keep_documented_defaults``): priority/checklist/attachments
+    are spec-DEFINED Card fields the spine does not model as first-class columns. The old scope
+    DROPPED a client's value for them (projecting a documented default) while PRESERVING a random
+    foreign key — punishing spec compliance, rewarding deviation. They now route through the SAME
+    preservation path (``Task.metadata``) as an unknown foreign key and round-trip on read; only
+    when the client sends none does ``to_card`` emit the documented default. See
+    test_spec_divergences.py::test_priority_checklist_attachments_round_trip for the register cross-ref."""
     directory, path = make_temp_db()
     try:
-        is_error, sc = _create(path, {"title": "t", "priority": "high", "checklist": [{"text": "a"}]})
+        checklist = [{"text": "a", "done": False}, {"text": "b", "done": True}]
+        attachments = [{"id": "att-1", "ref": "s3://bucket/x"}]
+        is_error, sc = _create(path, {
+            "title": "t", "priority": "high", "checklist": checklist, "attachments": attachments,
+        })
         assert is_error is False
-        assert sc["card"]["priority"] == "med"   # documented default, not the client's "high"
+        assert sc["card"]["priority"] == "high"        # the client's value, no longer dropped to "med"
+        assert sc["card"]["checklist"] == checklist
+        assert sc["card"]["attachments"] == attachments
+        # stored in metadata (the preservation path), NOT as a first-class Task column
+        assert _task_on_disk(path, sc["card"]["id"]).metadata == {
+            "priority": "high", "checklist": checklist, "attachments": attachments,
+        }
+    finally:
+        cleanup(directory)
+
+
+def test_unmodeled_known_card_fields_default_when_absent():
+    """The other half of the round-trip: when the client sends none of the trio, ``to_card``
+    still emits the documented default (``priority: "med"``, empty collections) and metadata
+    stays empty — the default projection is unchanged for the absent case."""
+    directory, path = make_temp_db()
+    try:
+        is_error, sc = _create(path, {"title": "t"})
+        assert is_error is False
+        assert sc["card"]["priority"] == "med"
         assert sc["card"]["checklist"] == []
+        assert sc["card"]["attachments"] == []
         assert _task_on_disk(path, sc["card"]["id"]).metadata == {}
     finally:
         cleanup(directory)
+
+
+def test_unmodeled_known_card_fields_survive_update_round_trip():
+    """Each of the trio survives a ``card_update`` round trip (RFC 7386 merge through metadata),
+    exactly like a foreign key: set priority on create, then change it + add a checklist on
+    update, and read both back."""
+    directory, path = make_temp_db()
+    try:
+        is_error, sc = _create(path, {"title": "t", "priority": "low"})
+        assert is_error is False and sc["card"]["priority"] == "low"
+        cid = sc["card"]["id"]
+        is_error, sc = anyio.run(
+            _call, build_server(_config(path)), "card_update",
+            {"id": cid, "patch": {"priority": "high", "checklist": [{"text": "ship", "done": False}]},
+             "expected_version": _version_of(path, cid)},
+        )
+        assert is_error is False
+        assert sc["card"]["priority"] == "high"
+        assert sc["card"]["checklist"] == [{"text": "ship", "done": False}]
+    finally:
+        cleanup(directory)
+
+
+def test_unmodeled_known_card_fields_cannot_clobber_a_modeled_field():
+    """The clobber guard still holds AFTER the trio was subtracted from the protected set: a
+    preserved key can override a known-but-unmodeled default (priority) but NEVER a modeled/
+    authority/extension field. gate_status stays the server's COMMITTED even alongside a
+    round-tripping priority."""
+    directory, path = make_temp_db()
+    try:
+        is_error, sc = _create(path, {"title": "t", "priority": "high", "gate_status": "HACKED"})
+        assert is_error is False
+        assert sc["card"]["priority"] == "high"          # unmodeled field overrides its default
+        assert sc["card"]["gate_status"] == "COMMITTED"  # protected field stays server-owned
+    finally:
+        cleanup(directory)
+
+
+def test_realistic_checklist_and_attachments_payload_passes_comfortably():
+    """A realistic Card body — a few-dozen-item checklist + an attachments list — passes the
+    RAISED metadata budget comfortably (the payload the caps were sized against). Proves the
+    budget fits real collections, not just stray scalars."""
+    directory, path = make_temp_db()
+    try:
+        checklist = [{"text": f"task item number {i} — do the thing", "done": i % 2 == 0}
+                     for i in range(40)]
+        attachments = [{"id": f"att-{i}", "ref": f"https://storage.example.com/blobs/{i:04d}"}
+                       for i in range(15)]
+        is_error, sc = _create(path, {
+            "title": "t", "priority": "high", "checklist": checklist, "attachments": attachments,
+        })
+        assert is_error is False, sc
+        assert len(sc["card"]["checklist"]) == 40 and len(sc["card"]["attachments"]) == 15
+        assert sc["card"]["priority"] == "high"
+    finally:
+        cleanup(directory)
+
+
+def test_metadata_budget_is_uncoupled_from_the_provenance_budget():
+    """Finding 3: the metadata caps are DEFINED INDEPENDENTLY of the provenance caps (no longer
+    aliased) and RAISED. This pins the uncoupling — the two budgets must NOT be equal — and
+    proves the provenance caps did not move (they keep their pinned contract numbers)."""
+    from spine.entity import (
+        MAX_CREATED_BY_BYTES,
+        MAX_METADATA_DEPTH,
+        MAX_PROVENANCE_DEPTH,
+        MAX_PROVENANCE_KEYS,
+        MAX_PROVENANCE_VALUE_LEN,
+    )
+    # metadata is strictly larger on the size axes that matter for collections
+    assert MAX_METADATA_BYTES == 32768 and MAX_METADATA_BYTES > MAX_CREATED_BY_BYTES
+    assert MAX_METADATA_KEYS == 24 and MAX_METADATA_KEYS > MAX_PROVENANCE_KEYS
+    assert MAX_METADATA_VALUE_LEN == 2048 and MAX_METADATA_VALUE_LEN > MAX_PROVENANCE_VALUE_LEN
+    assert MAX_METADATA_DEPTH == 4 and MAX_METADATA_DEPTH > MAX_PROVENANCE_DEPTH
+    # provenance caps UNMOVED (their pinned contract numbers)
+    assert MAX_PROVENANCE_KEYS == 12 and MAX_PROVENANCE_VALUE_LEN == 512
+    assert MAX_PROVENANCE_DEPTH == 3 and MAX_CREATED_BY_BYTES == 4096

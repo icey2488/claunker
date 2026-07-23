@@ -221,23 +221,57 @@ def _validate_description(v: Any) -> None:
         raise SpineError(f"description must be a string or null, got {v!r}")
 
 
-# ── metadata (UNMODELED FOREIGN CARD KEYS) ADMISSION CAPS ────────────────────────────
+# ── metadata (PRESERVED CARD KEYS) ADMISSION CAPS ────────────────────────────────────
 # The spec's unknown-field rule (§Schema Versioning & Forward Compatibility: "unknown
 # fields are preserved and round-tripped, never stripped, never an error") applies to the
-# whole Card body, not just to ``created_by``. Keys the spine does not model as first-class
-# Card fields are PRESERVED in this typed map — stored intact, echoed on projection —
-# instead of being silently flattened away at the write boundary (the old ``description``-
-# drop failure mode, generalized). This is the forward-compat guarantee: a v0.8 client's
-# new field survives a round trip through a v0.7 server rather than vanishing.
+# whole Card body, not just to ``created_by``. Two classes of key route through this typed
+# map — stored intact, echoed on projection — instead of being silently flattened away at
+# the write boundary (the old ``description``-drop failure mode, generalized):
+#   1. genuinely-FOREIGN keys — a newer client's field or a foreign server's extension
+#      (the forward-compat case: a v0.9 field survives a round trip through a v0.8 server);
+#   2. spec-DEFINED-but-unmodeled Card fields — ``priority`` / ``checklist`` / ``attachments``
+#      (v0.8.0): the spine has no first-class column for them, but the spec DEFINES them, so
+#      dropping the client's value while preserving a random foreign key would punish spec
+#      compliance and reward deviation. They route through the SAME preservation path.
 #
-# Same admission discipline as ``created_by``: unknown-key tolerance + no cleanup API ⇒
-# the payload MUST be bounded at create/update. Foreign card metadata is the SAME class of
-# interop passthrough as a foreign ``created_by`` dialect, so it inherits the ``created_by``
-# budget rather than inventing a parallel set — the aliases below keep the two from drifting.
-MAX_METADATA_KEYS = MAX_PROVENANCE_KEYS
-MAX_METADATA_VALUE_LEN = MAX_PROVENANCE_VALUE_LEN
-MAX_METADATA_DEPTH = MAX_PROVENANCE_DEPTH
-MAX_METADATA_BYTES = MAX_CREATED_BY_BYTES
+# UNCOUPLED FROM THE PROVENANCE BUDGET (v0.8.0). Metadata FORMERLY aliased the ``created_by``
+# interop budget (12 keys / 512 chars / depth 3 / 4096 bytes). That was defensible when
+# metadata held only stray scalar foreign keys — the same shape class as a ``created_by``
+# provenance dialect. It is NOT defensible now that ``checklist`` and ``attachments`` —
+# legitimately larger COLLECTIONS — route through it: a realistic checklist alone blows a
+# 4096-byte ceiling. So these caps are now DEFINED INDEPENDENTLY (never aliased) and RAISED
+# to fit real Card payloads. The provenance caps above are UNCHANGED — the two budgets no
+# longer move together. Same admission discipline: bounded at create/update, fail-closed,
+# name the specific limit exceeded, never truncate.
+#
+# SIZED AGAINST a realistic worst-case Card body: a ~40-item checklist
+# (``[{"text": <~120 chars>, "done": bool}]`` ≈ 40×145 ≈ 5.8 KB) + a ~15-item attachments
+# list (``[{"id": <uuid>, "ref": <~200-char url>}]`` ≈ 15×265 ≈ 4.0 KB) + ``priority`` + a
+# handful of genuinely-foreign keys ⇒ ~10-12 KB realistic. Each cap justified inline:
+#
+#   MAX_METADATA_KEYS = 24 — TOP-LEVEL key fan-out (a collection is ONE key holding many
+#       items, so item count does not spend this). Room for the 3 known-unmodeled Card fields
+#       + ~21 foreign-dialect keys while still bounding fan-out. (Provenance stays at 12.)
+#   MAX_METADATA_VALUE_LEN = 2048 — chars per TOP-LEVEL STRING value (a foreign note/URL, or
+#       ``priority``). NOTE the reviewer's remedy was INCOMPLETE: raising this alone is near-
+#       useless because the long strings live INSIDE ``checklist``/``attachments`` arrays, not
+#       as top-level string values — the byte TOTAL is what actually bounds them. So this is
+#       raised (512→2048, a longer foreign string/URL) AND the total below is raised; a 2048
+#       value now fits comfortably under the 32 KiB total. (Provenance stays at 512.)
+#   MAX_METADATA_DEPTH = 4 — metadata dict (level 1) → ``checklist``/``attachments`` array
+#       (2) → item object (3) → one container of HEADROOM (4) for a nested foreign value or a
+#       slightly richer item. A ``[{text,done}]`` checklist reaches depth 3. (Provenance
+#       stays at 3.) Enforced by the same iterative ``_exceeds_depth`` walk (no parser bomb).
+#   MAX_METADATA_BYTES = 32768 — serialized-byte ceiling, the PRIMARY guard (it bounds the
+#       collections the per-value cap cannot see). 32 KiB is ~2.5-3× the ~10-12 KB realistic
+#       worst case above — comfortable headroom for a rich checklist + attachments + foreign
+#       keys — while still rejecting a multi-megabyte paste outright. The TOTAL rises (not just
+#       the per-value cap), which is the point: no single value could exceed the total anyway.
+#       (Provenance stays at 4096.)
+MAX_METADATA_KEYS = 24
+MAX_METADATA_VALUE_LEN = 2048
+MAX_METADATA_DEPTH = 4
+MAX_METADATA_BYTES = 32768
 
 
 def check_metadata_limits(v: Any) -> None:

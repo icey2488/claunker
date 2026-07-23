@@ -50,27 +50,31 @@ from mcp.server.transport_security import TransportSecuritySettings
 from starlette.applications import Starlette
 
 from spine import ConflictError, Spine, Store, project
-from spine.projection import CARD_FIELD_KEYS
+from spine.projection import PROTECTED_CARD_KEYS
 
 # Input-only reserved keys a CardInput / patch may carry that are NOT projected Card
 # fields but must still NEVER be preserved as foreign metadata: ``tier`` (the native-int
 # tier carrier folded into the ``tier:N`` tag by ``_tier_from_card_input``) and
 # ``project_id`` (the top-level create-targeting sibling). Everything OUTSIDE
-# ``CARD_FIELD_KEYS ∪ _NON_METADATA_INPUT_KEYS`` is an unmodeled foreign key the write
-# boundary PRESERVES into ``Task.metadata`` (spec §Schema Versioning) rather than dropping.
+# ``PROTECTED_CARD_KEYS ∪ _NON_METADATA_INPUT_KEYS`` is PRESERVED into ``Task.metadata``
+# (spec §Schema Versioning) rather than dropped — this now includes the known-but-unmodeled
+# Card trio (``priority``/``checklist``/``attachments``), which live OUTSIDE PROTECTED_CARD_KEYS
+# precisely so a client's value for them round-trips instead of being flattened to a default.
 _NON_METADATA_INPUT_KEYS = frozenset({"tier", "project_id"})
 
 
 def _foreign_metadata(card: Dict[str, Any]) -> Dict[str, Any]:
-    """The unmodeled foreign keys of a CardInput / patch — everything the spine does not
-    model as a first-class Card field or consume as an input-only carrier. These are
-    PRESERVED (stored in ``Task.metadata``, echoed on projection) instead of flattened
-    away, honouring the spec's preserve-and-round-trip rule while forward-compat keys from
-    a newer client survive. The size/depth of the result is bounded downstream by
+    """The PRESERVED keys of a CardInput / patch — everything the spine does not model as a
+    first-class (PROTECTED) Card field or consume as an input-only carrier. Two classes ride
+    here: genuinely-foreign keys (forward-compat) AND the spec-defined-but-unmodeled trio
+    ``priority``/``checklist``/``attachments`` (v0.8.0 — subtracted from PROTECTED_CARD_KEYS so
+    a client value survives rather than being dropped for a documented default). All are
+    PRESERVED (stored in ``Task.metadata``, echoed on projection) honouring the spec's
+    preserve-and-round-trip rule. The size/depth of the result is bounded downstream by
     ``check_metadata_limits`` at the create/update boundary."""
     return {
         k: v for k, v in card.items()
-        if k not in CARD_FIELD_KEYS and k not in _NON_METADATA_INPUT_KEYS
+        if k not in PROTECTED_CARD_KEYS and k not in _NON_METADATA_INPUT_KEYS
     }
 
 # Drive backup singleton — DORMANT until SA key is present (set by main()).
@@ -370,15 +374,22 @@ def build_server(config: ServerConfig) -> FastMCP:
         structured_output=False,
     )
     def project_list() -> types.CallToolResult:
-        # Live projects only (a soft-deleted project is not a create target — the
-        # same liveness rule jobcard's resolver applies). Sorted (created_at, id):
-        # deterministic, oldest-first, with the opaque id as the stable tiebreak.
+        # Live projects only (a soft-deleted project is not a create target — the same
+        # liveness rule jobcard's resolver applies). Oldest-first: a STABLE sort by
+        # ``created_at`` over the INSERTION-ORDERED scan (``list_live`` → ``list_all``'s
+        # ``ORDER BY rowid``). The former ``(created_at, id)`` tiebreak was a REAL DEFECT,
+        # not a flake: ``created_at`` is a display value (never an ordering primitive), so
+        # two projects minted in the same clock tick collided on it and fell back to the
+        # tiebreak — but ``id`` is a RANDOM UUIDv4 that bears no relation to creation order,
+        # so same-tick projects sorted at random (~50% inverted). Python's sort is STABLE,
+        # so keying on ``created_at`` ALONE preserves the rowid (creation) order within a
+        # tick — a total, deterministic, oldest-first order that no random id can perturb.
         with Store(config.db_path) as store:
             projects = [
                 {"id": p.id, "name": p.name, "created_at": p.created_at}
                 for p in store.projects.list_live()
             ]
-        projects.sort(key=lambda p: (p["created_at"] or "", p["id"]))
+        projects.sort(key=lambda p: p["created_at"] or "")
         return ok_result({"projects": projects})
 
     @mcp.tool(
@@ -598,10 +609,12 @@ def build_server(config: ServerConfig) -> FastMCP:
                 kwargs["tier"] = _patch_tier_to_int(patch["tier"])
             except ValueError as exc:
                 return domain_error_result(VALIDATION_FAILED, str(exc), {"id": id})
-        # PRESERVE-AND-ROUND-TRIP: unmodeled foreign keys in the patch merge into the card's
-        # metadata map (RFC 7386 — a null value removes that key), never silently ignored.
-        # Governed/authority keys (tier/archived_at/deleted_at/created_by/column_id/order)
-        # are guarded or handled above and live in CARD_FIELD_KEYS, so they are excluded.
+        # PRESERVE-AND-ROUND-TRIP: preserved keys in the patch merge into the card's metadata
+        # map (RFC 7386 — a null value removes that key), never silently ignored. This includes
+        # the known-but-unmodeled trio (priority/checklist/attachments) — outside PROTECTED_CARD_KEYS
+        # so a patch value round-trips. Governed/authority keys (tier/archived_at/deleted_at/
+        # created_by/column_id/order) are guarded or handled above and live in PROTECTED_CARD_KEYS,
+        # so they are excluded.
         foreign = _foreign_metadata(patch)
         if foreign:
             kwargs["metadata"] = foreign
