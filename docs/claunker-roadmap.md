@@ -23,7 +23,7 @@
 
 **Classifier arming (`enforce: true`):** still observe-only, parallel + evidence-gated per the Phase 2 plan. Not a phase gate; arm when observation logs confirm tiers on real dispatches.
 
-**Post-Phase-3 board work also shipped (beyond the original roadmap's scope):** full mobile pass (Matrix compact map, Timeline frozen columns, long-press card move, tag filter collapse), sticky column headers, archival UI with purge guard + bulk sweep + Show Archive (4299489), Calendar Day view + Timeline Work Week (9535480), top-level view persistence (9cc427b), PolyForm Noncommercial 1.0.0 license (4b53d78).
+**Post-Phase-3 board work also shipped (beyond the original roadmap's scope):** full mobile pass (Matrix compact map, Timeline frozen columns, long-press card move, tag filter collapse), sticky column headers, archival UI with purge guard + bulk sweep + Show Archive (4299489), Calendar Day view + Timeline Work Week (9535480), top-level view persistence (9cc427b), PolyForm Noncommercial 1.0.0 license (4b53d78). **Human-intake write path (spec v0.6.0→v0.6.1, 2026-07-20):** `project_list` + project-targeted `card_create` with human-intake defaults (Kanbantt 0610163), uniform conflict snap-back on move/delete (e61d6ff, PR #1 3314e71), conflict-envelope key pinned to `meta.current` (spec v0.6.1, fa22cd1; spine copy synced at claunker-hermes 8a0e990). The MCP spec is at **v0.6.1**, byte-identical in the canonical (kanbantt-app) and spine (`docs/kanbantt-mcp-spec.md`) copies [verified 2026-07-23].
 
 ## 0.1 Punch list (carry-forward, before/alongside Phase 4)
 

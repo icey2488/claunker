@@ -1,4 +1,15 @@
-# Claunker — Standing Tool-Access Grant Inventory (FT-008) — v2.1
+# Claunker — Standing Tool-Access Grant Inventory (FT-008) — v2.2
+
+**Verification note (v2.2 addendum, 2026-07-23 — mid-move durability pass):** the
+re-inventory trigger fired hard during the durability build. New standing grants
+enumerated this revision: **#11** age→git offsite backup, **#12** restic→R2 offsite
+backup, **#13** Tailscale device auth, **#14** the new private GitHub repos, **#15**
+the (still-unrotated) Discord bot token. Existing grants re-checked against live
+state: **#2** durability gap is now **CLOSED** by #11/#12 (drills passed, same-machine
+only); **#10** Spine→Drive (SA) is **DEAD** (org policy blocked SA-key creation — never
+went ACTIVE, superseded by #11/#12). Machine-checkable claims below bear
+**[verified 2026-07-23]**. Repo canonicality (which clone the live spine runs from)
+is now tracked in `claunker-ops/docs/REPO-MAP.md`.
 
 **Status:** Second inventory, 2026-07-03. Supersedes the 2026-06-16 first inventory (Drive corpus, moves to Superseded). Trigger: the re-inventory rule fired several times over — the Cloudflare Tunnel (a public edge + new credential), the OAuth Drive-auth rewrite (a new secret + redirect grant), and two new dispatch lanes (claude-async, Desktop Claude Code). This discharges punch-list #2 and is a Phase 4 entry criterion. v2.1, 2026-07-07: touch-up — Grant #3 watch updated (Kanbantt remember-token opt-in shipped 2026-07-04, commit 6b7803b); Grant #9 added (ClaunkerElevatedRunner, standing elevation trampoline, verified 2026-07-06).
 
@@ -29,6 +40,8 @@ Unchanged from v1: Docker backend (`terminal.backend: docker` [verified 2026-07-
 **Verdict: INTENTIONAL per the amendment — but the durability property moved and is now a flagged gap.** §5.9's "spine state is Drive-durable" does not currently hold: the ledger's blast radius is one machine. The dump/merge/load sync seam is designed and unwired. Until wired, a disk loss is a total orchestration-ledger loss.
 
 **Action owed:** wire the Drive-durable sync (or an equivalent off-machine backup) before the spine is load-bearing for anything beyond reconstructable work.
+
+> **UPDATE 2026-07-23 — this gap is now CLOSED, by an equivalent off-machine backup (NOT Drive).** Three layers exist: local `ClaudeSnapshotBackup` (2×/day same-disk undo), age→git offsite (`ClaunkerOffsiteBackup`, Grant #11), and restic→R2 offsite (`ClaunkerResticOffsite`, Grant #12). Restore drills passed for both offsite layers — **same-machine only**; no cross-machine drill yet [verified 2026-07-23]. The Drive/SA route (Grant #10) that was originally owed here is DEAD; the durability property was delivered by a different medium.
 
 ### 3. Kanbantt — spine URL + Bearer token; now also the OAuth Drive grant
 
@@ -114,6 +127,107 @@ The action is **not a fixed operation**: it executes `logs\_elevated_runner.ps1`
 - Status 2026-07-10: key generation in progress. This grant is NOT live until the spine logs `drive_backup: ACTIVE` and a write-plus-restore smoke passes. Update this row with the activation date and verification receipt when confirmed.
 - Watch: the SA-created folder may live in the SA's own Drive space rather than the operator's My Drive (sharing-model note); duplicate blobs trigger the split-brain HALT (drive_backup.py guard); first live start on an empty local DB requires `--restore-from-drive`.
 
+> **STATUS 2026-07-23 — DEAD. Never activated.** SA-key creation was blocked by the
+> Google Workspace org policy; the grant never reached `drive_backup: ACTIVE`. The
+> durability need it was meant to serve is met instead by Grants #11 (age→git) and
+> #12 (restic→R2). No credential exists for this grant; nothing to revoke.
+> `drive_backup.py` remains in the tree, dormant. **No verdict — grant abandoned.**
+
+### 11. Offsite backup — age → git blob (`icey2488/claunker-spine-backup`) — NEW
+
+**Holds:** the `ClaunkerOffsiteBackup` task (daily 03:30) age-encrypts a consistent
+`spine.db` copy + all of `C:\Users\Raide\.claude\projects` and pushes the `.zip.age`
+blob to the private repo `icey2488/claunker-spine-backup` [verified 2026-07-23: task
+present + Ready; age key file present]. Credential: the age identity at
+`C:\Users\Raide\.config\claunker-backup.key`, `icacls`-locked, **backed up in
+Bitwarden**. The recipient is derived from the identity, so the one key both
+encrypts new blobs and decrypts all history.
+
+**Reach:** whoever holds the age key can decrypt **every historical spine snapshot
+AND every Claude transcript ever backed up** — and transcripts can contain secrets
+that passed through them. The GitHub repo is private and stores ciphertext only;
+the key is the whole gate.
+
+**Verdict: INTENTIONAL — the durability layer Grant #2 owed.** **Backed up: yes
+(Bitwarden).** **Watch:** the age key is now a crown-jewel — lose it and the
+backups are noise; leak it and full history (including any secrets-in-transcript)
+is readable. Same Bitwarden discipline as any root credential.
+
+### 12. Offsite backup — restic → Cloudflare R2 (`claunker-backup` bucket) — NEW
+
+**Holds:** the `ClaunkerResticOffsite` task (daily 04:15) writes a deduplicated,
+natively-encrypted restic snapshot of the same payload to the R2 bucket
+`claunker-backup` [verified 2026-07-23: task present + Ready; restic 0.19.1 exe +
+`claunker-r2.env` + `restic-offsite.log` present]. Credentials live in
+`C:\Users\Raide\.config\claunker-r2.env` (`icacls`-locked): the **restic repo
+password** (encrypts the repo) and a **bucket-scoped R2 API token** (Object Read &
+Write, scoped to `claunker-backup` ONLY — deliberately NOT account-wide). Both in
+Bitwarden.
+
+**Reach:** the R2 token's blast radius is **one bucket, by design** — a compromise
+of this box cannot touch other R2 buckets or the Cloudflare account. The restic
+password is a decryption crown-jewel of the same class as the age key.
+
+**Verdict: INTENTIONAL, scoped at creation** — the token was created bucket-scoped,
+not account-wide, exactly as an audited grant should be. **Backed up: yes
+(Bitwarden — both the password and the S3 token pair).** **Watch:** restic password
+is **unrecoverable**; there are now TWO independent decryption secrets (age +
+restic) — both must survive a move. Runs in parallel with #11 until a cross-machine
+R2 restore drill passes.
+
+### 13. Tailscale device auth — `raide-desktop` on the tailnet — NEW
+
+**Holds:** this machine is enrolled in the operator's Tailscale tailnet as
+`raide-desktop` (100.68.249.4); an iPhone (`iphone-14-pro`, 100.99.11.22) is also a
+member [verified 2026-07-23 from `tailscale status`]. Credential: the Tailscale
+account login (Bitwarden / identity-provider SSO).
+
+**SCOPE CHECK (the one that mattered):** `tailscale serve status` →
+**"No serve config"** [verified 2026-07-23]. **`tailscale serve` was NEVER run** —
+so agentglass (:6180, which embeds a terminal = code execution) is **NOT** exposed
+to the tailnet. The feared material grant (a tailnet-reachable shell) **did not
+happen**. Only device membership exists; no service is published.
+
+**Verdict: INTENTIONAL, narrow — device membership only, no published service.**
+**Backed up: n/a (re-enroll via login).** **Watch:** the instant `tailscale serve`
+is run to expose agentglass, this jumps to a HIGH grant — a tailnet-reachable
+embedded terminal. **Re-inventory the moment serve is configured**, and pair it
+with auth on agentglass's terminal surface before doing so.
+
+### 14. New private GitHub repos — NEW
+
+**Holds:** four private repos created during the mid-move pass [verified 2026-07-23
+via `gh repo list icey2488`]: `claunker-ops` (machine wiring + runbooks — **path +
+procedure only, NO secret values**, by standing rule), `claunker-spine-backup`
+(age-encrypted blobs only — see #11), `Vigil` (WoW addon source), `claude-discord-bot`
+(`main.py` **deliberately untracked** because it held a hardcoded token — see #15).
+Credential: `gh` auth as `icey2488`, **never stored** — pushed via the one-shot
+`gh auth git-credential` helper.
+
+**Reach:** repo read/write under the operator's GitHub account. The material risk
+is not the repos but the discipline: claunker-ops must never carry a secret value.
+
+**Verdict: INTENTIONAL.** **Backed up: n/a (GitHub is the store; gh auth
+re-derivable).** **Watch:** secret-scan every commit to claunker-ops (this pass
+did); keep `claude-discord-bot/main.py` out of history until its token is rotated
+and scrubbed (#15).
+
+### 15. Discord bot token (`claude-bot`) — NEW — UNROTATED LIABILITY
+
+**Holds:** a live Discord bot token, historically hardcoded in
+`claude-discord-bot/main.py` (that file is deliberately untracked). Flagged for
+rotation 2026-07-21; rotation runbook at `claunker-ops/docs/DISCORD-TOKEN-ROTATION.md`.
+**Status 2026-07-23: STILL UNROTATED** [asserted from record].
+
+**Reach:** whatever the bot's Discord application/guild permissions are — an
+externally-valid credential for a third-party service, sitting in a local file.
+
+**Verdict: OPEN LIABILITY — a credential that was hardcoded (and thus at elevated
+exposure risk) and has not been rotated since being flagged.** **Backed up:
+irrelevant — it should be replaced, not preserved.** **Action owed (carried, now
+overdue):** rotate per the runbook and scrub any git history that ever held it
+before the repo is cloned anywhere.
+
 ---
 
 ## Audit summary
@@ -121,7 +235,7 @@ The action is **not a fixed operation**: it executes `logs\_elevated_runner.ps1`
 | # | Grant | Reach | Verdict |
 |---|---|---|---|
 | 1 | Hermes executor | sandbox host dir + container | INTENTIONAL — narrowed |
-| 2 | Spine server | spine.db, one local file | INTENTIONAL — **Drive-durability gap flagged** |
+| 2 | Spine server | spine.db, one local file | INTENTIONAL — **durability gap now CLOSED by #11/#12 (2026-07-23, same-machine drills)** |
 | 3 | Kanbantt | spine surface R+W; Drive OAuth | INTENTIONAL — secret correctly server-side; **Bearer token opt-in persistent as of 2026-07-04 [CORRECTED; updated v2.1]**; CSP remains the wall |
 | 4 | Claude Code | Desktop-wide read | **OVER-BROAD** — narrowing still owed |
 | 5 | Judge/executor pins | model-family authorization | **FT-013 config condition closed; code/allowlist mismatch BLOCKS judge; code backstop audit still owed [CORRECTED]** |
@@ -129,13 +243,20 @@ The action is **not a fixed operation**: it executes `logs\_elevated_runner.ps1`
 | 7 | claude-async | operator user account, remote-triggerable | **OVER-BROAD BY NATURE** — accepted; ledger is the control |
 | 8 | Desktop Claude Code | operator user account, interactive | INTENTIONAL — correlated lane, on-ledger |
 | 9 | ClaunkerElevatedRunner | arbitrary PowerShell at HighestAvailable, user-session-triggerable | **STANDING ELEVATION TRAMPOLINE** — reachability accepted; claude-async lane transitively elevation-capable |
-| 10 | Spine → Drive (SA) | `drive.file` as SA identity; `claunker-spine-backups` folder | **PENDING** — dormant until SA key file exists; not live until `drive_backup: ACTIVE` + write-plus-restore smoke |
+| 10 | Spine → Drive (SA) | `drive.file` as SA identity; `claunker-spine-backups` folder | **DEAD (2026-07-23)** — org policy blocked SA key; never activated; superseded by #11/#12 |
+| 11 | Offsite backup age→git | decrypts all snapshots + transcripts (age key) | INTENTIONAL — durability layer; age key = crown-jewel, in Bitwarden |
+| 12 | Offsite backup restic→R2 | one bucket (token scoped); restic pw decrypts | INTENTIONAL — **token bucket-scoped at creation**; restic pw in Bitwarden, unrecoverable |
+| 13 | Tailscale device auth | tailnet membership only | INTENTIONAL — narrow; **`serve` NOT run, agentglass NOT exposed**; re-inventory if serve lands |
+| 14 | New private GitHub repos | repo R/W under gh auth | INTENTIONAL — claunker-ops must stay secret-free; scan every commit |
+| 15 | Discord bot token | third-party service, local file | **OPEN LIABILITY — unrotated since 2026-07-21 flag; rotate + scrub** |
 
 **Owed actions, consolidated (pre-Phase-4):**
 - #4 scope narrowing (carried from v1)
 - #5a align `JUDGE_MODEL` constant (`tools.py:25`) with live config allowlist, or vice versa — **judge is currently broken** (NEW, blocker)
 - #5b confirm/add hardcoded absent-allowlist backstop in Hermes plugin LLM trust gate (carried FT-013 code concern)
-- #2 Drive-durable spine sync (new)
+- ~~#2 Drive-durable spine sync~~ **CLOSED 2026-07-23** — delivered via #11/#12 offsite backups (not Drive); cross-machine restore drill still owed to prove it
+- #15 **rotate the Discord bot token** — overdue since 2026-07-21; runbook in claunker-ops (NEW, liability)
+- #13 before ever running `tailscale serve` to expose agentglass, put auth on its embedded terminal and re-inventory this grant (NEW, conditional)
 - #6 token rotation story (new)
 
 - #9 harden elevation trampoline: restrict `logs\elevated_command.ps1` to a location only an elevated actor can write, or enumerate/allowlist permitted operations — eliminates the arbitrary-command surface at HighestAvailable without removing the operational utility (deferred; accepted as-is until the claude-async lane's operator-only gate is no longer sufficient)
