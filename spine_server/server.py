@@ -50,6 +50,32 @@ from mcp.server.transport_security import TransportSecuritySettings
 from starlette.applications import Starlette
 
 from spine import ConflictError, Spine, Store, project
+from spine.projection import PROTECTED_CARD_KEYS
+
+# Input-only reserved keys a CardInput / patch may carry that are NOT projected Card
+# fields but must still NEVER be preserved as foreign metadata: ``tier`` (the native-int
+# tier carrier folded into the ``tier:N`` tag by ``_tier_from_card_input``) and
+# ``project_id`` (the top-level create-targeting sibling). Everything OUTSIDE
+# ``PROTECTED_CARD_KEYS ∪ _NON_METADATA_INPUT_KEYS`` is PRESERVED into ``Task.metadata``
+# (spec §Schema Versioning) rather than dropped — this now includes the known-but-unmodeled
+# Card trio (``priority``/``checklist``/``attachments``), which live OUTSIDE PROTECTED_CARD_KEYS
+# precisely so a client's value for them round-trips instead of being flattened to a default.
+_NON_METADATA_INPUT_KEYS = frozenset({"tier", "project_id"})
+
+
+def _foreign_metadata(card: Dict[str, Any]) -> Dict[str, Any]:
+    """The PRESERVED keys of a CardInput / patch — everything the spine does not model as a
+    first-class (PROTECTED) Card field or consume as an input-only carrier. Two classes ride
+    here: genuinely-foreign keys (forward-compat) AND the spec-defined-but-unmodeled trio
+    ``priority``/``checklist``/``attachments`` (v0.8.0 — subtracted from PROTECTED_CARD_KEYS so
+    a client value survives rather than being dropped for a documented default). All are
+    PRESERVED (stored in ``Task.metadata``, echoed on projection) honouring the spec's
+    preserve-and-round-trip rule. The size/depth of the result is bounded downstream by
+    ``check_metadata_limits`` at the create/update boundary."""
+    return {
+        k: v for k, v in card.items()
+        if k not in PROTECTED_CARD_KEYS and k not in _NON_METADATA_INPUT_KEYS
+    }
 
 # Drive backup singleton — DORMANT until SA key is present (set by main()).
 _backup: Optional[Any] = None
@@ -80,11 +106,13 @@ from .result import (
 
 # serverInfo (arrives in the ``initialize`` handshake; Kanbantt shows it as
 # "MCP: Claunker"). The version is this server's own version, aligned to the Kanbantt
-# MCP spec version it implements (0.7.0 — dispatch provenance inside created_by, on top
-# of v0.6.x project_list + CardInput-shaped card_create) and still distinct from the
-# data schema version (1: provenance is additive-optional, no blob shape change).
+# MCP spec version it implements (0.8.0 — the narrative `description` body is now modeled
+# and projected (no longer a constant ""), and unmodeled foreign keys are PRESERVED and
+# round-tripped rather than flattened; on top of v0.7.0 dispatch provenance) and still
+# distinct from the data schema version (1: `description` is additive-nullable and the
+# preserved-metadata map rides in the existing blob, so old rows load untouched).
 SERVER_NAME = "Claunker"
-SERVER_VERSION = "0.7.0"
+SERVER_VERSION = "0.8.0"
 
 # Actor stamped as ``created_by`` on every card_create write. Derived from the
 # AUTHENTICATED CREDENTIAL, never the payload (the escalation_resolve actor stance
@@ -346,9 +374,26 @@ def build_server(config: ServerConfig) -> FastMCP:
         structured_output=False,
     )
     def project_list() -> types.CallToolResult:
-        # Live projects only (a soft-deleted project is not a create target — the
-        # same liveness rule jobcard's resolver applies). Sorted (created_at, id):
-        # deterministic, oldest-first, with the opaque id as the stable tiebreak.
+        # Live projects only (a soft-deleted project is not a create target — the same
+        # liveness rule jobcard's resolver applies). Ordered by a DATA-BOUND TOTAL ORDER:
+        # sort key ``(created_at, id)``, oldest-first.
+        #
+        # This depends ONLY on row CONTENTS, so it is deterministic for identical data and
+        # stable across process restart, dump/reload, restore, and the replica-merge story —
+        # anything a consumer can recompute from the rows themselves. That is the property the
+        # PRIOR fix only DISGUISED: it stable-sorted by ``created_at`` ALONE over an
+        # ``ORDER BY rowid`` scan and relied on that scan to break same-tick ties in creation
+        # order. But ``rowid`` is a physical storage artifact — it does NOT survive dump/reload,
+        # restore, or a merge — so that "determinism" evaporated the moment the store was
+        # reloaded. Adding ``id`` as the tiebreak makes the order intrinsic to the data.
+        #
+        # HONEST NOTE on the within-tick order: because ``id`` is a random UUIDv4, two projects
+        # minted in the SAME clock tick sort by that id, which is NOT their creation order. That
+        # is deliberate and correct: ``created_at`` is documented as display-only and NEVER an
+        # ordering primitive, so the API does not — and must not — promise creation order within
+        # a tick. It promises a TOTAL, REPRODUCIBLE order. A consumer that truly needs within-tick
+        # creation order needs a monotonic key (a LexoRank-style ``order``, as cards already have);
+        # that is a future card, not this read.
         with Store(config.db_path) as store:
             projects = [
                 {"id": p.id, "name": p.name, "created_at": p.created_at}
@@ -378,11 +423,16 @@ def build_server(config: ServerConfig) -> FastMCP:
         # authority-owned fields — version / created_at / updated_at / created_by /
         # updated_by / deleted_at supplied by a client are IGNORED, not errored (this
         # handler simply never reads them; created_by is stamped from the credential,
-        # see CARD_CREATE_ACTOR). Fields the spine does not model (description,
-        # priority, checklist, attachments) flatten away at this boundary — the
-        # projection re-emits their Card defaults. project_id is the ONE extension
-        # over the spec input (this server's Tasks live in Projects); it rides at the
-        # top level NEXT TO the card so CardInput itself stays a pure Card subset.
+        # see CARD_CREATE_ACTOR). ``description`` IS now modeled (the narrative body) and
+        # is read straight from the input — absent means null, NOT "" (no coercion, so the
+        # absent/present distinction survives). UNMODELED foreign keys are PRESERVED into
+        # Task.metadata (``_foreign_metadata``) and echoed on projection — no longer
+        # flattened away (the silent-drop this contract ends). The still-unmodeled KNOWN
+        # Card fields ``priority``/``checklist``/``attachments`` keep their projected
+        # documented defaults (a recorded divergence — see SPEC-DIVERGENCES.md). project_id
+        # is the ONE extension over the spec input (this server's Tasks live in Projects);
+        # it rides at the top level NEXT TO the card so CardInput itself stays a pure Card
+        # subset (and is excluded from foreign metadata by ``_NON_METADATA_INPUT_KEYS``).
         #
         # HUMAN-INTAKE SEMANTICS (the governance stance): a board-created card is
         # intent capture ONLY. It defaults into 'created', UNTIERED — never
@@ -454,11 +504,13 @@ def build_server(config: ServerConfig) -> FastMCP:
                     state=card.get("column_id") or "created",  # column IS the state
                     tier=tier,
                     acceptance_criteria=card.get("acceptance_criteria") or "",
+                    description=card.get("description"),  # absent → null (no "" coercion)
                     due=card.get("due"),
                     depends_on=card.get("depends_on"),
                     task_id=task_id,
                     order=order,
                     created_by=_created_by_with_provenance(card.get("created_by")),
+                    metadata=_foreign_metadata(card),  # preserve unmodeled foreign keys
                 )
                 card_out = project([task], store.escalations.list_all())[0]
         except ValueError as exc:
@@ -472,13 +524,14 @@ def build_server(config: ServerConfig) -> FastMCP:
         name="card_update",
         description=(
             "Edit an operator card's mutable fields via a Card patch (title / "
-            "acceptance_criteria / effort / impact / due / depends_on / tier). "
-            "RFC 7386 key-presence semantics: absent key = unchanged; present null = "
-            "clear for {due, effort, impact}; depends_on uses [] to clear (null → "
-            "validation_failed). Guarded: {tier, archived_at, deleted_at} present-null "
-            "→ validation_failed; created_by present (any value) → validation_failed "
-            "(write-once mint provenance). NOT state or order (use card_move). "
-            "expected_version required (optimistic concurrency); force skips the check."
+            "description / acceptance_criteria / effort / impact / due / depends_on / "
+            "tier). RFC 7386 key-presence semantics: absent key = unchanged; present null "
+            "= clear for {description, due, effort, impact}; depends_on uses [] to clear "
+            "(null → validation_failed). Unmodeled foreign keys merge into the card's "
+            "preserved metadata (null removes a key). Guarded: {tier, archived_at, "
+            "deleted_at} present-null → validation_failed; created_by present (any value) "
+            "→ validation_failed (write-once mint provenance). NOT state or order (use "
+            "card_move). expected_version required (optimistic concurrency); force skips it."
         ),
         structured_output=False,
     )
@@ -531,6 +584,8 @@ def build_server(config: ServerConfig) -> FastMCP:
             kwargs["title"] = patch["title"]
         if "acceptance_criteria" in patch:
             kwargs["acceptance_criteria"] = patch["acceptance_criteria"]
+        if "description" in patch:
+            kwargs["description"] = patch["description"]  # None clears (key-presence); mutable body
         if "effort" in patch:
             kwargs["effort"] = patch["effort"]   # None clears (key-presence)
         if "impact" in patch:
@@ -564,6 +619,15 @@ def build_server(config: ServerConfig) -> FastMCP:
                 kwargs["tier"] = _patch_tier_to_int(patch["tier"])
             except ValueError as exc:
                 return domain_error_result(VALIDATION_FAILED, str(exc), {"id": id})
+        # PRESERVE-AND-ROUND-TRIP: preserved keys in the patch merge into the card's metadata
+        # map (RFC 7386 — a null value removes that key), never silently ignored. This includes
+        # the known-but-unmodeled trio (priority/checklist/attachments) — outside PROTECTED_CARD_KEYS
+        # so a patch value round-trips. Governed/authority keys (tier/archived_at/deleted_at/
+        # created_by/column_id/order) are guarded or handled above and live in PROTECTED_CARD_KEYS,
+        # so they are excluded.
+        foreign = _foreign_metadata(patch)
+        if foreign:
+            kwargs["metadata"] = foreign
 
         with Store(config.db_path) as store:
             spine = Spine(store)

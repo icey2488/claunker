@@ -165,6 +165,24 @@ def test_provenance_flags_ignored_without_actor(tmp_db, capsys):
     assert task.created_by is None
 
 
+# ── create --description (narrative body, spec v0.8.0) ─────────────────────────
+
+def test_description_flag_round_trips(tmp_db, capsys):
+    main(["create", "--description", "Fix the widget latency regression.", "my task"])
+    task_id = capsys.readouterr().out.strip()
+    with Store(tmp_db) as store:
+        task = store.tasks.get(task_id)
+    assert task.description == "Fix the widget latency regression."
+
+
+def test_description_omitted_is_null_not_empty(tmp_db, capsys):
+    main(["create", "my task"])
+    task_id = capsys.readouterr().out.strip()
+    with Store(tmp_db) as store:
+        task = store.tasks.get(task_id)
+    assert task.description is None
+
+
 # ── artifact subcommand ────────────────────────────────────────────────────────
 
 def test_artifact_git_hash_ref_accepted(tmp_db, capsys):

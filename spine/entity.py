@@ -184,6 +184,175 @@ def check_created_by_limits(v: Any) -> None:
         )
 
 
+# ── description ADMISSION CAP (write-boundary policy; see ``check_description_limits``) ──
+# ``description`` is the spec-conformant, agent-agnostic narrative Card BODY (Markdown).
+# Unlike a provenance VALUE (a model id / effort word / uuid, capped at 512 chars), it is
+# free-form prose and needs a far larger ceiling — but it is still bounded at the CREATE/
+# UPDATE boundary, the same prevention-at-admission discipline the ``created_by`` caps
+# apply: an unbounded body is a storage-abuse vector. 16 KiB (16384 chars) admits a rich
+# multi-paragraph Markdown body — headings, a list, a fenced code block, ~8 pages of prose
+# — while rejecting a megabyte paste. It is ~32× the per-provenance-value cap and is
+# counted in CHARACTERS, matching ``MAX_PROVENANCE_VALUE_LEN``'s unit (a body is a single
+# string, so a char cap is the natural measure; a byte cap would penalise non-ASCII prose).
+MAX_DESCRIPTION_LEN = 16384
+
+
+def check_description_limits(v: Any) -> None:
+    """Enforce the ``description`` length cap at the write boundary (→ SpineError, which
+    the server maps to ``validation_failed``). ``None`` is a no-op (absent body — the
+    write-once-vs-mutable distinction is the caller's, not this cap's). A NON-string is a
+    SHAPE error owned by the Task constructor (``_validate_description``); this size layer
+    measures strings only. Fails CLOSED and NAMES the limit — never truncates: silent
+    truncation of the body is exactly the failure mode this whole contract exists to end."""
+    if v is None:
+        return
+    if isinstance(v, str) and len(v) > MAX_DESCRIPTION_LEN:
+        raise SpineError(
+            f"description exceeds the {MAX_DESCRIPTION_LEN}-character limit "
+            f"({len(v)} chars); trim the body or link out to external storage"
+        )
+
+
+def _validate_description(v: Any) -> None:
+    """Raise SpineError unless ``v`` is a string or ``None``. SHAPE only — runs on
+    construct AND load (``__post_init__``); the SIZE cap is admission policy
+    (``check_description_limits``), so restore/load never re-polices an admitted body."""
+    if v is not None and not isinstance(v, str):
+        raise SpineError(f"description must be a string or null, got {v!r}")
+
+
+# ── metadata (PRESERVED CARD KEYS) ADMISSION CAPS ────────────────────────────────────
+# The spec's unknown-field rule (§Schema Versioning & Forward Compatibility: "unknown
+# fields are preserved and round-tripped, never stripped, never an error") applies to the
+# whole Card body, not just to ``created_by``. Two classes of key route through this typed
+# map — stored intact, echoed on projection — instead of being silently flattened away at
+# the write boundary (the old ``description``-drop failure mode, generalized):
+#   1. genuinely-FOREIGN keys — a newer client's field or a foreign server's extension
+#      (the forward-compat case: a v0.9 field survives a round trip through a v0.8 server);
+#   2. spec-DEFINED-but-unmodeled Card fields — ``priority`` / ``checklist`` / ``attachments``
+#      (v0.8.0): the spine has no first-class column for them, but the spec DEFINES them, so
+#      dropping the client's value while preserving a random foreign key would punish spec
+#      compliance and reward deviation. They route through the SAME preservation path.
+#
+# UNCOUPLED FROM THE PROVENANCE BUDGET (v0.8.0). Metadata FORMERLY aliased the ``created_by``
+# interop budget (12 keys / 512 chars / depth 3 / 4096 bytes). That was defensible when
+# metadata held only stray scalar foreign keys — the same shape class as a ``created_by``
+# provenance dialect. It is NOT defensible now that ``checklist`` and ``attachments`` —
+# legitimately larger COLLECTIONS — route through it: a realistic checklist alone blows a
+# 4096-byte ceiling. So these caps are now DEFINED INDEPENDENTLY (never aliased) and RAISED
+# to fit real Card payloads. The provenance caps above are UNCHANGED — the two budgets no
+# longer move together. Same admission discipline: bounded at create/update, fail-closed,
+# name the specific limit exceeded, never truncate.
+#
+# SIZED AGAINST a realistic worst-case Card body: a ~40-item checklist
+# (``[{"text": <~120 chars>, "done": bool}]`` ≈ 40×145 ≈ 5.8 KB) + a ~15-item attachments
+# list (``[{"id": <uuid>, "ref": <~200-char url>}]`` ≈ 15×265 ≈ 4.0 KB) + ``priority`` + a
+# handful of genuinely-foreign keys ⇒ ~10-12 KB realistic. Each cap justified inline:
+#
+#   MAX_METADATA_KEYS = 24 — PER-OBJECT key fan-out, enforced on EVERY object at EVERY depth
+#       (NOT top-level-only). A collection is ONE key holding many items, so item COUNT does not
+#       spend this. Room for the 3 known-unmodeled Card fields + ~21 foreign-dialect keys while
+#       still bounding fan-out. RECURSIVE because the top-level-only check left a hole: a nested
+#       object stuffed with 500 keys sailed past the granular cap and hit only the byte backstop
+#       — a vague "too big" error for a specific "too wide" abuse. (Provenance stays at 12 and
+#       top-level-only — its 4 KiB byte cap makes the same nested-fan-out hole immaterial there.)
+#   MAX_METADATA_VALUE_LEN = 2048 — chars per STRING value at ANY depth (a foreign note/URL,
+#       ``priority``, or a checklist item's ``text``). Enforced RECURSIVELY: the long strings that
+#       matter live INSIDE ``checklist``/``attachments`` arrays, not as top-level string values, so
+#       a top-level-only check was near-useless (only the byte TOTAL bounded them, with a vague
+#       error). Now every string the walk reaches is length-checked and NAMES its locus; the byte
+#       total remains the backstop. Raised 512→2048 for a longer foreign string/URL. (Provenance
+#       stays at 512 and top-level-only.)
+#   MAX_METADATA_DEPTH = 4 — metadata dict (level 1) → ``checklist``/``attachments`` array
+#       (2) → item object (3) → one container of HEADROOM (4) for a nested foreign value or a
+#       slightly richer item. A ``[{text,done}]`` checklist reaches depth 3. (Provenance
+#       stays at 3.) Enforced by the same iterative ``_exceeds_depth`` walk (no parser bomb).
+#   MAX_METADATA_BYTES = 32768 — serialized-byte ceiling, the PRIMARY guard (it bounds the
+#       collections the per-value cap cannot see). 32 KiB is ~2.5-3× the ~10-12 KB realistic
+#       worst case above — comfortable headroom for a rich checklist + attachments + foreign
+#       keys — while still rejecting a multi-megabyte paste outright. The TOTAL rises (not just
+#       the per-value cap), which is the point: no single value could exceed the total anyway.
+#       (Provenance stays at 4096.)
+MAX_METADATA_KEYS = 24
+MAX_METADATA_VALUE_LEN = 2048
+MAX_METADATA_DEPTH = 4
+MAX_METADATA_BYTES = 32768
+
+
+def _walk_metadata_granular_caps(v: Any) -> None:
+    """Enforce the GRANULAR metadata caps RECURSIVELY, at EVERY depth, in one iterative walk:
+      * per-object key-count (``MAX_METADATA_KEYS``) on EVERY dict — not just the top one;
+      * per-string-value length (``MAX_METADATA_VALUE_LEN``) on EVERY string the walk reaches;
+      * nesting depth (``MAX_METADATA_DEPTH``) — only CONTAINERS occupy a level, a scalar leaf
+        sits at its parent's depth (matching ``_exceeds_depth``).
+
+    Why recursive: the OLD top-level-only checks left two holes now that ``checklist``/
+    ``attachments`` route through metadata — nested strings are the NORMAL case, not the
+    exception. A 30 KB string inside an array, or a 500-key object nested one level down, both
+    slipped past the granular caps and hit only the 32 KiB byte backstop: a vague "too big"
+    error instead of the specific limit that was actually blown. This walk closes both.
+
+    ITERATIVE with an explicit stack (never recurses through the payload), so a maliciously
+    deep/wide value can't drive the CHECK into a RecursionError — it is rejected in O(nodes)
+    before the recursive ``json.dumps`` byte-count ever sees it. Each SpineError names the
+    specific limit AND the locus (a JSONPath-ish ``metadata.checklist[3].text``) so a client
+    can act. Fails CLOSED; never truncates."""
+    stack = [(v, 1, "metadata")]
+    while stack:
+        node, depth, path = stack.pop()
+        if isinstance(node, dict):
+            if depth > MAX_METADATA_DEPTH:
+                raise SpineError(
+                    f"metadata nests deeper than the allowed limit at {path} "
+                    f"(max nesting depth {MAX_METADATA_DEPTH})"
+                )
+            if len(node) > MAX_METADATA_KEYS:
+                raise SpineError(
+                    f"metadata carries too many keys at {path} "
+                    f"({len(node)} > {MAX_METADATA_KEYS} max)"
+                )
+            for key, child in node.items():
+                stack.append((child, depth + 1, f"{path}.{key}"))
+        elif isinstance(node, list):
+            if depth > MAX_METADATA_DEPTH:
+                raise SpineError(
+                    f"metadata nests deeper than the allowed limit at {path} "
+                    f"(max nesting depth {MAX_METADATA_DEPTH})"
+                )
+            for i, child in enumerate(node):
+                stack.append((child, depth + 1, f"{path}[{i}]"))
+        elif isinstance(node, str):
+            if len(node) > MAX_METADATA_VALUE_LEN:
+                raise SpineError(
+                    f"metadata string value too long at {path} "
+                    f"({len(node)} > {MAX_METADATA_VALUE_LEN} char max)"
+                )
+
+
+def check_metadata_limits(v: Any) -> None:
+    """Enforce the metadata ADMISSION CAPS at the write boundary (→ SpineError →
+    ``validation_failed``). Unlike ``check_created_by_limits`` (whose 4 KiB byte cap makes a
+    nested-fan-out hole immaterial, so it checks the top level only), metadata legitimately
+    carries larger nested COLLECTIONS (``checklist``/``attachments``), so its granular caps —
+    per-object key-count AND per-string length — are enforced RECURSIVELY at every depth by
+    ``_walk_metadata_granular_caps`` (which also does the depth check, before serialization,
+    so a parser-bomb payload never reaches the recursive ``json.dumps`` below). The serialized-
+    byte ceiling remains the backstop for total size and long key names. Fails CLOSED, naming
+    the specific limit AND its locus; the whole write is rejected, never truncated. Non-dict
+    ``v`` is a no-op (shape is owned by the Task constructor)."""
+    if not isinstance(v, dict):
+        return
+    # Granular caps + depth, recursively — the iterative walk rejects a deeply-nested or
+    # widely-fanned payload BEFORE the recursive json.dumps byte-count is ever handed it.
+    _walk_metadata_granular_caps(v)
+    serialized_bytes = len(json.dumps(v, default=str, sort_keys=True).encode("utf-8"))
+    if serialized_bytes > MAX_METADATA_BYTES:
+        raise SpineError(
+            f"metadata serialized size exceeds cap "
+            f"({serialized_bytes} > {MAX_METADATA_BYTES} byte max)"
+        )
+
+
 # ── state / kind vocabularies ────────────────────────────────────────────────
 class State:
     """The Task lifecycle. Pipeline: created → tiered → dispatched → judged →
@@ -285,6 +454,13 @@ class Task(_Entity):
     state: str = State.CREATED
     tier: Optional[int] = None
     acceptance_criteria: Optional[Any] = None
+    # The spec-conformant, agent-agnostic narrative BODY (Markdown), or ``None`` when
+    # the card has no body. Additive nullable field (the ``archived_at`` precedent: no
+    # blob-shape break, old rows load with ``description=None`` via ``from_dict``).
+    # MUTABLE — unlike write-once ``created_by``, a body is edited over a card's life.
+    # Shape validated on construct/load (``_validate_description``); SIZE bounded at the
+    # write boundary (``check_description_limits``).
+    description: Optional[str] = None
     effort: Optional[str] = None
     impact: Optional[str] = None
     due: Optional[str] = None
@@ -300,12 +476,21 @@ class Task(_Entity):
     # ``_validate_created_by``. WRITE-ONCE: set at create, never mutated (no
     # ``update_task`` path touches it — the audit value is "what actually ran").
     created_by: Optional[Dict[str, Any]] = None
+    # UNMODELED FOREIGN Card keys the spine has no first-class field for, PRESERVED here
+    # rather than flattened away (spec §Schema Versioning: unknown fields round-trip).
+    # The server fills this at the write boundary (keys outside the known Card schema) and
+    # the projection echoes it back. MUTABLE via ``card_update`` (RFC 7386 merge-patch).
+    # Bounded at admission (``check_metadata_limits``) so preservation is not unbounded.
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.created_by is not None:
             _validate_created_by(self.created_by)
+        _validate_description(self.description)
         if self.depends_on is None:
             self.depends_on = []
+        if self.metadata is None:
+            self.metadata = {}
 
 
 @dataclass

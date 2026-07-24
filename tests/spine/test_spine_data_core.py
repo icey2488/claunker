@@ -270,6 +270,75 @@ def test_acceptance_criteria_echoes_into_the_card_lens():
     assert _card_for(spine, withac.id)["acceptance_criteria"] == criteria
 
 
+# ── description (the narrative body) + preserved foreign metadata ──────────────
+def test_description_round_trips_and_defaults_null_in_the_lens():
+    spine = Spine()
+    p = spine.create_project("p")
+    # Unset → the lens carries the key and projects null (NOT a constant "").
+    bare = spine.create_task(p.id, "bare", created_at=T[0])
+    assert _card_for(spine, bare.id)["description"] is None
+    # A set body round-trips through the projection unchanged.
+    body = "# Title\n\nbody **text**"
+    withd = spine.create_task(p.id, "withd", description=body, created_at=T[1])
+    assert _card_for(spine, withd.id)["description"] == body
+
+
+def test_description_is_mutable_via_update_task():
+    spine = Spine()
+    p = spine.create_project("p")
+    t = spine.create_task(p.id, "t", description="first", created_at=T[0])
+    spine.update_task(t.id, description="second")
+    assert spine.get_task(t.id).description == "second"
+    spine.update_task(t.id, description=None)  # present-null clears
+    assert spine.get_task(t.id).description is None
+
+
+def test_over_limit_description_rejected_at_create_and_update():
+    from spine.entity import MAX_DESCRIPTION_LEN
+    spine = Spine()
+    p = spine.create_project("p")
+    _assert_raises(lambda: spine.create_task(p.id, "t", description="x" * (MAX_DESCRIPTION_LEN + 1)), SpineError)
+    t = spine.create_task(p.id, "ok", description="fine", created_at=T[0])
+    _assert_raises(lambda: spine.update_task(t.id, description="y" * (MAX_DESCRIPTION_LEN + 1)), Exception)
+    assert spine.get_task(t.id).description == "fine"  # rejected update changed nothing
+
+
+def test_legacy_task_blob_without_description_or_metadata_loads():
+    """The archived_at precedent: a Task blob written before ``description``/``metadata``
+    existed carries neither key. ``from_dict`` defaults them (None → {} for metadata via
+    __post_init__), so the row loads untouched — additive, no migration, no schema bump."""
+    store = Store()
+    legacy = {  # pre-description/metadata blob shape
+        "id": "t1", "project_id": "p", "title": "legacy", "state": "created",
+        "tier": None, "acceptance_criteria": None, "order": "i",
+        "created_at": T[0], "version": "1:deadbeef",
+    }
+    assert "description" not in legacy and "metadata" not in legacy
+    store.load({"tasks": [legacy]})
+    loaded = store.tasks.get("t1")
+    assert loaded.description is None
+    assert loaded.metadata == {}
+    card = project(store.tasks.list_all(), [])[0]
+    assert card["description"] is None
+
+
+def test_metadata_foreign_keys_preserved_and_overlaid_in_lens():
+    spine = Spine()
+    p = spine.create_project("p")
+    t = spine.create_task(p.id, "t", metadata={"x_future": {"k": 1}}, created_at=T[0])
+    assert _card_for(spine, t.id)["x_future"] == {"k": 1}
+
+
+def test_metadata_overlay_never_clobbers_a_modeled_card_field():
+    """Defense in depth: even a hand-tampered row whose metadata holds a Card key cannot
+    override the projected modeled/extension value — the overlay skips CARD_FIELD_KEYS."""
+    t = Task(id="t1", project_id="p", title="real title", created_at=T[0],
+             metadata={"title": "SPOOFED", "gate_status": "HACKED"})
+    card = to_card(t)
+    assert card["title"] == "real title"
+    assert card["gate_status"] == GATE_STATUS_COMMITTED
+
+
 # ── escalation → badge (orthogonal to the state column) ────────────────────────
 def test_unresolved_escalation_badges_card_and_keeps_it_in_state_column():
     spine = Spine()

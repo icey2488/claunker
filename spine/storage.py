@@ -100,8 +100,19 @@ class EntityStore:
         return self._from_dict(json.loads(row[0])) if row else None
 
     def list_all(self) -> List[_Entity]:
-        """Every row, tombstones included."""
-        rows = self._conn.execute(f"SELECT data FROM {self._table}").fetchall()
+        """Every row, tombstones included, in a DEFINED scan order — ``ORDER BY rowid``.
+        SQLite leaves scan order UNDEFINED without an ORDER BY, so relying on the implicit
+        rowid scan was undefined behaviour; pinning ``rowid`` is defined-beats-undefined
+        hygiene — a stable, repeatable scan within a single database file.
+
+        NON-LOAD-BEARING for cross-store ordering. ``rowid`` is a physical storage artifact:
+        it is reassigned on ``INSERT OR REPLACE`` and does NOT survive ``dump``/``load``,
+        restore, or a replica merge, so it CANNOT be trusted as a durable ordering primitive
+        across those seams. Callers that need a deterministic order MUST sort on row CONTENTS
+        (e.g. ``project_list`` sorts on ``(created_at, id)``, intrinsic to the data). An earlier
+        comment here claimed this scan supplied ``project_list``'s same-tick tiebreak — that was
+        a lie waiting to mislead: the tiebreak now lives in the data-bound sort key, not here."""
+        rows = self._conn.execute(f"SELECT data FROM {self._table} ORDER BY rowid").fetchall()
         return [self._from_dict(json.loads(r[0])) for r in rows]
 
     def list_live(self) -> List[_Entity]:
