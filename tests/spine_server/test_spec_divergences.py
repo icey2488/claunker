@@ -208,6 +208,21 @@ def test_divergence_9_projected_card_has_no_project_id():
         cleanup(directory)
 
 
+def test_divergence_9_listed_cards_have_no_project_id():
+    """Register #9 (list-endpoint mirror). ``project_id`` must not leak onto any card projected
+    by ``card_list`` either — not just the create-time echo. Goes RED if ``project_id`` is ever
+    projected onto a listed card."""
+    directory, path = make_temp_db()
+    try:
+        seed(path, [{"title": "a"}, {"title": "b"}])
+        listed = list_cards(path, max_bytes=BIG)
+        assert len(listed["cards"]) == 2
+        for card in listed["cards"]:
+            assert "project_id" not in card
+    finally:
+        cleanup(directory)
+
+
 # ── #10 · card_create stores acceptance_criteria "" when absent (KNOWN GAP, minor) ───────
 def test_divergence_10_absent_acceptance_criteria_coerces_to_empty_string():
     """Register #10. A wire ``card_create`` with no ``acceptance_criteria`` coerces it to ``""``
