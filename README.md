@@ -12,6 +12,10 @@ The wire contract is the Kanbantt MCP spec (`docs/kanbantt-mcp-spec.md`, v0.5.0)
 Kanbantt gates its features on the tool names this server advertises, so the surface
 below is also the capability declaration.
 
+Kanbantt's mock spine test harness is contracted to parity with the board's own
+`LocalProvider`, not to mirroring this server — see `docs/PROVIDER-PARITY-CONTRACT.md`
+(propagated copy; authoring repo is `kanbantt-app`).
+
 ## Quickstart
 
 Install and run with uv:
