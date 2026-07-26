@@ -3,9 +3,9 @@
 > copy and the source disagree, the source wins.
 >
 > - Source repo: `kanbantt-app`
-> - Source path: `docs/PROVIDER-PARITY-CONTRACT.md`
-> - Source commit SHA: `22ff8b0ccfc2843d193b14ccfbd51035318f3a8a`
-> - Sync date: 2026-07-24
+> - Source path: `docs/HARNESS-FIDELITY-CONTRACT.md`
+> - Source commit SHA: `b4e1c9148d79281c439c564dfeae4b76b710de9b`
+> - Sync date: 2026-07-25
 >
 > **Read this if you work on the spine:** this document states plainly that
 > Kanbantt's mock harness is contracted to parity with the board's own
@@ -14,9 +14,14 @@
 
 ---
 
-# Provider-Parity Contract — the mock spine harness's actual contract
+# Harness-Fidelity Contract — the mock spine harness's fidelity to card-store
 
-**Status:** ratified 2026-07-24. Authoring repo: `kanbantt-app` (Rule 1 of
+**Status:** ratified 2026-07-24; renamed from `PROVIDER-PARITY-CONTRACT.md`
+2026-07-25 (amendment record
+`claunker-hermes/docs/claunker-amendment-2026-07-25-harness-fidelity-rename.md`
+— the old title collided with the spec's normative "Provider Parity Contract"
+section and mislabeled the harness, a server, as a provider).
+Authoring repo: `kanbantt-app` (Rule 1 of
 `DOC-PROPAGATION-POLICY.md` — a doc governing the mock harness or board
 authors here). Propagated, with provenance headers, to `claunker-hermes` and
 `claunker-ops` under their own `docs/`.
@@ -46,6 +51,19 @@ projection, not one server pretending to be the other's twin.
 is not *per se* a defect. A divergence between the harness and the
 `LocalProvider` **is** — that pairing has no adaptation boundary between
 them; they are contracted to be identical.
+
+### 1.1 Subordination — this is not the spec's Provider Parity Contract
+
+This document does not supersede, restate, or amend the "Provider Parity
+Contract" section of `docs/kanbantt-mcp-spec.md`. That section is a
+normative requirement on the **LocalProvider**: it must match a conforming
+server's observable semantics. THIS document governs a different relation —
+the in-process test harness's fidelity to `card-store`, the store the
+LocalProvider itself uses. Different subjects, different obligations. The
+one point where they interact: because the harness mirrors `card-store`, a
+spec-conformance defect in the LocalProvider's semantics would be faithfully
+reproduced by the harness rather than caught by it (see the untested axis in
+§4).
 
 ---
 
@@ -122,6 +140,7 @@ intentional non-goal; this contract exists specifically to close that door.
 | Harness vs Claunker spine (boundary adaptation, scope-limited by §2's register) | The parity probe: `npm run probe` (`src/lib/parity-receipt-write.mjs`), plus `src/lib/parity-coverage.test.js`, `parity-manifest.test.js`, `parity-probe.test.js`. |
 | Claunker spine vs its own spec | `claunker-hermes/tests/spine_server/test_spec_divergences.py` — **not** this document, **not** the probe. |
 | The board's handling of spine REJECTIONS (`validation_failed`, `not_found`, `payload_too_large`, `conflict`) | The board pushback suite, merged `3d03227`. Finding: the board's error path (`MCPProviderError` → `failureTruth`/`snapBackCards` → `writeError`/`mutationNotice`) handles every spec'd rejection class correctly — the prior gap was in *assertions*, not implementation. |
+| `LocalProvider` vs the spec's own Provider Parity Contract (`docs/kanbantt-mcp-spec.md`) | **NOTHING — UNTESTED.** Every axis above compares against an implementation; no suite compares the LocalProvider against the spec's parity clause itself. Concrete smell: the spec states the LocalProvider stamps actor `{"type":"human","id":"local"}`, while the harness defaults to an `agent:spine` actor (probe finding F5 — previously classified a boundary difference by comparing against `card-store`, never against the spec). Finding card `83fc4f1d-1982-4ac7-baad-d3e418cdb011`. Resolving F5 and building this coverage is its own work order, not this document's. |
 
 ---
 

@@ -13,7 +13,7 @@ Kanbantt gates its features on the tool names this server advertises, so the sur
 below is also the capability declaration.
 
 Kanbantt's mock spine test harness is contracted to parity with the board's own
-`LocalProvider`, not to mirroring this server — see `docs/PROVIDER-PARITY-CONTRACT.md`
+`LocalProvider`, not to mirroring this server — see `docs/HARNESS-FIDELITY-CONTRACT.md`
 (propagated copy; authoring repo is `kanbantt-app`).
 
 ## Quickstart
