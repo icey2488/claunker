@@ -18,7 +18,7 @@ Usage::
     python jobcard.py fail      <task_id>   # set state to FAILED
     python jobcard.py set-state <task_id> <state>  # move to any ratified state
     python jobcard.py delete    <task_id>   # hard-remove the row entirely
-    python jobcard.py show      <task_id>   # print id/title/state/version
+    python jobcard.py show      <task_id>   # print id/title/state/version (full id or unambiguous prefix)
     python jobcard.py update    <task_id> --title "<text>" --expected-version <token>
     python jobcard.py update    <task_id> --description "<text>" --expected-version <token>
 
@@ -155,13 +155,37 @@ def cmd_set_state(spine: Spine, task_id: str, state: str) -> None:
         raise SystemExit(f"jobcard: {e}") from None
 
 
+def _resolve_show_id(spine: Spine, task_id: str):
+    """Resolve ``task_id`` for ``show``: an exact id match takes precedence (the
+    hot path stays a single indexed ``get``); otherwise ``task_id`` is treated as an
+    unambiguous prefix scanned across every task, tombstones included, since ``show``
+    itself already prints tombstoned cards by full id.
+
+    Zero matches and 2+ matches are both loud, non-zero, and DISTINCT from each
+    other, and an ambiguous prefix NEVER falls back to a first/newest/any-other
+    tiebreak — silently resolving to the wrong card costs far more than the
+    ergonomics gained. No minimum prefix length is imposed; ambiguity handling alone
+    covers that risk."""
+    task = spine.get_task(task_id)
+    if task is not None:
+        return task
+    matches = [t for t in spine.store.tasks.list_all() if t.id.startswith(task_id)]
+    if not matches:
+        raise SystemExit(f"jobcard: no card matches id/prefix {task_id!r}")
+    if len(matches) > 1:
+        ids = ", ".join(sorted(m.id for m in matches))
+        raise SystemExit(
+            f"jobcard: ambiguous prefix {task_id!r} matches {len(matches)} cards: {ids}"
+        )
+    return matches[0]
+
+
 def cmd_show(spine: Spine, task_id: str) -> None:
     """Print the minimum an operator needs to build an ``update``: id, title,
     state, and the current version token (``expected_version``). No formatting
-    framework — this is a read, not a report."""
-    task = spine.get_task(task_id)
-    if task is None:
-        raise SystemExit(f"jobcard: no task with id {task_id!r} (nothing to show)")
+    framework — this is a read, not a report. ``task_id`` may be a full uuid or any
+    unambiguous prefix (see ``_resolve_show_id``)."""
+    task = _resolve_show_id(spine, task_id)
     print(f"id: {task.id}")
     print(f"title: {task.title}")
     print(f"state: {task.state}")
@@ -267,7 +291,7 @@ def main(argv=None) -> int:
     p_set_state.add_argument("state", choices=list(STATES), help="the new state")
 
     p_show = sub.add_parser("show", help="print a card's id/title/state/version")
-    p_show.add_argument("task_id", help="the task id")
+    p_show.add_argument("task_id", help="the task id, or any unambiguous prefix of it")
 
     p_update = sub.add_parser("update", help="correct a card's title/description")
     p_update.add_argument("task_id", help="the task id")

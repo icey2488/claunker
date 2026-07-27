@@ -235,6 +235,52 @@ def test_artifact_unknown_card_rejected_not_found(tmp_db):
               "--ref", "abc123def456abc123def456abc123def456abc1"])
 
 
+# ── show (id resolution: exact + unambiguous prefix) ───────────────────────────
+
+def test_show_exact_uuid_still_works(tmp_db, capsys):
+    main(["create", "my task"])
+    task_id = capsys.readouterr().out.strip()
+
+    main(["show", task_id])
+    out = capsys.readouterr().out
+    assert f"id: {task_id}" in out
+
+
+def test_show_unique_prefix_resolves(tmp_db, capsys):
+    main(["create", "my task"])
+    task_id = capsys.readouterr().out.strip()
+
+    main(["show", task_id[:8]])
+    out = capsys.readouterr().out
+    assert f"id: {task_id}" in out
+
+
+def test_show_ambiguous_prefix_rejected_and_names_candidates(tmp_db, capsys):
+    # Mint two tasks whose ids share a common prefix, via task_id= on create_task.
+    with Store(tmp_db) as store:
+        spine = Spine(store)
+        project = spine.create_project("Dispatch Log")
+        a = spine.create_task(project.id, "task a",
+                               task_id="abcd1111-0000-0000-0000-000000000001")
+        b = spine.create_task(project.id, "task b",
+                               task_id="abcd2222-0000-0000-0000-000000000002")
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(["show", "abcd"])
+    msg = str(exc_info.value)
+    assert "ambiguous" in msg
+    assert a.id in msg
+    assert b.id in msg
+
+
+def test_show_unknown_prefix_rejected_distinct_from_ambiguous(tmp_db):
+    with pytest.raises(SystemExit) as exc_info:
+        main(["show", "deadbeef"])
+    msg = str(exc_info.value)
+    assert "no card matches" in msg
+    assert "ambiguous" not in msg
+
+
 # ── update (concurrency + null-forwarding) ─────────────────────────────────────
 
 def test_update_stale_version_rejected_and_state_unchanged(tmp_db, capsys):
