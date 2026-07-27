@@ -18,6 +18,9 @@ Usage::
     python jobcard.py fail      <task_id>   # set state to FAILED
     python jobcard.py set-state <task_id> <state>  # move to any ratified state
     python jobcard.py delete    <task_id>   # hard-remove the row entirely
+    python jobcard.py show      <task_id>   # print id/title/state/version
+    python jobcard.py update    <task_id> --title "<text>" --expected-version <token>
+    python jobcard.py update    <task_id> --description "<text>" --expected-version <token>
 
 The db path follows the server's own resolution: ``$CLAUNKER_SPINE_DB`` if set,
 else the package default ``spine/spine.db``.
@@ -30,7 +33,7 @@ import os
 import sys
 from typing import Optional
 
-from spine import Spine, State, STATES, Store
+from spine import ConflictError, Spine, State, STATES, Store
 from spine.entity import ARTIFACT_KINDS
 from spine.storage import DB_PATH
 
@@ -152,6 +155,38 @@ def cmd_set_state(spine: Spine, task_id: str, state: str) -> None:
         raise SystemExit(f"jobcard: {e}") from None
 
 
+def cmd_show(spine: Spine, task_id: str) -> None:
+    """Print the minimum an operator needs to build an ``update``: id, title,
+    state, and the current version token (``expected_version``). No formatting
+    framework — this is a read, not a report."""
+    task = spine.get_task(task_id)
+    if task is None:
+        raise SystemExit(f"jobcard: no task with id {task_id!r} (nothing to show)")
+    print(f"id: {task.id}")
+    print(f"title: {task.title}")
+    print(f"state: {task.state}")
+    print(f"version: {task.version}")
+
+
+def cmd_update(spine: Spine, task_id: str, patch: dict, *, expected_version: str) -> None:
+    """Correct a card's title/description via ``spine.update_task``'s optimistic-
+    concurrency get→set→put. ``patch`` carries ONLY the keys the operator actually
+    supplied on the command line (argparse.SUPPRESS keeps an omitted flag out of
+    the namespace) — update_task's key-presence contract treats an absent key as
+    "leave unchanged", so a naive always-present patch would forward None and clear
+    the other field. No retry on conflict: the caller re-reads via ``show`` and
+    resubmits deliberately."""
+    if not patch:
+        raise SystemExit("jobcard update: at least one of --title/--description is required")
+    try:
+        task = spine.update_task(task_id, expected_version=expected_version, **patch)
+    except KeyError as e:
+        raise SystemExit(f"jobcard update: {e}") from None
+    except ConflictError as e:
+        raise SystemExit(f"jobcard update: {e}") from None
+    print(task.id)
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         prog="jobcard", description="Log Claude Code passes as cards on the spine board."
@@ -231,6 +266,23 @@ def main(argv=None) -> int:
     p_set_state.add_argument("task_id", help="the task id")
     p_set_state.add_argument("state", choices=list(STATES), help="the new state")
 
+    p_show = sub.add_parser("show", help="print a card's id/title/state/version")
+    p_show.add_argument("task_id", help="the task id")
+
+    p_update = sub.add_parser("update", help="correct a card's title/description")
+    p_update.add_argument("task_id", help="the task id")
+    p_update.add_argument(
+        "--title", default=argparse.SUPPRESS, help="new title (omit to leave unchanged)",
+    )
+    p_update.add_argument(
+        "--description", default=argparse.SUPPRESS,
+        help="new narrative body (omit to leave unchanged)",
+    )
+    p_update.add_argument(
+        "--expected-version", dest="expected_version", required=True,
+        help="version token from `jobcard show` (required — no silent last-write-wins)",
+    )
+
     args = parser.parse_args(argv)
 
     # One writable Store for the whole command; WAL serializes us against the live
@@ -252,6 +304,15 @@ def main(argv=None) -> int:
             cmd_artifact(spine, args.task_id, args.kind, args.ref)
         elif args.command == "set-state":
             cmd_set_state(spine, args.task_id, args.state)
+        elif args.command == "show":
+            cmd_show(spine, args.task_id)
+        elif args.command == "update":
+            patch = {}
+            if hasattr(args, "title"):
+                patch["title"] = args.title
+            if hasattr(args, "description"):
+                patch["description"] = args.description
+            cmd_update(spine, args.task_id, patch, expected_version=args.expected_version)
     return 0
 
 

@@ -233,3 +233,56 @@ def test_artifact_unknown_card_rejected_not_found(tmp_db):
     with pytest.raises(SystemExit, match="does not exist"):
         main(["artifact", "00000000-0000-0000-0000-000000000000", "--kind", "diff",
               "--ref", "abc123def456abc123def456abc123def456abc1"])
+
+
+# ── update (concurrency + null-forwarding) ─────────────────────────────────────
+
+def test_update_stale_version_rejected_and_state_unchanged(tmp_db, capsys):
+    """A stale --expected-version is rejected, and BOTH title and description are
+    left exactly as they were — asserted against the PERSISTED row, not the CLI's
+    exit code. The same edit with the CORRECT version then succeeds, proving the
+    rejection above was the concurrency guard and not some other failure."""
+    main(["create", "--description", "orig desc", "orig title"])
+    task_id = capsys.readouterr().out.strip()
+
+    with Store(tmp_db) as store:
+        good_version = store.tasks.get(task_id).version
+    stale_version = "0:stale"
+
+    with pytest.raises(SystemExit):
+        main(["update", task_id, "--title", "new title",
+              "--description", "new desc", "--expected-version", stale_version])
+
+    with Store(tmp_db) as store:
+        task = store.tasks.get(task_id)
+    assert task.title == "orig title"
+    assert task.description == "orig desc"
+
+    main(["update", task_id, "--title", "new title",
+          "--description", "new desc", "--expected-version", good_version])
+    capsys.readouterr()
+
+    with Store(tmp_db) as store:
+        task = store.tasks.get(task_id)
+    assert task.title == "new title"
+    assert task.description == "new desc"
+
+
+def test_update_title_only_leaves_description_unchanged(tmp_db, capsys):
+    """Supplying only --title must NOT null out --description. This is red against
+    a naive patch built as {"title": args.title, "description": args.description}
+    (argparse fills the omitted --description with None, which update_task's RFC
+    7386 key-presence contract reads as an explicit clear)."""
+    main(["create", "--description", "keep me", "orig title"])
+    task_id = capsys.readouterr().out.strip()
+
+    with Store(tmp_db) as store:
+        version = store.tasks.get(task_id).version
+
+    main(["update", task_id, "--title", "new title", "--expected-version", version])
+    capsys.readouterr()
+
+    with Store(tmp_db) as store:
+        task = store.tasks.get(task_id)
+    assert task.title == "new title"
+    assert task.description == "keep me"
