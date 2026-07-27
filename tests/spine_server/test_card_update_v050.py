@@ -474,6 +474,112 @@ def test_atomicity_self_ref_writes_no_rows():
         cleanup(directory)
 
 
+# ── edit-audit ledger: title / description (2026-07-26 extension) ─────────────
+
+def test_title_update_writes_ledger_row_with_old_and_new():
+    directory, path = make_temp_db()
+    try:
+        _, task_id = _seed_task(path, title="original title")
+        ev = _version_of(path, task_id)
+        is_error, sc = anyio.run(
+            _call, build_server(_config(path)), "card_update",
+            {"id": task_id, "patch": {"title": "corrected title"}, "expected_version": ev},
+        )
+        assert is_error is False
+        assert sc["card"]["title"] == "corrected title"
+        rows = _edit_audit_rows(path)
+        assert len(rows) == 1
+        assert rows[0]["field"] == "title"
+        assert rows[0]["old"] == "original title"
+        assert rows[0]["new"] == "corrected title"
+    finally:
+        cleanup(directory)
+
+
+def test_description_update_writes_ledger_row_with_old_and_new():
+    directory, path = make_temp_db()
+    try:
+        _, task_id = _seed_task(path)
+        ev = _version_of(path, task_id)
+        anyio.run(
+            _call, build_server(_config(path)), "card_update",
+            {"id": task_id, "patch": {"description": "original body"}, "expected_version": ev},
+        )
+        ev2 = _version_of(path, task_id)
+        is_error, sc = anyio.run(
+            _call, build_server(_config(path)), "card_update",
+            {"id": task_id, "patch": {"description": "corrected body"}, "expected_version": ev2},
+        )
+        assert is_error is False
+        assert sc["card"]["description"] == "corrected body"
+        rows = _edit_audit_rows(path)
+        change_row = rows[-1]
+        assert change_row["field"] == "description"
+        assert change_row["old"] == "original body"
+        assert change_row["new"] == "corrected body"
+    finally:
+        cleanup(directory)
+
+
+def test_title_only_update_writes_no_description_row():
+    """Guards against the audit path over-recording untouched fields: a patch that
+    changes ONLY title must produce a ledger entry for title and NOTHING for
+    description (which was never present in the patch)."""
+    directory, path = make_temp_db()
+    try:
+        _, task_id = _seed_task(path, title="original title")
+        ev = _version_of(path, task_id)
+        anyio.run(
+            _call, build_server(_config(path)), "card_update",
+            {"id": task_id, "patch": {"description": "keep me"}, "expected_version": ev},
+        )
+        rows_before = _edit_audit_rows(path)  # baseline: the description-set row above
+        ev2 = _version_of(path, task_id)
+        is_error, sc = anyio.run(
+            _call, build_server(_config(path)), "card_update",
+            {"id": task_id, "patch": {"title": "corrected title"}, "expected_version": ev2},
+        )
+        assert is_error is False
+        rows_after = _edit_audit_rows(path)
+        new_rows = rows_after[len(rows_before):]  # rows written by THIS (title-only) update
+        assert len(new_rows) == 1
+        assert new_rows[0]["field"] == "title"
+        assert new_rows[0]["old"] == "original title"
+        assert new_rows[0]["new"] == "corrected title"
+    finally:
+        cleanup(directory)
+
+
+def test_description_clear_to_null_writes_ledger_row_with_old_text():
+    """The case most likely to be mishandled: clearing description to null (key
+    present, value null) is a real, auditable change — the ledger must record the
+    retracted old text, not treat the clear as a no-op."""
+    directory, path = make_temp_db()
+    try:
+        _, task_id = _seed_task(path)
+        ev = _version_of(path, task_id)
+        anyio.run(
+            _call, build_server(_config(path)), "card_update",
+            {"id": task_id, "patch": {"description": "false claim to retract"},
+             "expected_version": ev},
+        )
+        ev2 = _version_of(path, task_id)
+        is_error, sc = anyio.run(
+            _call, build_server(_config(path)), "card_update",
+            {"id": task_id, "patch": {"description": None}, "expected_version": ev2},
+        )
+        assert is_error is False
+        assert sc["card"]["description"] is None
+        assert _task_on_disk(path, task_id).description is None
+        rows = _edit_audit_rows(path)
+        clear_row = rows[-1]
+        assert clear_row["field"] == "description"
+        assert clear_row["old"] == "false claim to retract"
+        assert clear_row["new"] is None
+    finally:
+        cleanup(directory)
+
+
 # ── legacy blob load: tasks without due/depends_on project null/[] ─────────────
 
 def test_legacy_task_without_due_projects_null():

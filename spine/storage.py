@@ -65,11 +65,14 @@ TIER_AUDIT_TABLE = "tier_audit"
 # ``append_archive_audit`` / ``list_archive_audit``.
 ARCHIVE_AUDIT_TABLE = "archive_audit"
 
-# The append-only card-edit audit ledger (amendment 2026-07-06) — the SEVENTH table.
-# Records one row per set/change/clear of ``due``, ``effort``, ``impact``, or
+# The append-only card-edit audit ledger (amendment 2026-07-06; extended 2026-07-26
+# to ``title``/``description``) — the SEVENTH table. Records one row per set/change/
+# clear of ``title``, ``description``, ``due``, ``effort``, ``impact``, or
 # ``depends_on``, written atomically with the mutation (same ``commit=False`` / put idiom
 # as ``tier_audit`` and ``archive_audit``). Schema: ``{id, card_id, field, old, new,
-# actor, ts}``. No MCP tool reads it (record-now-render-later, v1).
+# actor, ts}`` — BOTH old and new are carried, so a title/description overwrite leaves
+# a receipt of the retracted claim, not just the fact that a change occurred. No MCP
+# tool reads it (record-now-render-later, v1).
 EDIT_AUDIT_TABLE = "edit_audit"
 
 
@@ -276,9 +279,9 @@ class Store:
         before the put; a failed guard leaves no orphan ledger row).
 
         Row shape: ``{id, card_id, field, old, new, actor, ts}``. Written for every
-        set/change/clear of ``due``, ``effort``, ``impact``, or ``depends_on`` — one
-        row per field that actually changed value. No read API this version
-        (record-now-render-later)."""
+        set/change/clear of ``title``, ``description``, ``due``, ``effort``, ``impact``,
+        or ``depends_on`` — one row per field that actually changed value. No read API
+        this version (record-now-render-later)."""
         self._conn.execute(
             f"INSERT INTO {EDIT_AUDIT_TABLE} (id, data) VALUES (?, ?)",
             (row["id"], json.dumps(row, default=str)),

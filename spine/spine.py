@@ -313,10 +313,14 @@ class Spine:
           * WRITE-ONCE TIER: ``tier`` here may only set an UNTIERED task's INITIAL tier;
             changing a SET tier → ``ValueError`` — governed path is ``retier_task``.
 
-        EDIT-AUDIT LEDGER (amendment 2026-07-06): one ``edit_audit`` row per field that
-        ACTUALLY changes (old ≠ new) among ``{effort, impact, due, depends_on}``,
+        EDIT-AUDIT LEDGER (amendment 2026-07-06; extended 2026-07-26 to ``title`` /
+        ``description``): one ``edit_audit`` row per field that ACTUALLY changes
+        (old ≠ new) among ``{title, description, effort, impact, due, depends_on}``,
         staged atomically with the mutation (``commit=False`` + put commits both). A
-        failed guard or invariant writes NO row.
+        failed guard or invariant writes NO row. ``title`` uses its own None-as-omitted
+        contract (only a provided, changed title is audited); ``description`` uses the
+        RFC 7386 key-presence contract above, so clearing it to null IS audited (the
+        old body is the whole point — see ``append_edit_audit``).
 
         OPTIMISTIC CONCURRENCY: ``expected_version`` checked against current token;
         mismatch → ``ConflictError``. Tombstone → ``ConflictError`` even under ``force``."""
@@ -375,6 +379,14 @@ class Spine:
         # Capture old values for the edit-audit ledger BEFORE mutation.
         now = utcnow_iso()
         audit_entries: List[Dict[str, Any]] = []
+        # title: plain Optional[str]=None-as-omitted (never nullable) — only a
+        # provided, changed value is audited; None here means "not provided".
+        if title is not None and task.title != title:
+            audit_entries.append({"field": "title", "old": task.title, "new": title})
+        # description: RFC 7386 key-presence like effort/impact/due — _UNSET means
+        # omitted, so a present None (a clear) is still audited with the old text.
+        if description is not _UNSET and task.description != description:
+            audit_entries.append({"field": "description", "old": task.description, "new": description})
         if effort is not _UNSET and task.effort != effort:
             audit_entries.append({"field": "effort", "old": task.effort, "new": effort})
         if impact is not _UNSET and task.impact != impact:
