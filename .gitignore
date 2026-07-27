@@ -31,3 +31,4 @@ cache/
 *.db-wal
 
 %ProgramData%/
+claunker-spine-sa-key.json
