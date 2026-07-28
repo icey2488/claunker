@@ -235,6 +235,61 @@ def test_artifact_unknown_card_rejected_not_found(tmp_db):
               "--ref", "abc123def456abc123def456abc123def456abc1"])
 
 
+# ── delete (governed soft-delete, card b467851e) ───────────────────────────────
+
+def test_delete_without_expected_version_fails_at_parse(tmp_db, capsys):
+    """No --expected-version must fail at argparse (exit 2), before cmd_delete
+    ever runs — the CLI must never let a bare task_id slide through as an
+    implicit None (spine.py's fail-open opt-out is for internal/test callers
+    only, never the wire-facing CLI)."""
+    main(["create", "x"])
+    task_id = capsys.readouterr().out.strip()
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(["delete", task_id])
+    assert exc_info.value.code == 2
+
+
+def test_delete_wrong_version_rejected_row_untouched(tmp_db, capsys):
+    main(["create", "x"])
+    task_id = capsys.readouterr().out.strip()
+
+    with pytest.raises(SystemExit, match="jobcard delete:"):
+        main(["delete", task_id, "--expected-version", "0:stale"])
+
+    with Store(tmp_db) as store:
+        task = store.tasks.get(task_id)
+    assert task is not None
+    assert task.deleted_at is None
+
+
+def test_delete_correct_version_tombstones_recoverably(tmp_db, capsys):
+    main(["create", "x"])
+    task_id = capsys.readouterr().out.strip()
+
+    with Store(tmp_db) as store:
+        version = store.tasks.get(task_id).version
+
+    main(["delete", task_id, "--expected-version", version])
+    capsys.readouterr()
+
+    with Store(tmp_db) as store:
+        # Excluded from live views...
+        assert task_id not in {t.id for t in store.tasks.list_live()}
+        # ...but the row itself is retained (recoverable), tombstoned not gone —
+        # the raw hard_delete behavior (row vanishes entirely) is gone.
+        task = store.tasks.get(task_id)
+        assert task is not None
+        assert task.deleted_at is not None
+        assert task_id in {t.id for t in store.tasks.list_all()}
+
+
+def test_delete_unknown_id_fails_loudly(tmp_db):
+    with pytest.raises(SystemExit, match="jobcard:"):
+        main(["delete", "00000000-0000-0000-0000-000000000000",
+              "--expected-version", "0:whatever"])
+
+
 # ── show (id resolution: exact + unambiguous prefix) ───────────────────────────
 
 def test_show_exact_uuid_still_works(tmp_db, capsys):

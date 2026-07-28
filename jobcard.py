@@ -17,7 +17,7 @@ Usage::
     python jobcard.py done      <task_id>   # set state to DELIVERED
     python jobcard.py fail      <task_id>   # set state to FAILED
     python jobcard.py set-state <task_id> <state>  # move to any ratified state
-    python jobcard.py delete    <task_id>   # hard-remove the row entirely
+    python jobcard.py delete    <task_id> --expected-version <token>  # tombstone (soft delete)
     python jobcard.py show      <task_id>   # print id/title/state/version (full id or unambiguous prefix)
     python jobcard.py update    <task_id> --title "<text>" --expected-version <token>
     python jobcard.py update    <task_id> --description "<text>" --expected-version <token>
@@ -123,13 +123,17 @@ def cmd_fail(spine: Spine, task_id: str) -> None:
     _set_state(spine, task_id, State.FAILED)
 
 
-def cmd_delete(spine: Spine, task_id: str) -> None:
-    """Hard-remove a task's row entirely — distinct from ``done``/``fail``, which
-    only change state. Errors clearly if the id is unknown rather than no-op-ing."""
+def cmd_delete(spine: Spine, task_id: str, *, expected_version: str) -> None:
+    """Tombstone a task via the governed ``Spine.soft_delete_task`` path — no more
+    raw ``hard_delete`` (card b467851e: the old path bypassed the ledger and any
+    concurrency check). Recoverable (row retained, ``deleted_at`` stamped), and
+    requires the caller's ``expected_version`` to match or the delete is rejected."""
     try:
-        spine.store.tasks.hard_delete(task_id)
+        spine.soft_delete_task(task_id, expected_version=expected_version)
     except KeyError:
         raise SystemExit(f"jobcard: no task with id {task_id!r} (nothing to delete)")
+    except ConflictError as e:
+        raise SystemExit(f"jobcard delete: {e}") from None
 
 
 def cmd_artifact(spine: Spine, task_id: str, kind: str, ref: str) -> None:
@@ -276,8 +280,16 @@ def main(argv=None) -> int:
     p_fail = sub.add_parser("fail", help="mark a pass card FAILED")
     p_fail.add_argument("task_id", help="the task id printed by create")
 
-    p_delete = sub.add_parser("delete", help="hard-remove a pass card's row entirely")
-    p_delete.add_argument("task_id", help="the task id printed by create")
+    p_delete = sub.add_parser("delete", help="tombstone a pass card via the governed soft-delete path")
+    # Full uuid only — deliberately NO prefix resolution here (unlike `show`). Card
+    # b467851e recorded prefix-resolved deletion as a standing extension hazard: a
+    # destructive op must never be one fat-fingered/ambiguous prefix from hitting the
+    # wrong card.
+    p_delete.add_argument("task_id", help="the task id printed by create (full id only)")
+    p_delete.add_argument(
+        "--expected-version", dest="expected_version", required=True,
+        help="version token from `jobcard show` (required — no silent last-write-wins)",
+    )
 
     p_artifact = sub.add_parser("artifact", help="attach a durable artifact receipt to a card")
     p_artifact.add_argument("task_id", help="the task id")
@@ -323,7 +335,7 @@ def main(argv=None) -> int:
         elif args.command == "fail":
             cmd_fail(spine, args.task_id)
         elif args.command == "delete":
-            cmd_delete(spine, args.task_id)
+            cmd_delete(spine, args.task_id, expected_version=args.expected_version)
         elif args.command == "artifact":
             cmd_artifact(spine, args.task_id, args.kind, args.ref)
         elif args.command == "set-state":
