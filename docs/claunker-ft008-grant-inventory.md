@@ -98,7 +98,7 @@ Executor allowlist fail-closed-by-default remains (FT-007 closed [asserted from 
 
 **Reach:** effectively everything the operator's user account can do — Claude Code runs with user permissions, unsandboxed, on any `workFolder`.
 
-**Verdict: OVER-BROAD BY NATURE, accepted deliberately as the subscription-priced dispatch lane.** The compensating control is the dispatch-lane ledger (design note 2026-07-03 [asserted from record]): jobcard entries per job, moving to auto-carding once `created_by` + `artifacts` land. This lane has NO classifier, NO allowlist, NO judge gate — the operator is the gate, plus Gemini review at the prompt-drafting seat.
+**Verdict: OVER-BROAD BY NATURE, accepted deliberately as the subscription-priced dispatch lane.** The compensating control is the dispatch-lane ledger (design note 2026-07-03 [asserted from record]): jobcard entries per job, moving to auto-carding once `created_by` + `artifacts` land. This lane has NO classifier, NO allowlist, NO judge gate — the operator is the gate, plus Gemini review at the prompt-drafting seat. The ledger itself has a gap: jobcard.py delete performs an unaudited, version-check-free hard delete (bypassing Spine's soft-delete/tier/archive audit paths entirely), so anything running under this grant can erase a ledger entry with no forensic trace. Treat the ledger as a record of what *was* logged, not a guarantee that nothing was silently removed.
 
 **Watch:** any session with this connector is dispatch authority. If the connector set ever widens beyond the operator's own sessions, this grant is the first to revisit.
 
