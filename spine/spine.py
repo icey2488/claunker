@@ -53,22 +53,60 @@ from typing import Any, Dict, List, Optional
 # address). A local absolute path is executor-specific and will not resolve on
 # replay. The check is structural (prefix-based), not semantic.
 #
-# Patterns rejected:
+# Patterns rejected (used below as the "local path" test folded into rule (b)):
 #   /path     — Unix absolute path (starts with /)
 #   ~/path    — user-home relative (starts with ~)
 #   C:\path   — Windows drive letter + backslash
 #   C:/path   — Windows drive letter + forward slash (but NOT C://  which is URL-like)
 #   \\server  — UNC path
-#
-# URL-like refs (e.g. https://, git://, f://) are NOT rejected:
-# the :/(?!/) pattern requires the slash to NOT be followed by another slash,
-# so scheme:// (double slash) passes through cleanly.
 _LOCAL_PATH_RE = re.compile(r'^(?:[/~]|[a-zA-Z]:\\|[a-zA-Z]:/(?!/)|\\\\)')
+
+# R6 v2 (card 2c97959f, ratified 2026-07-27) — POSITIVE allowlist. The blocklist above
+# was the ONLY check on ``ref``, and ``ref`` was the only uncapped field admitted by
+# ``create_artifact``: a rejected local path was the sole thing it screened for, so an
+# inline multi-paragraph blob (arbitrary prose, not a path at all) sailed straight
+# through undetected. This flips the check to a POSITIVE allowlist — ``ref`` is admitted
+# iff it matches EXACTLY ONE of three durable forms; everything else, including free
+# text, is rejected outright:
+#
+#   (a) a bare 40-hex SHA               — a git object hash, content-addressed.
+#   (b) git:<repo-relative-path>@<sha>  — a path INTO a git tree, pinned to a commit.
+#       <path> must not be absolute/drive-lettered/UNC — this is where the old
+#       blocklist's local-path semantics fold in, applied to the path segment only.
+#   (c) <scheme>://<rest>               — any URI EXCEPT file://, which is a local path
+#       wearing a scheme — precisely what R6 exists to stop, so it is explicitly
+#       rejected rather than admitted by the generic scheme pattern.
+#
+# Hex is matched CASE-INSENSITIVELY: git itself accepts either case for a SHA, and
+# rejecting uppercase hex would be a false negative on a legitimate ref (see the paired
+# test asserting both cases admit).
+_HEX40_RE = re.compile(r'^[0-9a-fA-F]{40}$')
+_GIT_REF_RE = re.compile(r'^git:(?P<path>[^@]+)@(?P<sha>[0-9a-fA-F]{40})$')
+_SCHEME_URL_RE = re.compile(r'^(?P<scheme>[a-zA-Z][a-zA-Z0-9+.\-]*)://.+$')
+
+# Named to match the entity.py sibling admission caps (MAX_CREATED_BY_BYTES,
+# MAX_METADATA_BYTES, MAX_DESCRIPTION_LEN): a serialized-size ceiling enforced at the
+# CREATE boundary. ``ref`` was the only field ``create_artifact`` admitted with no size
+# bound at all (card 2c97959f) — a real ref (hash / git pointer / URL) is well under
+# 200 bytes, so 1024 is generous headroom while still rejecting a pasted blob.
+MAX_ARTIFACT_REF_BYTES = 1024
 
 
 def _is_durable_ref(ref: str) -> bool:
-    """True iff ``ref`` is not a local filesystem path (R6)."""
-    return not bool(_LOCAL_PATH_RE.match(ref))
+    """True iff ``ref`` matches ONE of the three admitted forms (R6 v2, card
+    2c97959f): a bare 40-hex SHA, ``git:<repo-relative-path>@<sha>`` with a
+    non-local path, or ``scheme://...`` other than ``file://``. POSITIVE
+    allowlist — anything that matches none of the three (including inline
+    prose) is rejected."""
+    if _HEX40_RE.match(ref):
+        return True
+    git_match = _GIT_REF_RE.match(ref)
+    if git_match:
+        return not bool(_LOCAL_PATH_RE.match(git_match.group('path')))
+    scheme_match = _SCHEME_URL_RE.match(ref)
+    if scheme_match:
+        return scheme_match.group('scheme').lower() != 'file'
+    return False
 
 from .entity import (
     ARTIFACT_KINDS,
@@ -693,13 +731,21 @@ class Spine:
         created_at: Optional[str] = None,
     ) -> Artifact:
         """Attach an artifact to a live task. MI-1: rejected if the task is
-        tombstoned (or absent). R6: rejected if ``ref`` is a local filesystem path."""
+        tombstoned (or absent). R6 (card 2c97959f): ``ref`` must match the durable-ref
+        allowlist and fit the ``MAX_ARTIFACT_REF_BYTES`` admission cap."""
         if kind not in ARTIFACT_KINDS:
             raise ValueError(f"unknown artifact kind {kind!r}")
         if not _is_durable_ref(ref):
             raise ValueError(
-                f"non_durable_ref: {ref!r} is a local filesystem path and will not "
-                f"resolve outside this executor — use a git hash, URL, or content address"
+                f"non_durable_ref: {ref!r} is not an admitted durable ref — use a bare "
+                f"40-hex SHA, git:<repo-relative-path>@<sha>, or a scheme:// URI "
+                f"(file:// is rejected as a local path in disguise)"
+            )
+        ref_bytes = len(ref.encode("utf-8"))
+        if ref_bytes > MAX_ARTIFACT_REF_BYTES:
+            raise ValueError(
+                f"artifact ref exceeds the {MAX_ARTIFACT_REF_BYTES}-byte admission cap "
+                f"({ref_bytes} bytes) — card 2c97959f"
             )
         self._require_live_parent(task_id)  # MI-1
         artifact = Artifact(

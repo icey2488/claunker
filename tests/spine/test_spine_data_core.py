@@ -772,6 +772,102 @@ def test_r6_tilde_path_rejected():
     _assert_raises(lambda: spine.create_artifact(t.id, ArtifactKind.FILE, "~/output.py"), ValueError)
 
 
+# ── R6 v2 positive allowlist (card 2c97959f, ratified 2026-07-27) ─────────────
+
+def test_r6_bare_hex_sha_admitted_either_case():
+    """Bare 40-hex SHA admits in both lower- and upper-case (git itself is
+    case-insensitive on hex; the allowlist must not false-negative on case)."""
+    spine = Spine()
+    p = spine.create_project("p")
+    t = spine.create_task(p.id, "x", created_at=T[0])
+    lower = spine.create_artifact(t.id, ArtifactKind.DELIVERY, "a" * 40)
+    upper = spine.create_artifact(t.id, ArtifactKind.DELIVERY, "A" * 40)
+    assert lower.ref == "a" * 40 and upper.ref == "A" * 40
+
+
+def test_r6_git_repo_relative_ref_admitted():
+    spine = Spine()
+    p = spine.create_project("p")
+    t = spine.create_task(p.id, "x", created_at=T[0])
+    ref = "git:src/spine/spine.py@" + "b" * 40
+    a = spine.create_artifact(t.id, ArtifactKind.DIFF, ref)
+    assert a.ref == ref
+
+
+def test_r6_scheme_url_admitted():
+    spine = Spine()
+    p = spine.create_project("p")
+    t = spine.create_task(p.id, "x", created_at=T[0])
+    a = spine.create_artifact(t.id, ArtifactKind.FILE, "https://example.com/out.py")
+    assert a.ref == "https://example.com/out.py"
+
+
+def test_r6_file_scheme_rejected():
+    """file:// is a local path wearing a scheme — explicitly rejected even though it
+    matches the generic scheme:// shape (case-insensitive: FILE:// must reject too)."""
+    spine = Spine()
+    p = spine.create_project("p")
+    t = spine.create_task(p.id, "x", created_at=T[0])
+    _assert_raises(lambda: spine.create_artifact(t.id, ArtifactKind.FILE, "file:///etc/passwd"), ValueError)
+    _assert_raises(lambda: spine.create_artifact(t.id, ArtifactKind.FILE, "FILE:///etc/passwd"), ValueError)
+
+
+def test_r6_git_ref_with_absolute_path_rejected():
+    """The old blocklist's local-path semantics fold into the git: form's path segment."""
+    spine = Spine()
+    p = spine.create_project("p")
+    t = spine.create_task(p.id, "x", created_at=T[0])
+    ref = "git:/etc/passwd@" + "c" * 40
+    _assert_raises(lambda: spine.create_artifact(t.id, ArtifactKind.FILE, ref), ValueError)
+
+
+def test_r6_inline_prose_rejected():
+    """The case that motivated card 2c97959f: an inline multi-paragraph blob is not a
+    path at all, so the OLD blocklist admitted it. The positive allowlist rejects it
+    outright since it matches none of the three durable forms."""
+    spine = Spine()
+    p = spine.create_project("p")
+    t = spine.create_task(p.id, "x", created_at=T[0])
+    prose = "Here is the fix:\n\nStep 1. Do the thing.\n\nStep 2. Do another thing.\n"
+    _assert_raises(lambda: spine.create_artifact(t.id, ArtifactKind.DELIVERY, prose), ValueError)
+
+
+def test_r6_ref_over_byte_cap_rejected():
+    from spine.spine import MAX_ARTIFACT_REF_BYTES
+    spine = Spine()
+    p = spine.create_project("p")
+    t = spine.create_task(p.id, "x", created_at=T[0])
+    ref = "https://example.com/" + ("a" * (MAX_ARTIFACT_REF_BYTES + 1))
+    _assert_raises(lambda: spine.create_artifact(t.id, ArtifactKind.FILE, ref), ValueError)
+    assert MAX_ARTIFACT_REF_BYTES == 1024  # pin the documented contract number
+
+
+def test_r6_ref_at_byte_cap_admitted():
+    """Exactly at the cap is still admitted — the cap rejects strictly OVER, not AT."""
+    from spine.spine import MAX_ARTIFACT_REF_BYTES
+    spine = Spine()
+    p = spine.create_project("p")
+    t = spine.create_task(p.id, "x", created_at=T[0])
+    prefix = "https://example.com/"
+    ref = prefix + "a" * (MAX_ARTIFACT_REF_BYTES - len(prefix))
+    a = spine.create_artifact(t.id, ArtifactKind.FILE, ref)
+    assert len(a.ref.encode("utf-8")) == MAX_ARTIFACT_REF_BYTES
+
+
+def test_r6_unc_path_rejected():
+    spine = Spine()
+    p = spine.create_project("p")
+    t = spine.create_task(p.id, "x", created_at=T[0])
+    _assert_raises(lambda: spine.create_artifact(t.id, ArtifactKind.FILE, "\\\\server\\share\\out.py"), ValueError)
+
+
+def test_r6_windows_forward_slash_drive_path_rejected():
+    spine = Spine()
+    p = spine.create_project("p")
+    t = spine.create_task(p.id, "x", created_at=T[0])
+    _assert_raises(lambda: spine.create_artifact(t.id, ArtifactKind.FILE, "C:/output/result.txt"), ValueError)
+
+
 # ── pure-python fallback runner (no pytest) ───────────────────────────────────
 def _main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
