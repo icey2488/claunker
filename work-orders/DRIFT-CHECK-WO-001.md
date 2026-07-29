@@ -93,7 +93,7 @@ Quoted from the source card, verbatim, each with its stated rationale:
 | CLEAN | 0 | all assertions green |
 | DRIFT | 1 | copy body ≠ source body at recorded SHA (or ACCEPTED_GAP fingerprint mismatch) |
 | MISSING_COPY | 2 | manifest-REQUIRED copy absent |
-| STALENESS | 3 | source canonical-branch tip moved past recorded SHA |
+| STALENESS | 3 | one or more commits touching the source path exist on the canonical branch past the recorded SHA |
 | HEADER_UNPARSEABLE | 4 | file exists but its provenance header is absent or fails its declared format; drift and staleness unevaluated for that copy — a missing file is MISSING_COPY, never HEADER_UNPARSEABLE |
 | UNMANIFESTED_DUPLICATE | 5 | duplicate-filename scan found a governed-looking copy with no manifest entry |
 | PIN_MISMATCH | 6 | accepted_gap_count ≠ actual ACCEPTED_GAP entries |
@@ -322,3 +322,5 @@ adjudication committed alongside in review-packets/. Requirements 2 and 5
 amended on source card 1486ea8a in the same arc, prior wording preserved in
 edit_audit. Round-2 headline: no design-invalidating flaw — both BLOCKERs
 resolved as specification clarifications.
+
+v3.1 2026-07-28: STALENESS outcome-map row re-scoped to the source path, restoring Requirement 1's "for that path" wording — the AMD-14 drafting compression had dropped the path scope, surfaced as build finding 3 (claunker-ops, drift-check/BUILD-REPORT.md @ 2f59958). Requirement 1 on the source card is unchanged and was always path-scoped; no card touch in this fix.
