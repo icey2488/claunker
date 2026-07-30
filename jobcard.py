@@ -16,7 +16,7 @@ Usage::
         --effort medium --job-id 1234-abcd "<title>"    # dispatch provenance
     python jobcard.py done      <task_id>   # set state to DELIVERED
     python jobcard.py fail      <task_id>   # set state to FAILED
-    python jobcard.py set-state <task_id> <state>  # move to any ratified state
+    python jobcard.py set-state <task_id> <state> --expected-version <token>  # move to any ratified state
     python jobcard.py delete    <task_id> --expected-version <token>  # tombstone (soft delete)
     python jobcard.py show      <task_id>   # print id/title/state/version (full id or unambiguous prefix)
     python jobcard.py update    <task_id> --title "<text>" --expected-version <token>
@@ -148,15 +148,19 @@ def cmd_artifact(spine: Spine, task_id: str, kind: str, ref: str) -> None:
     print(artifact.id)
 
 
-def cmd_set_state(spine: Spine, task_id: str, state: str) -> None:
+def cmd_set_state(spine: Spine, task_id: str, state: str, *, expected_version: str) -> None:
     """Move a card to any ratified spine state. Deliberately permissive — no
     transition state-machine in the CLI (the spine is a ledger of already-governed
     work). Invalid state caught by argparse choices; unknown card fails with the
-    spine's own KeyError, surfaced as a loud SystemExit."""
+    spine's own KeyError, surfaced as a loud SystemExit. ``expected_version`` is
+    required (card f2b52250, mirroring ``update``'s mandatory argparse pattern) —
+    a stale token is rejected with no write."""
     try:
-        spine.set_state(task_id, state)
+        spine.set_state(task_id, state, expected_version=expected_version)
     except KeyError as e:
         raise SystemExit(f"jobcard: {e}") from None
+    except ConflictError as e:
+        raise SystemExit(f"jobcard set-state: {e}") from None
 
 
 def _resolve_show_id(spine: Spine, task_id: str):
@@ -301,6 +305,10 @@ def main(argv=None) -> int:
     p_set_state = sub.add_parser("set-state", help="move a card to any ratified state")
     p_set_state.add_argument("task_id", help="the task id")
     p_set_state.add_argument("state", choices=list(STATES), help="the new state")
+    p_set_state.add_argument(
+        "--expected-version", dest="expected_version", required=True,
+        help="version token from `jobcard show` (required — no silent last-write-wins)",
+    )
 
     p_show = sub.add_parser("show", help="print a card's id/title/state/version")
     p_show.add_argument("task_id", help="the task id, or any unambiguous prefix of it")
@@ -339,7 +347,7 @@ def main(argv=None) -> int:
         elif args.command == "artifact":
             cmd_artifact(spine, args.task_id, args.kind, args.ref)
         elif args.command == "set-state":
-            cmd_set_state(spine, args.task_id, args.state)
+            cmd_set_state(spine, args.task_id, args.state, expected_version=args.expected_version)
         elif args.command == "show":
             cmd_show(spine, args.task_id)
         elif args.command == "update":

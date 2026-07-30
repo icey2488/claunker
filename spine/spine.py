@@ -304,12 +304,19 @@ class Spine:
         )
         return self.store.tasks.put(task)
 
-    def set_state(self, task_id: str, state: str) -> Task:
+    def set_state(
+        self, task_id: str, state: str, *, expected_version: Optional[str] = None, force: bool = False
+    ) -> Task:
         """Move a task to a new state (its board column). Validates the target is a
-        known state; transition legality is not guarded in this slice."""
+        known state; transition legality is not guarded in this slice.
+
+        OPTIMISTIC CONCURRENCY (card f2b52250): mirrors ``update_task`` — the same
+        ``_guard_mutable`` gate, so a stale ``expected_version`` raises ``ConflictError``
+        instead of silently applying a lost-update. ``expected_version is None`` opts
+        out (internal/test callers only; the CLI/wire path always supplies one)."""
         if state not in STATES:
             raise ValueError(f"unknown task state {state!r}")
-        task = self._require_task(task_id)
+        task = self._guard_mutable(task_id, expected_version=expected_version, force=force)
         task.state = state
         return self.store.tasks.put(task)
 

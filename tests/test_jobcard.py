@@ -46,8 +46,10 @@ def test_create_state_created(tmp_db, capsys):
 def test_set_state_moves_card(tmp_db, capsys):
     main(["create", "x"])
     task_id = capsys.readouterr().out.strip()
+    with Store(tmp_db) as store:
+        version = store.tasks.get(task_id).version
 
-    main(["set-state", task_id, "tiered"])
+    main(["set-state", task_id, "tiered", "--expected-version", version])
 
     with Store(tmp_db) as store:
         task = store.tasks.get(task_id)
@@ -56,13 +58,39 @@ def test_set_state_moves_card(tmp_db, capsys):
 
 def test_set_state_rejects_off_enum_state(tmp_db):
     with pytest.raises(SystemExit) as exc_info:
-        main(["set-state", "fake-id", "nonexistent"])
+        main(["set-state", "fake-id", "nonexistent", "--expected-version", "1:deadbeef"])
     assert exc_info.value.code == 2  # argparse rejects invalid choice
 
 
 def test_set_state_unknown_card_fails_loudly(tmp_db):
     with pytest.raises(SystemExit, match="jobcard:"):
-        main(["set-state", "00000000-0000-0000-0000-000000000000", "created"])
+        main([
+            "set-state", "00000000-0000-0000-0000-000000000000", "created",
+            "--expected-version", "1:deadbeef",
+        ])
+
+
+# ── card f2b52250: set-state requires --expected-version (concurrency guard) ────
+
+def test_set_state_without_expected_version_fails_at_argparse(tmp_db, capsys):
+    main(["create", "x"])
+    task_id = capsys.readouterr().out.strip()
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(["set-state", task_id, "tiered"])
+    assert exc_info.value.code == 2  # argparse: required flag missing
+
+
+def test_set_state_stale_expected_version_rejected_no_write(tmp_db, capsys):
+    main(["create", "x"])
+    task_id = capsys.readouterr().out.strip()
+
+    with pytest.raises(SystemExit, match="jobcard set-state:"):
+        main(["set-state", task_id, "tiered", "--expected-version", "1:stale-token"])
+
+    with Store(tmp_db) as store:
+        task = store.tasks.get(task_id)
+    assert task.state == State.DISPATCHED  # unchanged — the write was refused
 
 
 # ── create --project ───────────────────────────────────────────────────────────
