@@ -29,6 +29,7 @@ from spine import (  # noqa: E402
     STATES,
     Artifact,
     ArtifactKind,
+    ConflictError,
     Escalation,
     GATE_STATUS_COMMITTED,
     MAX_RANK_LENGTH,
@@ -328,9 +329,9 @@ def test_description_is_mutable_via_update_task():
     spine = Spine.in_memory()
     p = spine.create_project("p")
     t = spine.create_task(p.id, "t", description="first", created_at=T[0])
-    spine.update_task(t.id, description="second")
+    t = spine.update_task(t.id, description="second", expected_version=t.version)
     assert spine.get_task(t.id).description == "second"
-    spine.update_task(t.id, description=None)  # present-null clears
+    spine.update_task(t.id, description=None, expected_version=t.version)  # present-null clears
     assert spine.get_task(t.id).description is None
 
 
@@ -340,8 +341,41 @@ def test_over_limit_description_rejected_at_create_and_update():
     p = spine.create_project("p")
     _assert_raises(lambda: spine.create_task(p.id, "t", description="x" * (MAX_DESCRIPTION_LEN + 1)), SpineError)
     t = spine.create_task(p.id, "ok", description="fine", created_at=T[0])
-    _assert_raises(lambda: spine.update_task(t.id, description="y" * (MAX_DESCRIPTION_LEN + 1)), Exception)
+    _assert_raises(
+        lambda: spine.update_task(t.id, description="y" * (MAX_DESCRIPTION_LEN + 1), expected_version=t.version),
+        Exception,
+    )
     assert spine.get_task(t.id).description == "fine"  # rejected update changed nothing
+
+
+# ── card ffce48ec: update_task must fail closed when expected_version is None ──
+def test_update_task_refuses_missing_expected_version():
+    """No token at all → refused (ValueError), no write. Distinct from a STALE
+    token, which is a ConflictError (existing version-conflict path, unchanged)."""
+    spine = Spine.in_memory()
+    p = spine.create_project("p")
+    t = spine.create_task(p.id, "t", description="first", created_at=T[0])
+    _assert_raises(lambda: spine.update_task(t.id, description="second"), ValueError)
+    assert spine.get_task(t.id).description == "first"  # refused: no write happened
+
+
+def test_update_task_stale_expected_version_conflicts():
+    spine = Spine.in_memory()
+    p = spine.create_project("p")
+    t = spine.create_task(p.id, "t", description="first", created_at=T[0])
+    _assert_raises(
+        lambda: spine.update_task(t.id, description="second", expected_version="0:stale"),
+        ConflictError,
+    )
+    assert spine.get_task(t.id).description == "first"  # conflict: no write happened
+
+
+def test_update_task_fresh_expected_version_writes():
+    spine = Spine.in_memory()
+    p = spine.create_project("p")
+    t = spine.create_task(p.id, "t", description="first", created_at=T[0])
+    spine.update_task(t.id, description="second", expected_version=t.version)
+    assert spine.get_task(t.id).description == "second"
 
 
 def test_legacy_task_blob_without_description_or_metadata_loads():

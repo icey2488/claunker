@@ -375,7 +375,11 @@ class Spine:
         old body is the whole point — see ``append_edit_audit``).
 
         OPTIMISTIC CONCURRENCY: ``expected_version`` checked against current token;
-        mismatch → ``ConflictError``. Tombstone → ``ConflictError`` even under ``force``."""
+        mismatch → ``ConflictError``. Tombstone → ``ConflictError`` even under ``force``.
+        ``expected_version`` is REQUIRED (card ffce48ec): unlike the shared
+        ``_guard_mutable`` gate used elsewhere, which treats ``None`` as an opt-out,
+        ``update_task`` refuses a write with no token at all rather than silently
+        skipping the concurrency check — ``ValueError`` naming the missing token."""
         if (
             title is None
             and acceptance_criteria is None
@@ -417,6 +421,11 @@ class Spine:
                         f"depends_on entries must be non-empty strings, got {entry!r}"
                     )
 
+        if expected_version is None:
+            raise ValueError(
+                "update_task requires expected_version — refusing an unguarded write; "
+                "supply the task's current version token (see get_task)"
+            )
         task = self._guard_mutable(task_id, expected_version=expected_version, force=force)
 
         # WRITE-ONCE TIER GUARD (spec v0.3.0 §Re-tier)
