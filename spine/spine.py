@@ -541,9 +541,24 @@ class Spine:
         carrying the current task is raised. Deletion has NO ``force`` — the spec's
         deliberate asymmetry: destructive ops never get a bypass. Deleting an ALREADY-
         tombstoned task raises ``ConflictError`` (the tombstone) — tombstones are
-        immutable. See ``_guard_mutable``."""
+        immutable. See ``_guard_mutable``.
+
+        EDIT-AUDIT LEDGER (card f9329f35): a soft delete is a governed mutation like
+        any other — it stages one ``edit_audit`` row (``field="deleted_at"``) atomically
+        with the put (``commit=False``, same idiom as ``update_task``), so deletion is
+        journaled with an actor rather than only visible via the tombstoned field."""
         task = self._guard_mutable(task_id, expected_version=expected_version, force=False)
-        task.deleted_at = utcnow_iso()
+        now = utcnow_iso()
+        task.deleted_at = now
+        self.store.append_edit_audit({
+            "id": str(uuid.uuid4()),
+            "card_id": task.id,
+            "field": "deleted_at",
+            "old": None,
+            "new": now,
+            "actor": EDIT_ACTOR,
+            "ts": now,
+        }, commit=False)
         return self.store.tasks.put(task)
 
     # ── governed re-tier (audited control) ─────────────────────────────────────

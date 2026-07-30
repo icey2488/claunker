@@ -136,6 +136,25 @@ def test_soft_delete_omitted_from_list_live_and_projection():
     assert to_card(spine.store.tasks.get(t.id)) is None  # the lens omits a tombstone
 
 
+# ── card f9329f35: soft_delete_task writes its edit_audit ledger row ───────────
+def test_soft_delete_task_writes_edit_audit_row():
+    spine = Spine.in_memory()
+    p = spine.create_project("p")
+    t = spine.create_task(p.id, "x", created_at=T[0])
+
+    assert spine.store.list_edit_audit() == []  # no row before the delete
+
+    spine.soft_delete_task(t.id)
+
+    rows = spine.store.list_edit_audit()
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["card_id"] == t.id
+    assert row["field"] == "deleted_at"
+    assert row["old"] is None
+    assert row["new"] is not None
+
+
 # ── migration-free: a legacy Task blob with no deleted_at key loads live ───────
 def test_legacy_task_blob_without_deleted_at_loads_live_and_visible():
     """A Task blob written before ``deleted_at`` existed carries no such key. The
