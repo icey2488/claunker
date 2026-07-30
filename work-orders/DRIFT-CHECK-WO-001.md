@@ -216,6 +216,8 @@ The self-containedness rule is scoped accordingly: this work order is
 self-contained for the build; 2c450718 is the declared, load-bearing gate
 for production activation only.
 
+RATIFIED AND CLOSED 2026-07-28 (card 2c450718, operator voice): R-1 four-field logical schema on every governed copy; R-2 two syntaxes — blockquote-v1 (as-used, including the trailing --- separator) and html-comment-v1 (labeled lines inside the leading comment) — YAML migration rejected; R-3 strip-both-sides comparison with the recorded SHA read from the copy's region; R-4 executed (hermes mirror fields inserted, claunker-hermes 515ea21); R-5 built (claunker-ops 7f1d14d, extended fc5c975). Production go-live completed at claunker-ops b8ff89c: hooks installed, live red (blocked drifted push) and live green (clean push passed) both proven.
+
 ## Rejected on record
 
 Carried forward from the source card so a builder does not re-propose them:
@@ -324,3 +326,5 @@ edit_audit. Round-2 headline: no design-invalidating flaw — both BLOCKERs
 resolved as specification clarifications.
 
 v3.1 2026-07-28: STALENESS outcome-map row re-scoped to the source path, restoring Requirement 1's "for that path" wording — the AMD-14 drafting compression had dropped the path scope, surfaced as build finding 3 (claunker-ops, drift-check/BUILD-REPORT.md @ 2f59958). Requirement 1 on the source card is unchanged and was always path-scoped; no card touch in this fix.
+
+2026-07-28: open dependency 2c450718 ratified and closed; production go-live completed (claunker-ops b8ff89c).
