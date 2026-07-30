@@ -45,7 +45,7 @@ import os
 import sys
 from typing import Optional
 
-from spine import ConflictError, Spine, State, STATES, Store
+from spine import ConflictError, Spine, SpineError, State, STATES, Store
 from spine.entity import ARTIFACT_KINDS
 from spine.storage import DB_PATH
 
@@ -58,6 +58,20 @@ def _db_path() -> str:
     """The live spine db, resolved exactly as the server does: env override, else
     the package default (``spine/spine.db``)."""
     return os.environ.get("CLAUNKER_SPINE_DB", DB_PATH)
+
+
+def _read_description_file(path: str) -> str:
+    """Read a card description from ``path`` for ``--description-file``. Opened in
+    BINARY mode (no universal-newline translation, no locale-dependent text
+    encoding guess) so the bytes on disk decode byte-exact — a text-mode
+    ``open(path)`` is not equivalent on every platform/locale. Decoded strictly as
+    UTF-8; the resulting string is handed to the same ``description`` parameter
+    --description uses, so it inherits the SAME admission cap (``check_
+    description_limits``, spine/entity.py) at the create/update boundary — this
+    lane does not bypass it."""
+    with open(path, "rb") as f:
+        raw = f.read()
+    return raw.decode("utf-8")
 
 
 def _ensure_dispatch_log(spine: Spine):
@@ -121,8 +135,14 @@ def cmd_create(
             created_by["job_id"] = job_id
     # description: the narrative body (spec v0.8.0). Omitted = absent (None), never a
     # coerced empty string — matches the wire card_create's absent-means-null handling.
-    task = spine.create_task(project.id, title, state=state, created_by=created_by,
-                             description=description)
+    # SpineError (e.g. the description admission cap) is surfaced as a loud SystemExit,
+    # like every other rejected write below — never a raw traceback, and NOTHING is
+    # written: check_description_limits runs inside create_task before the put.
+    try:
+        task = spine.create_task(project.id, title, state=state, created_by=created_by,
+                                 description=description)
+    except SpineError as e:
+        raise SystemExit(f"jobcard create: {e}") from None
     # ONLY the id on stdout — callers capture it (e.g. `jobcard done $(jobcard create ...)`).
     print(task.id)
 
@@ -257,6 +277,8 @@ def cmd_update(spine: Spine, task_id: str, patch: dict, *, expected_version: str
         raise SystemExit(f"jobcard update: {e}") from None
     except ConflictError as e:
         raise SystemExit(f"jobcard update: {e}") from None
+    except SpineError as e:
+        raise SystemExit(f"jobcard update: {e}") from None
     print(task.id)
 
 
@@ -312,11 +334,21 @@ def main(argv=None) -> int:
         help="dispatch provenance: originating claude-async job id to record in created_by "
              "(optional; ignored when --actor is omitted)",
     )
-    p_create.add_argument(
+    p_create_desc = p_create.add_mutually_exclusive_group()
+    p_create_desc.add_argument(
         "--description",
         default=None,
         help="the card's narrative body (spec v0.8.0); a short Markdown summary of what "
              "the card is about. Omitted = no body (never an empty string).",
+    )
+    p_create_desc.add_argument(
+        "--description-file",
+        dest="description_file",
+        metavar="PATH",
+        default=None,
+        help="read the narrative body from PATH, binary-safe (no newline translation, "
+             "byte-exact) instead of --description; subject to the same admission cap. "
+             "Mutually exclusive with --description.",
     )
 
     p_done = sub.add_parser("done", help="mark a pass card DELIVERED")
@@ -370,9 +402,17 @@ def main(argv=None) -> int:
     p_update.add_argument(
         "--title", default=argparse.SUPPRESS, help="new title (omit to leave unchanged)",
     )
-    p_update.add_argument(
+    p_update_desc = p_update.add_mutually_exclusive_group()
+    p_update_desc.add_argument(
         "--description", default=argparse.SUPPRESS,
         help="new narrative body (omit to leave unchanged)",
+    )
+    p_update_desc.add_argument(
+        "--description-file", dest="description_file", metavar="PATH",
+        default=argparse.SUPPRESS,
+        help="read the new narrative body from PATH, binary-safe (no newline translation, "
+             "byte-exact) instead of --description; subject to the same admission cap. "
+             "Mutually exclusive with --description.",
     )
     p_update.add_argument(
         "--expected-version", dest="expected_version", required=True,
@@ -386,10 +426,13 @@ def main(argv=None) -> int:
     with Store(_db_path()) as store:
         spine = Spine(store)
         if args.command == "create":
+            description = args.description
+            if args.description_file is not None:
+                description = _read_description_file(args.description_file)
             cmd_create(spine, args.title, state=args.state, project_arg=args.project,
                        actor=args.actor, actor_type=args.actor_type,
                        model=args.model, effort=args.effort, job_id=args.job_id,
-                       description=args.description)
+                       description=description)
         elif args.command == "done":
             cmd_done(spine, args.task_id)
         elif args.command == "fail":
@@ -410,6 +453,8 @@ def main(argv=None) -> int:
                 patch["title"] = args.title
             if hasattr(args, "description"):
                 patch["description"] = args.description
+            elif hasattr(args, "description_file"):
+                patch["description"] = _read_description_file(args.description_file)
             cmd_update(spine, args.task_id, patch, expected_version=args.expected_version)
     return 0
 

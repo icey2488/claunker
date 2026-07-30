@@ -211,6 +211,89 @@ def test_description_omitted_is_null_not_empty(tmp_db, capsys):
     assert task.description is None
 
 
+# ── --description-file (card 269144d9 remedy: binary-safe, cap-inheriting lane) ─
+
+def test_description_file_byte_exact_round_trip(tmp_db, tmp_path, capsys):
+    """A ~12KB LF-only payload with quotes, backticks, curly quotes, and blank
+    lines must round-trip BYTE-EXACT through create-with-file then a library
+    re-read. Written with an explicit binary encode so the source file itself
+    carries no CRLF and no encoding ambiguity; a naive text-mode file read (locale
+    default encoding, universal-newline translation) is not guaranteed to survive
+    this untouched."""
+    unit = (
+        'Straight quotes: "double" and \'single\'.\n'
+        "Curly quotes: ‘single’ and “double”.\n"
+        "Backtick block:\n```\ncode line\n```\n"
+        "\n"
+        "blank line above this one.\n"
+    )
+    payload = (unit * (12000 // len(unit) + 1))[:12000]
+    desc_path = tmp_path / "desc.txt"
+    with open(desc_path, "wb") as f:
+        f.write(payload.encode("utf-8"))
+
+    main(["create", "--description-file", str(desc_path), "my task"])
+    task_id = capsys.readouterr().out.strip()
+
+    with Store(tmp_db) as store:
+        task = store.tasks.get(task_id)
+    assert task.description == payload
+
+
+def test_description_file_over_cap_refused_nothing_written(tmp_db, tmp_path, capsys):
+    """A payload exceeding MAX_DESCRIPTION_LEN through --description-file must be
+    refused loudly by the SAME admission cap create/update already enforce for
+    --description — the file lane must not bypass the governed boundary — and
+    NOTHING must be written to the store."""
+    from spine.entity import MAX_DESCRIPTION_LEN
+
+    oversized = "x" * (MAX_DESCRIPTION_LEN + 1)
+    desc_path = tmp_path / "big.txt"
+    with open(desc_path, "wb") as f:
+        f.write(oversized.encode("utf-8"))
+
+    with Store(tmp_db) as store:
+        before_ids = {t.id for t in store.tasks.list_all()}
+
+    with pytest.raises(SystemExit, match="jobcard create:"):
+        main(["create", "--description-file", str(desc_path), "my task"])
+
+    with Store(tmp_db) as store:
+        after_ids = {t.id for t in store.tasks.list_all()}
+    assert after_ids == before_ids  # nothing written
+
+
+def test_description_and_description_file_mutually_exclusive(tmp_db, tmp_path):
+    desc_path = tmp_path / "desc.txt"
+    with open(desc_path, "wb") as f:
+        f.write(b"file body")
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(["create", "--description", "inline body",
+              "--description-file", str(desc_path), "my task"])
+    assert exc_info.value.code == 2  # argparse: mutually exclusive
+
+
+def test_update_description_file_binary_safe(tmp_db, tmp_path, capsys):
+    main(["create", "--description", "orig", "my task"])
+    task_id = capsys.readouterr().out.strip()
+    with Store(tmp_db) as store:
+        version = store.tasks.get(task_id).version
+
+    payload = "line one\nline two\n\nline four\n"
+    desc_path = tmp_path / "desc.txt"
+    with open(desc_path, "wb") as f:
+        f.write(payload.encode("utf-8"))
+
+    main(["update", task_id, "--description-file", str(desc_path),
+          "--expected-version", version])
+    capsys.readouterr()
+
+    with Store(tmp_db) as store:
+        task = store.tasks.get(task_id)
+    assert task.description == payload
+
+
 # ── artifact subcommand ────────────────────────────────────────────────────────
 
 def test_artifact_git_hash_ref_accepted(tmp_db, capsys):
