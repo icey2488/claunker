@@ -397,6 +397,64 @@ def test_update_stale_version_rejected_and_state_unchanged(tmp_db, capsys):
     assert task.description == "new desc"
 
 
+# ── list subcommand (card 269144d9 remedy 1: read surface) ─────────────────────
+
+def test_list_enumerates_cards_short_id_state_title(tmp_db, capsys):
+    main(["create", "--state", "created", "alpha"])
+    id1 = capsys.readouterr().out.strip()
+    main(["create", "--state", "tiered", "beta"])
+    id2 = capsys.readouterr().out.strip()
+
+    main(["list"])
+    out = capsys.readouterr().out
+    assert f"{id1[:8]} created alpha" in out
+    assert f"{id2[:8]} tiered beta" in out
+
+
+def test_list_state_filter(tmp_db, capsys):
+    main(["create", "--state", "created", "alpha"])
+    capsys.readouterr()
+    main(["create", "--state", "tiered", "beta"])
+    capsys.readouterr()
+
+    main(["list", "--state", "tiered"])
+    out = capsys.readouterr().out
+    assert "beta" in out
+    assert "alpha" not in out
+
+
+def test_list_unknown_state_rejected(tmp_db):
+    with pytest.raises(SystemExit) as exc_info:
+        main(["list", "--state", "nonexistent"])
+    assert exc_info.value.code == 2  # argparse rejects invalid choice
+
+
+# ── show prints full description + artifacts (card 269144d9 remedy 2/5) ────────
+
+def test_show_prints_full_description(tmp_db, capsys):
+    long_desc = "para one.\n\npara two with *markdown* and a list:\n- item\n" * 50
+    main(["create", "--description", long_desc, "my task"])
+    task_id = capsys.readouterr().out.strip()
+
+    main(["show", task_id])
+    out = capsys.readouterr().out
+    assert long_desc in out
+
+
+def test_show_prints_attached_artifacts(tmp_db, capsys):
+    main(["create", "task"])
+    task_id = capsys.readouterr().out.strip()
+    main(["artifact", task_id, "--kind", "delivery",
+          "--ref", "81d33c2a4b5e6f7890abcdef1234567890abcdef"])
+    artifact_id = capsys.readouterr().out.strip()
+
+    main(["show", task_id])
+    out = capsys.readouterr().out
+    assert artifact_id in out
+    assert "delivery" in out
+    assert "81d33c2a4b5e6f7890abcdef1234567890abcdef" in out
+
+
 def test_update_title_only_leaves_description_unchanged(tmp_db, capsys):
     """Supplying only --title must NOT null out --description. This is red against
     a naive patch built as {"title": args.title, "description": args.description}

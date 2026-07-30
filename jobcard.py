@@ -9,18 +9,30 @@ on the board within a few seconds.
 
 Usage::
 
-    python jobcard.py create "<title>"                  # Dispatch Log, DISPATCHED
-    python jobcard.py create --state created "<title>"  # Dispatch Log, CREATED
+    python jobcard.py create "<title>"                  # Dispatch Log, CREATED
+    python jobcard.py create --state dispatched "<title>"  # explicit non-default state
     python jobcard.py create --project "<name-or-id>" "<title>"  # named project
     python jobcard.py create --actor claude-code --model claude-sonnet-5 \
         --effort medium --job-id 1234-abcd "<title>"    # dispatch provenance
+    python jobcard.py create --description-file <path> "<title>"  # binary-safe long body
+    python jobcard.py list                              # every live card: id/state/title
+    python jobcard.py list --state created               # filtered to one state
     python jobcard.py done      <task_id>   # set state to DELIVERED
     python jobcard.py fail      <task_id>   # set state to FAILED
     python jobcard.py set-state <task_id> <state> --expected-version <token>  # move to any ratified state
     python jobcard.py delete    <task_id> --expected-version <token>  # tombstone (soft delete)
-    python jobcard.py show      <task_id>   # print id/title/state/version (full id or unambiguous prefix)
+    python jobcard.py show      <task_id>   # id/title/state/version/description/artifacts (full id or unambiguous prefix)
     python jobcard.py update    <task_id> --title "<text>" --expected-version <token>
     python jobcard.py update    <task_id> --description "<text>" --expected-version <token>
+    python jobcard.py update    <task_id> --description-file <path> --expected-version <token>
+
+CARD-STATE CONVENTION: ``create`` defaults to ``created`` (any other initial state
+needs an explicit ``--state``). A finding/radar card (a defect discovered rather
+than dispatched as work) is not job-lifecycle-shaped — it stays in ``created``
+until someone actively works it, then moves straight to ``delivered`` when
+resolved; ``{tiered, dispatched, judged}`` simply don't apply to it. This is a
+CONVENTION over the existing six-state enum, not a new state (see README.md and
+card 269144d9).
 
 The db path follows the server's own resolution: ``$CLAUNKER_SPINE_DB`` if set,
 else the package default ``spine/spine.db``.
@@ -188,16 +200,45 @@ def _resolve_show_id(spine: Spine, task_id: str):
     return matches[0]
 
 
+def cmd_list(spine: Spine, state: Optional[str] = None) -> None:
+    """Enumerate live cards, one per line: ``<8-char id prefix> <state> <title>``.
+    Tombstones are excluded — this is a discovery surface over the working board,
+    the same live set ``board_get`` renders, not a full-history read. ``state``
+    narrows to that column when given; an off-enum value is rejected by argparse
+    (``choices``) before this ever runs, so no validation is needed here.
+
+    ORDERING (deterministic, this CLI's choice — see --help): board position
+    (``Task.order``, the LexoRank string the board itself sorts columns by), then
+    ``id`` as a total-order tiebreak for two cards sharing an ``order``."""
+    tasks = spine.store.tasks.list_live()
+    if state is not None:
+        tasks = [t for t in tasks if t.state == state]
+    for t in sorted(tasks, key=lambda t: (t.order, t.id)):
+        print(f"{t.id[:8]} {t.state} {t.title}")
+
+
 def cmd_show(spine: Spine, task_id: str) -> None:
-    """Print the minimum an operator needs to build an ``update``: id, title,
-    state, and the current version token (``expected_version``). No formatting
-    framework — this is a read, not a report. ``task_id`` may be a full uuid or any
-    unambiguous prefix (see ``_resolve_show_id``)."""
+    """Print id/title/state/version, then the FULL description body and every
+    attached artifact (card 269144d9 remedies 2 and 5) — the CLI's only read
+    surface for a single card, so nothing governed content lives in without being
+    visible here. ``task_id`` may be a full uuid or any unambiguous prefix (see
+    ``_resolve_show_id``). The description is printed verbatim between clear
+    delimiters (never truncated or reformatted) since it may itself contain
+    Markdown that would otherwise blur into this output."""
     task = _resolve_show_id(spine, task_id)
     print(f"id: {task.id}")
     print(f"title: {task.title}")
     print(f"state: {task.state}")
     print(f"version: {task.version}")
+    print("description:")
+    print("--- description start ---")
+    if task.description is not None:
+        print(task.description)
+    print("--- description end ---")
+    artifacts = [a for a in spine.store.artifacts.list_all() if a.task_id == task.id]
+    print(f"artifacts ({len(artifacts)}):")
+    for a in artifacts:
+        print(f"  {a.id} {a.kind} {a.ref}")
 
 
 def cmd_update(spine: Spine, task_id: str, patch: dict, *, expected_version: str) -> None:
@@ -310,7 +351,18 @@ def main(argv=None) -> int:
         help="version token from `jobcard show` (required — no silent last-write-wins)",
     )
 
-    p_show = sub.add_parser("show", help="print a card's id/title/state/version")
+    p_list = sub.add_parser(
+        "list", help="enumerate live cards: id/state/title",
+        description="Enumerate live (non-tombstoned) cards, one per line: "
+                     "'<8-char id prefix> <state> <title>'. Ordered by board position "
+                     "(Task.order), then id as a tiebreak.",
+    )
+    p_list.add_argument(
+        "--state", choices=list(STATES), default=None,
+        help="only list cards in this state (default: every live state)",
+    )
+
+    p_show = sub.add_parser("show", help="print a card's id/title/state/version/description/artifacts")
     p_show.add_argument("task_id", help="the task id, or any unambiguous prefix of it")
 
     p_update = sub.add_parser("update", help="correct a card's title/description")
@@ -348,6 +400,8 @@ def main(argv=None) -> int:
             cmd_artifact(spine, args.task_id, args.kind, args.ref)
         elif args.command == "set-state":
             cmd_set_state(spine, args.task_id, args.state, expected_version=args.expected_version)
+        elif args.command == "list":
+            cmd_list(spine, args.state)
         elif args.command == "show":
             cmd_show(spine, args.task_id)
         elif args.command == "update":
