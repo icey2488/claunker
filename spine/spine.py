@@ -196,8 +196,15 @@ class ConflictError(Exception):
 
 
 class Spine:
-    def __init__(self, store: Optional[Store] = None) -> None:
-        self.store = store or Store()
+    def __init__(self, store: Store) -> None:
+        self.store = store
+
+    @classmethod
+    def in_memory(cls) -> "Spine":
+        """Explicit opt-in to an isolated ``:memory:`` board (tests only) — a
+        bare ``Spine()`` raises rather than silently defaulting (card 47b81de8:
+        the same footgun as bare ``Store()``, one layer up)."""
+        return cls(Store.in_memory())
 
     # ── reads ────────────────────────────────────────────────────────────────
     def get_project(self, project_id: str) -> Optional[Project]:

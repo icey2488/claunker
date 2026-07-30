@@ -147,11 +147,17 @@ class EntityStore:
 
 
 class Store:
-    """The four-table SQLite store. ``path=":memory:"`` for tests; ``DB_PATH`` (or
-    any file path) for a real spine. Exposes the four ``EntityStore``s as
-    attributes plus the dump/load sync seam."""
+    """The four-table SQLite store. ``DB_PATH`` (or any file path) for a real
+    spine. Exposes the four ``EntityStore``s as attributes plus the dump/load
+    sync seam.
 
-    def __init__(self, path: str = ":memory:") -> None:
+    ``path`` is required — a bare ``Store()`` raises ``TypeError`` rather than
+    silently opening an empty ``:memory:`` database (card 47b81de8: a bare
+    construction was mistaken for a real, populated board more than once).
+    Tests that legitimately want an isolated in-memory store must opt in
+    explicitly via ``Store.in_memory()``."""
+
+    def __init__(self, path: str) -> None:
         self._conn = sqlite3.connect(path)
         self._conn.execute("PRAGMA journal_mode=WAL")  # no-op ('memory') on :memory:
         for table in TABLES:
@@ -189,6 +195,13 @@ class Store:
     def _next_seq(self) -> int:
         self.seq += 1
         return self.seq
+
+    @classmethod
+    def in_memory(cls) -> "Store":
+        """Explicit opt-in to an isolated ``:memory:`` store (tests only) — the
+        one legitimate way to get an in-memory board now that bare ``Store()``
+        raises (card 47b81de8)."""
+        return cls(":memory:")
 
     # ── lifecycle ────────────────────────────────────────────────────────────
     def close(self) -> None:

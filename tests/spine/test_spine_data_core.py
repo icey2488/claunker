@@ -66,9 +66,31 @@ def _assert_raises(fn, exc=Exception):
     assert raised, f"expected {fn} to raise {exc.__name__}"
 
 
+# ── card 47b81de8: bare Store()/Spine() must raise, not silently open :memory: ──
+def test_bare_store_construction_raises():
+    _assert_raises(lambda: Store(), TypeError)
+
+
+def test_bare_spine_construction_raises():
+    _assert_raises(lambda: Spine(), TypeError)
+
+
+def test_store_in_memory_explicit_opt_in_works():
+    store = Store.in_memory()
+    p = Project(id="p1", name="Proj", created_at=T[0])
+    store.projects.put(p)
+    assert store.projects.get("p1").to_dict() == p.to_dict()
+
+
+def test_spine_in_memory_explicit_opt_in_works():
+    spine = Spine.in_memory()
+    p = spine.create_project("p")
+    assert spine.get_project(p.id) is not None
+
+
 # ── per-entity store round-trip across all four tables ─────────────────────────
 def test_per_entity_store_round_trip_all_four_tables():
-    store = Store()
+    store = Store.in_memory()
     p = Project(id="p1", name="Proj", created_at=T[0])
     t = Task(id="t1", project_id="p1", title="task", state=State.TIERED, tier=2,
              acceptance_criteria=["compiles", "tests pass"], order="i", created_at=T[1])
@@ -98,7 +120,7 @@ def test_per_entity_store_round_trip_all_four_tables():
 
 # ── soft-delete: omitted from list_live AND projection, retained in list_all ───
 def test_soft_delete_omitted_from_list_live_and_projection():
-    spine = Spine()
+    spine = Spine.in_memory()
     p = spine.create_project("p")
     t = spine.create_task(p.id, "x", created_at=T[0])
 
@@ -120,7 +142,7 @@ def test_legacy_task_blob_without_deleted_at_loads_live_and_visible():
     dataclass default fills it in (``from_dict`` ignores unknown keys, defaults the
     missing one), so the task loads with ``deleted_at=None`` — LIVE and on the board.
     No migration / backfill is needed when the soft-delete field is introduced."""
-    store = Store()
+    store = Store.in_memory()
     legacy = {  # exactly the pre-deleted_at blob shape (note: no "deleted_at" key)
         "id": "t1", "project_id": "p", "title": "legacy", "state": "created",
         "tier": None, "acceptance_criteria": None, "order": "i",
@@ -137,7 +159,7 @@ def test_legacy_task_blob_without_deleted_at_loads_live_and_visible():
 
 # ── ordering: creation order reflected in LexoRank order + projection order ────
 def test_creation_order_reflected_in_lexorank_projection_order():
-    spine = Spine()
+    spine = Spine.in_memory()
     p = spine.create_project("p")
     a = spine.create_task(p.id, "a", created_at=T[0])
     b = spine.create_task(p.id, "b", created_at=T[1])
@@ -169,7 +191,7 @@ def test_rebalance_is_sorted_compact_and_total():
 
 # ── version: opaque, equality-only, changes on every put ───────────────────────
 def test_version_is_opaque_string_and_changes_on_mutation():
-    store = Store()
+    store = Store.in_memory()
     t = Task(id="t1", project_id="p", title="t", created_at=T[0])
     store.tasks.put(t)
     v1 = t.version
@@ -185,7 +207,7 @@ def test_version_is_opaque_string_and_changes_on_mutation():
 def test_put_mints_a_fresh_token_every_put():
     """Every put bumps the monotonic seq, so even re-putting identical content
     yields a new token (the equality-only contract: a put is a change event)."""
-    store = Store()
+    store = Store.in_memory()
     t = Task(id="t1", project_id="p", title="t", created_at=T[0])
     store.tasks.put(t)
     first = t.version
@@ -202,7 +224,7 @@ def test_make_version_is_deterministic_and_seq_sensitive():
 
 # ── projection: gate_status, state→column, tier→tag, null attribution ──────────
 def test_every_projected_card_is_gate_status_committed_with_null_attribution():
-    spine = Spine()
+    spine = Spine.in_memory()
     p = spine.create_project("p")
     spine.create_task(p.id, "a", created_at=T[0])
     spine.create_task(p.id, "b", created_at=T[1])
@@ -223,7 +245,7 @@ def test_due_less_task_projects_due_null_never_fabricated():
     would emit a non-null ISO string (T[0]) — this test would fail, catching the
     regression. The never-fabricate rule: only a genuinely stored due value may
     appear; with no stored due, null is the only correct output."""
-    spine = Spine()
+    spine = Spine.in_memory()
     p = spine.create_project("p")
     task = spine.create_task(p.id, "no-due task", created_at=T[0])
     card = _card_for(spine, task.id)
@@ -234,7 +256,7 @@ def test_due_less_task_projects_due_null_never_fabricated():
 
 
 def test_state_maps_one_to_one_to_column():
-    spine = Spine()
+    spine = Spine.in_memory()
     p = spine.create_project("p")
     for st in STATES:
         spine.create_task(p.id, st, state=st, created_at=T[0])
@@ -248,7 +270,7 @@ def test_state_maps_one_to_one_to_column():
 
 
 def test_tier_projects_to_a_tag():
-    spine = Spine()
+    spine = Spine.in_memory()
     p = spine.create_project("p")
     untiered = spine.create_task(p.id, "untiered", created_at=T[0])
     tiered = spine.create_task(p.id, "tiered", tier=4, created_at=T[1])
@@ -257,7 +279,7 @@ def test_tier_projects_to_a_tag():
 
 
 def test_acceptance_criteria_echoes_into_the_card_lens():
-    spine = Spine()
+    spine = Spine.in_memory()
     p = spine.create_project("p")
     # Unset → the key is present (the lens always carries it) and projects as None.
     bare = spine.create_task(p.id, "bare", created_at=T[0])
@@ -272,7 +294,7 @@ def test_acceptance_criteria_echoes_into_the_card_lens():
 
 # ── description (the narrative body) + preserved foreign metadata ──────────────
 def test_description_round_trips_and_defaults_null_in_the_lens():
-    spine = Spine()
+    spine = Spine.in_memory()
     p = spine.create_project("p")
     # Unset → the lens carries the key and projects null (NOT a constant "").
     bare = spine.create_task(p.id, "bare", created_at=T[0])
@@ -284,7 +306,7 @@ def test_description_round_trips_and_defaults_null_in_the_lens():
 
 
 def test_description_is_mutable_via_update_task():
-    spine = Spine()
+    spine = Spine.in_memory()
     p = spine.create_project("p")
     t = spine.create_task(p.id, "t", description="first", created_at=T[0])
     spine.update_task(t.id, description="second")
@@ -295,7 +317,7 @@ def test_description_is_mutable_via_update_task():
 
 def test_over_limit_description_rejected_at_create_and_update():
     from spine.entity import MAX_DESCRIPTION_LEN
-    spine = Spine()
+    spine = Spine.in_memory()
     p = spine.create_project("p")
     _assert_raises(lambda: spine.create_task(p.id, "t", description="x" * (MAX_DESCRIPTION_LEN + 1)), SpineError)
     t = spine.create_task(p.id, "ok", description="fine", created_at=T[0])
@@ -307,7 +329,7 @@ def test_legacy_task_blob_without_description_or_metadata_loads():
     """The archived_at precedent: a Task blob written before ``description``/``metadata``
     existed carries neither key. ``from_dict`` defaults them (None → {} for metadata via
     __post_init__), so the row loads untouched — additive, no migration, no schema bump."""
-    store = Store()
+    store = Store.in_memory()
     legacy = {  # pre-description/metadata blob shape
         "id": "t1", "project_id": "p", "title": "legacy", "state": "created",
         "tier": None, "acceptance_criteria": None, "order": "i",
@@ -323,7 +345,7 @@ def test_legacy_task_blob_without_description_or_metadata_loads():
 
 
 def test_metadata_foreign_keys_preserved_and_overlaid_in_lens():
-    spine = Spine()
+    spine = Spine.in_memory()
     p = spine.create_project("p")
     t = spine.create_task(p.id, "t", metadata={"x_future": {"k": 1}}, created_at=T[0])
     assert _card_for(spine, t.id)["x_future"] == {"k": 1}
@@ -341,7 +363,7 @@ def test_metadata_overlay_never_clobbers_a_modeled_card_field():
 
 # ── escalation → badge (orthogonal to the state column) ────────────────────────
 def test_unresolved_escalation_badges_card_and_keeps_it_in_state_column():
-    spine = Spine()
+    spine = Spine.in_memory()
     p = spine.create_project("p")
     t = spine.create_task(p.id, "x", state=State.DISPATCHED, created_at=T[0])
 
@@ -365,7 +387,7 @@ def test_unresolved_escalation_badges_card_and_keeps_it_in_state_column():
 
 
 def test_approved_and_tombstoned_escalations_yield_no_badge():
-    spine = Spine()
+    spine = Spine.in_memory()
     p = spine.create_project("p")
     t = spine.create_task(p.id, "x", state=State.JUDGED, created_at=T[0])
 
@@ -387,7 +409,7 @@ def test_approved_and_tombstoned_escalations_yield_no_badge():
 
 # ── MI-1: no late children on a tombstoned task (BOTH child kinds rejected) ────
 def test_mi1_rejects_artifact_and_escalation_on_tombstoned_task():
-    spine = Spine()
+    spine = Spine.in_memory()
     p = spine.create_project("p")
     t = spine.create_task(p.id, "x", created_at=T[0])
 
@@ -407,7 +429,7 @@ def test_mi1_rejects_artifact_and_escalation_on_tombstoned_task():
 
 # ── MI-2: resolving an escalation is a single put, no paired state transition ──
 def test_mi2_resolve_escalation_is_a_single_put_with_no_state_transition():
-    spine = Spine()
+    spine = Spine.in_memory()
     p = spine.create_project("p")
     t = spine.create_task(p.id, "x", created_at=T[0])
     e = spine.create_escalation(t.id, "why", control_diff=_CONTROL_DIFF, created_at=T[1])
@@ -432,7 +454,7 @@ def test_mi2_resolve_escalation_is_a_single_put_with_no_state_transition():
 
 # ── resolve_escalation: decision recorded; rationale floor + actor invariant ────
 def test_resolve_escalation_records_decision_rationale_and_actor():
-    spine = Spine()
+    spine = Spine.in_memory()
     p = spine.create_project("p")
     t = spine.create_task(p.id, "x", created_at=T[0])
 
@@ -449,7 +471,7 @@ def test_resolve_escalation_records_decision_rationale_and_actor():
 
 
 def test_resolve_escalation_rejects_unknown_resolution():
-    spine = Spine()
+    spine = Spine.in_memory()
     p = spine.create_project("p")
     t = spine.create_task(p.id, "x", created_at=T[0])
     e = spine.create_escalation(t.id, "why", created_at=T[1])
@@ -459,7 +481,7 @@ def test_resolve_escalation_rejects_unknown_resolution():
 
 
 def test_resolve_escalation_enforces_rationale_floor():
-    spine = Spine()
+    spine = Spine.in_memory()
     p = spine.create_project("p")
     t = spine.create_task(p.id, "x", created_at=T[0])
     e = spine.create_escalation(t.id, "why", created_at=T[1])
@@ -471,7 +493,7 @@ def test_resolve_escalation_enforces_rationale_floor():
 
 
 def test_resolve_escalation_enforces_operator_actor_invariant():
-    spine = Spine()
+    spine = Spine.in_memory()
     p = spine.create_project("p")
     t = spine.create_task(p.id, "x", created_at=T[0])
     e = spine.create_escalation(t.id, "why", created_at=T[1])
@@ -482,7 +504,7 @@ def test_resolve_escalation_enforces_operator_actor_invariant():
 
 
 def test_resolve_escalation_unknown_id_raises_keyerror():
-    spine = Spine()
+    spine = Spine.in_memory()
     _assert_raises(
         lambda: spine.resolve_escalation("ghost", resolution="approve", resolution_rationale="valid rationale here", actor="operator"),
         KeyError,
@@ -491,7 +513,7 @@ def test_resolve_escalation_unknown_id_raises_keyerror():
 
 # ── projection: the THREE-state escalation badge (unresolved > denied > none) ───
 def test_projection_badge_is_three_state_unresolved_denied_none():
-    spine = Spine()
+    spine = Spine.in_memory()
     p = spine.create_project("p")
 
     # (1) a live unresolved escalation → status 'unresolved'.
@@ -524,7 +546,7 @@ def test_projection_badge_is_three_state_unresolved_denied_none():
 
 # ── dump / load: whole-blob sync seam round-trips losslessly ───────────────────
 def test_dump_load_blob_round_trip():
-    spine = Spine()
+    spine = Spine.in_memory()
     p = spine.create_project("p", created_at=T[0])
     t = spine.create_task(p.id, "task", state=State.TIERED, tier=1, created_at=T[1])
     a = spine.create_artifact(t.id, ArtifactKind.VERDICT, "v://1", created_at=T[2])
@@ -536,7 +558,7 @@ def test_dump_load_blob_round_trip():
     assert {len(blob[k]) for k in ("projects", "tasks", "artifacts", "escalations")} == {1}
 
     # Load into a fresh store: versions preserved (no re-stamp), seq restored.
-    other = Store()
+    other = Store.in_memory()
     other.load(blob)
     assert other.seq == spine.store.seq
     assert other.projects.get(p.id).to_dict() == spine.get_project(p.id).to_dict()
@@ -569,14 +591,14 @@ def test_wal_mode_enabled_on_file_db():
 # ── Task.created_by: nullable actor, validation, projection passthrough ────────
 
 def test_task_created_by_defaults_to_null():
-    spine = Spine()
+    spine = Spine.in_memory()
     p = spine.create_project("p")
     t = spine.create_task(p.id, "x", created_at=T[0])
     assert t.created_by is None
 
 
 def test_task_created_by_valid_agent():
-    spine = Spine()
+    spine = Spine.in_memory()
     p = spine.create_project("p")
     t = spine.create_task(p.id, "x", created_at=T[0], created_by={"type": "agent", "id": "claude-code"})
     assert t.created_by == {"type": "agent", "id": "claude-code"}
@@ -584,7 +606,7 @@ def test_task_created_by_valid_agent():
 
 
 def test_task_created_by_valid_human():
-    spine = Spine()
+    spine = Spine.in_memory()
     p = spine.create_project("p")
     t = spine.create_task(p.id, "x", created_at=T[0], created_by={"type": "human", "id": "icey2488"})
     assert t.created_by == {"type": "human", "id": "icey2488"}
@@ -608,7 +630,7 @@ def test_task_created_by_null_is_fine():
 
 
 def test_projection_passthrough_created_by_agent():
-    spine = Spine()
+    spine = Spine.in_memory()
     p = spine.create_project("p")
     t = spine.create_task(p.id, "x", created_at=T[0], created_by={"type": "agent", "id": "claude-code"})
     card = _card_for(spine, t.id)
@@ -616,7 +638,7 @@ def test_projection_passthrough_created_by_agent():
 
 
 def test_projection_null_created_by_for_legacy_null():
-    spine = Spine()
+    spine = Spine.in_memory()
     p = spine.create_project("p")
     t = spine.create_task(p.id, "x", created_at=T[0])
     card = _card_for(spine, t.id)
@@ -626,7 +648,7 @@ def test_projection_null_created_by_for_legacy_null():
 def test_legacy_blob_without_created_by_loads_untouched():
     """A blob written before created_by existed carries no such key. from_dict ignores
     unknown keys and defaults the missing one, so the task loads with created_by=None."""
-    store = Store()
+    store = Store.in_memory()
     legacy = {
         "id": "t1", "project_id": "p", "title": "legacy", "state": "created",
         "tier": None, "acceptance_criteria": None, "order": "i",
@@ -647,7 +669,7 @@ def test_legacy_blob_without_created_by_loads_untouched():
 # depth + byte admission caps); the whole stamp projects through the lens verbatim.
 
 def test_task_created_by_agent_with_provenance_persists_and_projects():
-    spine = Spine()
+    spine = Spine.in_memory()
     p = spine.create_project("p")
     prov = {"type": "agent", "id": "claude-code", "model": "claude-sonnet-5",
             "effort": "medium", "job_id": "job-42"}
@@ -671,7 +693,7 @@ def test_task_created_by_unknown_string_keys_tolerated():
     """MCP interop: a created_by minted by a FOREIGN server may carry KEYS we do not
     model. Unknown keys with STRING values must NOT break our write or read path —
     additive-only, preserved verbatim through store and lens."""
-    spine = Spine()
+    spine = Spine.in_memory()
     p = spine.create_project("p")
     foreign = {"type": "agent", "id": "some-other-agent", "model": "their-model",
                "vendor_trace": "span-abc", "cost_note": "3c"}
@@ -686,7 +708,7 @@ def test_task_created_by_unknown_nonstring_value_accepted_under_depth():
     a bool, null — under a key we do not model, and it must round-trip verbatim (NOT be
     hard-rejected). The abuse surface is bounded by the depth + byte caps, not a flat-value
     rule. This is the test the string-only over-correction broke."""
-    spine = Spine()
+    spine = Spine.in_memory()
     p = spine.create_project("p")
     structured = {"type": "agent", "id": "a",
                   "vendor_trace": {"span": "abc", "duration": 12},  # nested object (depth 2)
@@ -702,7 +724,7 @@ def test_task_created_by_over_depth_rejected():
     rejected at admission, naming the depth limit. depth 4 = created_by(1) → a(2) → b(3)
     → c(4), one past the depth-3 cap."""
     from spine.entity import MAX_PROVENANCE_DEPTH
-    spine = Spine()
+    spine = Spine.in_memory()
     p = spine.create_project("p")
     deep = {"type": "agent", "id": "a", "vt": {"a": {"b": {"c": 1}}}}  # deepest container at depth 4
     try:
@@ -719,7 +741,7 @@ def test_created_by_admission_caps_enforced_at_create_task():
     all raise at mint. A realistic payload passes. Proves BOTH write paths are bounded."""
     from spine.entity import (MAX_CREATED_BY_BYTES, MAX_PROVENANCE_DEPTH,
                               MAX_PROVENANCE_KEYS, MAX_PROVENANCE_VALUE_LEN)
-    spine = Spine()
+    spine = Spine.in_memory()
     p = spine.create_project("p")
     base = {"type": "agent", "id": "a"}
     # too many keys
@@ -744,7 +766,7 @@ def test_created_by_admission_caps_enforced_at_create_task():
 # ── R6 durable-ref validation in create_artifact ──────────────────────────────
 
 def test_r6_git_hash_ref_accepted():
-    spine = Spine()
+    spine = Spine.in_memory()
     p = spine.create_project("p")
     t = spine.create_task(p.id, "x", created_at=T[0])
     a = spine.create_artifact(t.id, ArtifactKind.DELIVERY, "81d33c2a4b5e6f7890abcdef1234567890abcdef")
@@ -752,21 +774,21 @@ def test_r6_git_hash_ref_accepted():
 
 
 def test_r6_unix_local_path_rejected():
-    spine = Spine()
+    spine = Spine.in_memory()
     p = spine.create_project("p")
     t = spine.create_task(p.id, "x", created_at=T[0])
     _assert_raises(lambda: spine.create_artifact(t.id, ArtifactKind.FILE, "/workspace/out.py"), ValueError)
 
 
 def test_r6_windows_local_path_rejected():
-    spine = Spine()
+    spine = Spine.in_memory()
     p = spine.create_project("p")
     t = spine.create_task(p.id, "x", created_at=T[0])
     _assert_raises(lambda: spine.create_artifact(t.id, ArtifactKind.FILE, "C:\\output\\result.txt"), ValueError)
 
 
 def test_r6_tilde_path_rejected():
-    spine = Spine()
+    spine = Spine.in_memory()
     p = spine.create_project("p")
     t = spine.create_task(p.id, "x", created_at=T[0])
     _assert_raises(lambda: spine.create_artifact(t.id, ArtifactKind.FILE, "~/output.py"), ValueError)
@@ -777,7 +799,7 @@ def test_r6_tilde_path_rejected():
 def test_r6_bare_hex_sha_admitted_either_case():
     """Bare 40-hex SHA admits in both lower- and upper-case (git itself is
     case-insensitive on hex; the allowlist must not false-negative on case)."""
-    spine = Spine()
+    spine = Spine.in_memory()
     p = spine.create_project("p")
     t = spine.create_task(p.id, "x", created_at=T[0])
     lower = spine.create_artifact(t.id, ArtifactKind.DELIVERY, "a" * 40)
@@ -786,7 +808,7 @@ def test_r6_bare_hex_sha_admitted_either_case():
 
 
 def test_r6_git_repo_relative_ref_admitted():
-    spine = Spine()
+    spine = Spine.in_memory()
     p = spine.create_project("p")
     t = spine.create_task(p.id, "x", created_at=T[0])
     ref = "git:src/spine/spine.py@" + "b" * 40
@@ -795,7 +817,7 @@ def test_r6_git_repo_relative_ref_admitted():
 
 
 def test_r6_scheme_url_admitted():
-    spine = Spine()
+    spine = Spine.in_memory()
     p = spine.create_project("p")
     t = spine.create_task(p.id, "x", created_at=T[0])
     a = spine.create_artifact(t.id, ArtifactKind.FILE, "https://example.com/out.py")
@@ -805,7 +827,7 @@ def test_r6_scheme_url_admitted():
 def test_r6_file_scheme_rejected():
     """file:// is a local path wearing a scheme — explicitly rejected even though it
     matches the generic scheme:// shape (case-insensitive: FILE:// must reject too)."""
-    spine = Spine()
+    spine = Spine.in_memory()
     p = spine.create_project("p")
     t = spine.create_task(p.id, "x", created_at=T[0])
     _assert_raises(lambda: spine.create_artifact(t.id, ArtifactKind.FILE, "file:///etc/passwd"), ValueError)
@@ -814,7 +836,7 @@ def test_r6_file_scheme_rejected():
 
 def test_r6_git_ref_with_absolute_path_rejected():
     """The old blocklist's local-path semantics fold into the git: form's path segment."""
-    spine = Spine()
+    spine = Spine.in_memory()
     p = spine.create_project("p")
     t = spine.create_task(p.id, "x", created_at=T[0])
     ref = "git:/etc/passwd@" + "c" * 40
@@ -825,7 +847,7 @@ def test_r6_inline_prose_rejected():
     """The case that motivated card 2c97959f: an inline multi-paragraph blob is not a
     path at all, so the OLD blocklist admitted it. The positive allowlist rejects it
     outright since it matches none of the three durable forms."""
-    spine = Spine()
+    spine = Spine.in_memory()
     p = spine.create_project("p")
     t = spine.create_task(p.id, "x", created_at=T[0])
     prose = "Here is the fix:\n\nStep 1. Do the thing.\n\nStep 2. Do another thing.\n"
@@ -834,7 +856,7 @@ def test_r6_inline_prose_rejected():
 
 def test_r6_ref_over_byte_cap_rejected():
     from spine.spine import MAX_ARTIFACT_REF_BYTES
-    spine = Spine()
+    spine = Spine.in_memory()
     p = spine.create_project("p")
     t = spine.create_task(p.id, "x", created_at=T[0])
     ref = "https://example.com/" + ("a" * (MAX_ARTIFACT_REF_BYTES + 1))
@@ -845,7 +867,7 @@ def test_r6_ref_over_byte_cap_rejected():
 def test_r6_ref_at_byte_cap_admitted():
     """Exactly at the cap is still admitted — the cap rejects strictly OVER, not AT."""
     from spine.spine import MAX_ARTIFACT_REF_BYTES
-    spine = Spine()
+    spine = Spine.in_memory()
     p = spine.create_project("p")
     t = spine.create_task(p.id, "x", created_at=T[0])
     prefix = "https://example.com/"
@@ -855,14 +877,14 @@ def test_r6_ref_at_byte_cap_admitted():
 
 
 def test_r6_unc_path_rejected():
-    spine = Spine()
+    spine = Spine.in_memory()
     p = spine.create_project("p")
     t = spine.create_task(p.id, "x", created_at=T[0])
     _assert_raises(lambda: spine.create_artifact(t.id, ArtifactKind.FILE, "\\\\server\\share\\out.py"), ValueError)
 
 
 def test_r6_windows_forward_slash_drive_path_rejected():
-    spine = Spine()
+    spine = Spine.in_memory()
     p = spine.create_project("p")
     t = spine.create_task(p.id, "x", created_at=T[0])
     _assert_raises(lambda: spine.create_artifact(t.id, ArtifactKind.FILE, "C:/output/result.txt"), ValueError)
