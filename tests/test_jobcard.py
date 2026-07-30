@@ -23,22 +23,22 @@ def tmp_db(tmp_path, monkeypatch):
     return db
 
 
-# ── create --state ─────────────────────────────────────────────────────────────
+# ── create --state (card 269144d9 remedy 4: default is created) ────────────────
 
-def test_create_default_state_is_dispatched(tmp_db, capsys):
+def test_create_default_state_is_created(tmp_db, capsys):
     main(["create", "my task"])
     task_id = capsys.readouterr().out.strip()
     with Store(tmp_db) as store:
         task = store.tasks.get(task_id)
-    assert task.state == State.DISPATCHED
+    assert task.state == State.CREATED
 
 
-def test_create_state_created(tmp_db, capsys):
-    main(["create", "--state", "created", "my task"])
+def test_create_explicit_state_dispatched(tmp_db, capsys):
+    main(["create", "--state", "dispatched", "my task"])
     task_id = capsys.readouterr().out.strip()
     with Store(tmp_db) as store:
         task = store.tasks.get(task_id)
-    assert task.state == State.CREATED
+    assert task.state == State.DISPATCHED
 
 
 # ── set-state ──────────────────────────────────────────────────────────────────
@@ -90,7 +90,7 @@ def test_set_state_stale_expected_version_rejected_no_write(tmp_db, capsys):
 
     with Store(tmp_db) as store:
         task = store.tasks.get(task_id)
-    assert task.state == State.DISPATCHED  # unchanged — the write was refused
+    assert task.state == State.CREATED  # unchanged — the write was refused
 
 
 # ── create --project ───────────────────────────────────────────────────────────

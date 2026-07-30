@@ -96,7 +96,7 @@ def cmd_create(
     spine: Spine,
     title: str,
     *,
-    state: str = State.DISPATCHED,
+    state: str = State.CREATED,
     project_arg: Optional[str] = None,
     actor: Optional[str] = None,
     actor_type: str = "agent",
@@ -271,8 +271,8 @@ def main(argv=None) -> int:
     p_create.add_argument(
         "--state",
         choices=list(STATES),
-        default=State.DISPATCHED,
-        help="initial state (default: dispatched)",
+        default=State.CREATED,
+        help="initial state (default: created; anything else requires this flag explicitly)",
     )
     p_create.add_argument(
         "--project",

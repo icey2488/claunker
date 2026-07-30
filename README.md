@@ -73,6 +73,11 @@ even under `force`.
 - **A set tier only moves through `card_retier`.** `card_update` enforces the matching write-once guard, so once a tier is set it cannot be changed off the audited path. The free initial classification (an untiered card getting its first tier) still goes through `card_update`.
 - **The `tier_audit` ledger is append-only.** Each `card_retier` appends one INSERT-only row: `card_id`, `old_tier`, `new_tier`, `reduces_control` (true iff the new tier is lower, weakening oversight), `actor`, `reason`, `ts`. The actor is a placeholder (`client:bearer`) until per-user tokens land. There is no ledger read tool in this version; the record is written now for a later history surface.
 
+## jobcard CLI conventions
+
+- **`create` defaults to `created`.** Any other initial state (`tiered`, `dispatched`, `judged`, `delivered`, `failed`) requires an explicit `--state`.
+- **Finding/radar cards.** A defect, radar item, or other non-job-shaped finding is not work in flight — it lives in `created` until someone actively works it, then moves straight to `delivered` once resolved. `{tiered, dispatched, judged}` describe job-lifecycle stages and simply don't apply to a finding card. This is a CONVENTION over the existing six-state enum, not a new state (the `State` enum in `spine/entity.py` is unchanged; see card `269144d9`).
+
 ## Connecting from Kanbantt
 
 Point Kanbantt's `mcp.url` at `http://<host>:<port>/mcp` (the `/mcp` path is the
