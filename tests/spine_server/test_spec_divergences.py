@@ -15,7 +15,7 @@ CROSS-REFERENCE: every test names its register entry id (``Register #N``); the r
 name their test back (both directions). Entries RESOLVED by the v0.8.0 card-body work have their
 assertions INVERTED here — they now assert the CORRECT behavior, so re-opening the bug goes red too.
 
-Register entry coverage (12 entries):
+Register entry coverage (13 entries):
   * #1  acceptance_criteria extension ............ asserted (round-trips)
   * #2  priority/checklist/attachments ........... INVERTED — RESOLVED v0.8.0 (now round-trips)
   * #3  created_by render gate .................... NOT spine-testable — board-enforced (see note)
@@ -28,10 +28,12 @@ Register entry coverage (12 entries):
   * #10 acceptance_criteria "" default when absent  asserted (gap)
   * #11 description projects null when unset ...... INVERTED — RESOLVED v0.8.0 (real body, not "")
   * #12 unmodeled foreign keys preserved .......... INVERTED — RESOLVED v0.8.0 (round-trips)
-⇒ 11 entries carry an executable assertion; 1 (#3) is declared board-enforced, not faked here.
+  * #13 production storage engine is SQLite ....... asserted (INTENTIONAL & PERMANENT, accepted downgrade)
+⇒ 12 entries carry an executable assertion; 1 (#3) is declared board-enforced, not faked here.
 """
 
 import os
+import sqlite3
 import sys
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
@@ -40,8 +42,10 @@ import anyio  # noqa: E402
 from mcp.shared.memory import create_connected_server_and_client_session as connect  # noqa: E402
 
 from spine import Spine, Store  # noqa: E402
+from spine.entity import Project  # noqa: E402
+from spine.storage import DB_PATH  # noqa: E402
 from spine_server.cards import list_cards  # noqa: E402
-from spine_server.config import ServerConfig  # noqa: E402
+from spine_server.config import ServerConfig, from_env  # noqa: E402
 from spine_server.server import CARD_CREATE_ACTOR, build_server  # noqa: E402
 from tests.spine_server._util import BIG, cleanup, make_temp_db, seed  # noqa: E402
 
@@ -266,3 +270,69 @@ def test_divergence_12_unmodeled_foreign_keys_are_preserved():
         assert sc["card"]["x_custom_priority"] == {"weight": 7}
     finally:
         cleanup(directory)
+
+
+# ── #13 · production spine storage is SQLite, not the ratified Drive-durable-blob ───────
+# INTENTIONAL & PERMANENT (accepted downgrade). See claunker-ops docs/SPEC-DIVERGENCES.md
+# entry #13. Unlike #1-#12 (wire-protocol shape, asserted via a card round-trip), this is a
+# storage-backend fact one layer below the wire — asserted on real code, not a config-string
+# tautology: the production ``Store`` opens a real ``sqlite3.Connection`` against an on-disk
+# file (proven via ``PRAGMA integrity_check`` + WAL mode, not just "the path string looks
+# like a .db file"), and the production entrypoint (``from_env`` with no ``CLAUNKER_SPINE_DB``
+# override) resolves ``ServerConfig.db_path`` to that same on-disk ``spine.db`` path. Goes RED
+# if the backend is swapped for something that isn't a real sqlite3 file connection, or if the
+# entrypoint's default wiring stops pointing at the on-disk path — either change must revisit
+# Register #13.
+def test_divergence_13_production_store_is_a_real_sqlite3_file_backend():
+    """Register #13. The production ``Store`` is sqlite3-backed against a real on-disk file:
+    ``store._conn`` is an actual ``sqlite3.Connection`` (not a stand-in), WAL mode is engaged
+    (a real SQLite pragma, not a string label), and the file exists on disk with content a
+    fresh ``sqlite3.connect`` + ``PRAGMA integrity_check`` can read back as ``ok``. Goes RED if
+    the storage engine is swapped for a non-sqlite3 backend."""
+    directory, path = make_temp_db()
+    try:
+        store = Store(path)
+        try:
+            assert isinstance(store._conn, sqlite3.Connection)
+            journal_mode = store._conn.execute("PRAGMA journal_mode").fetchone()[0]
+            assert journal_mode.lower() == "wal"
+            store.projects.put(Project(id="p1", name="probe"))
+        finally:
+            store.close()
+
+        assert os.path.exists(path) and os.path.getsize(path) > 0
+        raw = sqlite3.connect(path)
+        try:
+            assert raw.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+            row = raw.execute("SELECT data FROM projects WHERE id = ?", ("p1",)).fetchone()
+            assert row is not None  # the write really landed in the sqlite file, not just in-process state
+        finally:
+            raw.close()
+    finally:
+        cleanup(directory)
+
+
+def test_divergence_13_production_entrypoint_resolves_db_path_to_the_on_disk_spine_db():
+    """Register #13. The production entrypoint's default wiring (``from_env`` with no
+    ``CLAUNKER_SPINE_DB`` override) constructs ``ServerConfig.db_path`` against the real
+    on-disk ``spine/spine.db`` path (``spine.storage.DB_PATH``) — not ``:memory:``, not a
+    Drive-blob reference. Goes RED if the entrypoint's default stops pointing at that file."""
+    had_override = "CLAUNKER_SPINE_DB" in os.environ
+    saved = os.environ.pop("CLAUNKER_SPINE_DB", None)
+    saved_token = os.environ.pop("CLAUNKER_SPINE_TOKEN", None)
+    try:
+        os.environ["CLAUNKER_SPINE_TOKEN"] = "probe-token"
+        config = from_env()
+        assert config.db_path == DB_PATH
+        assert DB_PATH != ":memory:"
+        assert os.path.basename(DB_PATH) == "spine.db"
+        assert os.path.dirname(DB_PATH) == os.path.dirname(os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", "..", "spine", "storage.py")
+        ))
+    finally:
+        if had_override:
+            os.environ["CLAUNKER_SPINE_DB"] = saved
+        if saved_token is not None:
+            os.environ["CLAUNKER_SPINE_TOKEN"] = saved_token
+        else:
+            os.environ.pop("CLAUNKER_SPINE_TOKEN", None)
