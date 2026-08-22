@@ -76,6 +76,28 @@ ARCHIVE_AUDIT_TABLE = "archive_audit"
 EDIT_AUDIT_TABLE = "edit_audit"
 
 
+def _max_entity_seq(blob: Dict[str, Any]) -> int:
+    """The highest ``seq`` prefix among a dump envelope's entity version tokens
+    (``{seq}:{content_hash}`` — ``version.py``). Parsed here ONLY to take a max
+    when restoring the monotonic counter on ``load()`` (storage doc §5); the
+    token itself stays opaque everywhere else (equality-only, never ordered).
+    A missing/malformed token contributes 0, never raises — an entity from
+    before the version scheme, or a foreign-server round trip, must not crash
+    a load."""
+    max_seq = 0
+    for table in TABLES:
+        for entity_blob in blob.get(table, []) or []:
+            token = entity_blob.get("version") if isinstance(entity_blob, dict) else None
+            if not isinstance(token, str) or ":" not in token:
+                continue
+            head = token.split(":", 1)[0]
+            try:
+                max_seq = max(max_seq, int(head))
+            except ValueError:
+                continue
+    return max_seq
+
+
 def utcnow_iso() -> str:
     """ISO-8601 UTC timestamp. Timestamps are display/audit metadata only — never a
     sync or ordering primitive (``seq`` orders changes; ``order`` orders the board)."""
@@ -313,12 +335,24 @@ class Store:
 
     def load(self, blob: Dict[str, Any]) -> None:
         """Write a dumped envelope back, preserving each blob's stored version
-        token (raw INSERT OR REPLACE — NOT a re-stamping put) and restoring ``seq``."""
-        self.seq = blob.get("seq", self.seq)
+        token (raw INSERT OR REPLACE — NOT a re-stamping put).
+
+        ``seq`` is RECOMPUTED as ``max(entity seq)`` over the loaded version
+        tokens (storage doc §5: "recompute seq = max(entity seq) + 1 on open" —
+        the "+1" there is the NEXT seq a following ``put`` will mint; ``self.seq``
+        itself holds the LAST-USED value, matching ``_next_seq``'s pre-increment
+        convention, so restoring it to the bare max keeps that invariant intact).
+        Never trusted verbatim from the blob's own top-level ``seq`` field: a
+        merged blob (sync-merge's ``mergeBlobs`` carries ``seq`` through as a
+        plain tie-broken field, unaware of the store's version-token scheme)
+        could otherwise regress the monotonic clock below tokens already minted
+        locally. ``max()`` against the current in-memory ``seq`` is the same
+        regression guard for a load onto an already-active store."""
         for table in TABLES:
             for entity_blob in blob.get(table, []):
                 self._conn.execute(
                     f"INSERT OR REPLACE INTO {table} (id, data) VALUES (?, ?)",
                     (entity_blob["id"], json.dumps(entity_blob, default=str)),
                 )
+        self.seq = max(self.seq, _max_entity_seq(blob))
         self._conn.commit()

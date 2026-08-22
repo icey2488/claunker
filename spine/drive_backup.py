@@ -32,7 +32,7 @@ import sqlite3
 import threading
 import time
 import uuid
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 log = logging.getLogger(__name__)
@@ -172,117 +172,53 @@ def _validate_restore_blob(blob: bytes) -> Tuple[bytes, Dict[str, Any]]:
 
 
 # ── Drive helpers ─────────────────────────────────────────────────────────────
+# Thin, name-preserving wrappers over spine/drive_common.py — the shared auth/
+# folder/blob mechanics factored out so drive_sync.py does not duplicate them.
+# Behavior and call signatures are UNCHANGED from before the extraction; every
+# name below is still patchable at ``spine.drive_backup.<name>`` exactly as
+# before (tests patch these directly).
+
+from . import drive_common as _dc
+
 
 def _build_drive_service(key_path: str):
-    from google.oauth2 import service_account
-    from googleapiclient.discovery import build
-
-    creds = service_account.Credentials.from_service_account_file(
-        key_path, scopes=[DRIVE_SCOPE]
-    )
-    return build("drive", "v3", credentials=creds)
+    return _dc.build_drive_service(key_path)
 
 
 def _find_or_create_folder(drive) -> str:
-    results = (
-        drive.files()
-        .list(
-            q=(
-                f"name='{DRIVE_FOLDER_NAME}' and "
-                "mimeType='application/vnd.google-apps.folder' and trashed=false"
-            ),
-            fields="files(id)",
-        )
-        .execute()
-    )
-    folders = results.get("files", [])
-    if folders:
-        return folders[0]["id"]
-    meta = {
-        "name": DRIVE_FOLDER_NAME,
-        "mimeType": "application/vnd.google-apps.folder",
-    }
-    folder = drive.files().create(body=meta, fields="id").execute()
-    return folder["id"]
+    return _dc.find_or_create_folder(drive, DRIVE_FOLDER_NAME)
 
 
 def _find_active_blob_id(drive, folder_id: str) -> Optional[str]:
     """Find the active blob by name. Raises RuntimeError on split-brain (2+ copies)."""
-    results = (
-        drive.files()
-        .list(
-            q=(
-                f"name='{ACTIVE_BLOB_NAME}' and "
-                f"'{folder_id}' in parents and trashed=false"
-            ),
-            fields="files(id)",
-        )
-        .execute()
-    )
-    files = results.get("files", [])
-    if len(files) >= 2:
+    try:
+        return _dc.find_blob_id(drive, folder_id, ACTIVE_BLOB_NAME)
+    except RuntimeError:
         raise RuntimeError(
-            f"drive_backup: SPLIT-BRAIN HALT — found {len(files)} copies of "
+            f"drive_backup: SPLIT-BRAIN HALT — found 2+ copies of "
             f"{ACTIVE_BLOB_NAME!r} in {DRIVE_FOLDER_NAME!r}; "
             "manual deduplication required before backup can resume"
         )
-    return files[0]["id"] if files else None
 
 
 def _upload_blob(drive, folder_id: str, name: str, blob: bytes, existing_id: Optional[str] = None) -> str:
-    from googleapiclient.http import MediaInMemoryUpload
-
-    media = MediaInMemoryUpload(blob, mimetype="application/gzip", resumable=False)
-    if existing_id:
-        result = (
-            drive.files()
-            .update(fileId=existing_id, media_body=media, fields="id")
-            .execute()
-        )
-    else:
-        file_meta = {"name": name, "parents": [folder_id]}
-        result = (
-            drive.files()
-            .create(body=file_meta, media_body=media, fields="id")
-            .execute()
-        )
-    return result["id"]
+    return _dc.upload_blob(drive, folder_id, name, blob, existing_id)
 
 
 def _download_blob(drive, file_id: str) -> bytes:
-    import io
-    from googleapiclient.http import MediaIoBaseDownload
-
-    request = drive.files().get_media(fileId=file_id)
-    buf = io.BytesIO()
-    dl = MediaIoBaseDownload(buf, request)
-    done = False
-    while not done:
-        _, done = dl.next_chunk()
-    return buf.getvalue()
+    return _dc.download_blob(drive, file_id)
 
 
 def _prune_old_snapshots(drive, folder_id: str) -> None:
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=SNAPSHOT_RETENTION_DAYS)).strftime("%Y-%m-%d")
-    results = (
-        drive.files()
-        .list(
-            q=f"'{folder_id}' in parents and trashed=false",
-            fields="files(id, name)",
-        )
-        .execute()
+    _dc.prune_old_snapshots(
+        drive,
+        folder_id,
+        active_blob_name=ACTIVE_BLOB_NAME,
+        snapshot_prefix=SNAPSHOT_PREFIX,
+        snapshot_suffix=SNAPSHOT_SUFFIX,
+        retention_days=SNAPSHOT_RETENTION_DAYS,
+        log=log,
     )
-    for f in results.get("files", []):
-        name = f["name"]
-        if not (name.startswith(SNAPSHOT_PREFIX) and name.endswith(SNAPSHOT_SUFFIX) and name != ACTIVE_BLOB_NAME):
-            continue
-        date_part = name[len(SNAPSHOT_PREFIX): -len(SNAPSHOT_SUFFIX)]
-        if len(date_part) == 10 and date_part < cutoff:
-            try:
-                drive.files().delete(fileId=f["id"]).execute()
-                log.info("drive_backup: pruned old snapshot %s", name)
-            except Exception as exc:
-                log.warning("drive_backup: failed to prune %s: %s", name, exc)
 
 
 # ── restore (standalone, gated) ────────────────────────────────────────────────
