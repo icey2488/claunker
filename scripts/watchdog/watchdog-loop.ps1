@@ -11,7 +11,7 @@
 # read the icacls-locked .env.spine-token. Tradeoff declined; the operator logs
 # in on boot.
 
-$ROOT         = "C:\Users\Raide\code\claunker-hermes"
+$ROOT         = "D:\code\claunker-hermes"
 $PYTHON       = "$ROOT\.venv\Scripts\python.exe"
 $RELAUNCH     = "$ROOT\logs\_relaunch_spine.py"
 $URL          = "http://127.0.0.1:8848/mcp"

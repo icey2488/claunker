@@ -33,9 +33,9 @@
   </Triggers>
   <Actions Context="Author">
     <Exec>
-      <Command>C:\Users\Raide\code\claunker-hermes\.venv\Scripts\python.exe</Command>
-      <Arguments>"C:\Users\Raide\code\claunker-hermes\logs\_watchdog_spine.py"</Arguments>
-      <WorkingDirectory>C:\Users\Raide\code\claunker-hermes</WorkingDirectory>
+      <Command>D:\code\claunker-hermes\.venv\Scripts\python.exe</Command>
+      <Arguments>"D:\code\claunker-hermes\logs\_watchdog_spine.py"</Arguments>
+      <WorkingDirectory>D:\code\claunker-hermes</WorkingDirectory>
     </Exec>
   </Actions>
 </Task>

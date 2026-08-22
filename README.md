@@ -92,7 +92,7 @@ is the wire contract this server implements, kept in sync with Kanbantt's canoni
 uv run pytest
 ```
 
-Expect 115 passing tests. `pytest` is a dev dependency (`[dependency-groups] dev`), so
+Expect 350 passed, 1 skipped (Python 3.12, mcp==1.28.1). `pytest` is a dev dependency (`[dependency-groups] dev`), so
 `uv sync` installs it and no `--with` injection is needed.
 `[tool.pytest.ini_options] testpaths = ["tests"]` scopes collection to the suite, so a
 bare `pytest` from the repo root collects cleanly too.
