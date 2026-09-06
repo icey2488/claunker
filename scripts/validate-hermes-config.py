@@ -1,7 +1,8 @@
 """FT-013: Hermes gateway config validator.
 
-Parses the live Hermes config (%LOCALAPPDATA%/hermes/config.yaml) and enforces
-the plugin LLM block pairing invariant:
+Parses the live Hermes config (HERMES_HOME/config.yaml, falling back to
+%LOCALAPPDATA%/hermes/config.yaml) and enforces the plugin LLM block pairing
+invariant:
 
   allow_model_override: true    requires allowed_models key PRESENT and non-null
   allow_provider_override: true requires allowed_providers key PRESENT and non-null
@@ -27,9 +28,12 @@ except ImportError:
 
 
 def _default_config_path() -> str:
+    hermes_home = os.environ.get("HERMES_HOME", "")
+    if hermes_home:
+        return os.path.join(hermes_home, "config.yaml")
     localappdata = os.environ.get("LOCALAPPDATA", "")
     if not localappdata:
-        sys.exit("FATAL: LOCALAPPDATA environment variable not set")
+        sys.exit("FATAL: neither HERMES_HOME nor LOCALAPPDATA environment variable is set")
     return os.path.join(localappdata, "hermes", "config.yaml")
 
 
