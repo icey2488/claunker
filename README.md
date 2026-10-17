@@ -67,6 +67,12 @@ client reconciles without an extra round trip. Tombstones are immutable: any upd
 move, or delete targeting one returns `conflict` (with the tombstone in `meta.current`),
 even under `force`.
 
+The version counter behind those tokens is durable and monotonic across server restarts
+and across the fresh per-request store connections (a persisted high-water mark, bumped
+inside each write transaction), and the store performs a compare-and-swap on write, so a
+stale write can neither coincide with a reverted-content token nor overwrite a concurrent
+change — it is rejected as a `conflict`. See `docs/claunker-spine-storage-ratified.md` §5.
+
 ## Governance notes
 
 - **Tier lives in tags.** A card's tier is the `tier:N` tag in its `tags` array, not a native Card field. The board declares one tag per tier, and the projection emits `tier:N` for a tiered task.

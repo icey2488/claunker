@@ -75,6 +75,16 @@ Even a single-authority server doing read-modify-write-flush needs **write seria
 
 ---
 
-## 5. Known item — in-memory `seq`
+## 5. Persisted `seq` high-water mark + write-time CAS (amended 2026-10-16)
 
-v1 keeps `seq` in memory; it resets to 0 on a raw `.db` reopen. This is harmless: versions are opaque, compared for equality only, and content-hashed, so a reset `seq` cannot cause a false equality or a misorder that any consumer can observe. When the sync-merge layer lands, recompute `seq = max(entity seq) + 1` on open, before the merge layer runs, so the monotonic clock is restored from the stored tokens.
+**Superseded premise.** An earlier version of this section held that keeping `seq` in memory — resetting it to 0 on every raw `.db` reopen — was *harmless* because versions are opaque, equality-only, and content-hashed. That was **wrong**, and read-only repro job `claunker.spine-aba-verify-20261016-syjhcgcm` proved it.
+
+**The finding (ABA hazard).** Every writer opens a *fresh* `Store` per call (`with Store(config.db_path) as store:`), so the in-memory `seq` restarted at 1 on each open. The content hash covers the entity content minus the `version` field, and a `Task` carries no per-write timestamp, so reverting content A→B→A re-minted the **identical** token — the first and third tokens were byte-for-byte equal (in the repro, `1:a641b109ad0c61c4`). Because the tokens coincided, a stale writer whose `expected_version` matched the earlier token was **accepted**: a silent lost update. With 97% of live tasks carrying `seq=1` tokens, the collision surface was broad.
+
+**The fix — two layers.**
+
+1. **Persisted high-water mark.** A `meta(key TEXT PRIMARY KEY, value TEXT)` table holds one row under key `seq_hwm`. It is seeded **once** from the maximum `seq` prefix across all stored entity tokens (reusing `_max_entity_seq`, capped at 2⁶³−1), then every mint increments it **inside the write transaction** (`BEGIN IMMEDIATE`, so writers serialize on the reserved lock). `seq` is therefore monotonic *across processes*, and a reverted content can never reproduce an earlier token. `Store.load()` still recomputes `seq = max(entity seq)` as a backstop and advances the persisted HWM too (it never regresses below what is stored).
+
+2. **Write-time compare-and-swap.** The guarded card-write paths thread their `expected_version` down to the store, which writes with `UPDATE … WHERE id=? AND json_extract(data,'$.version')=?`. A zero-row result means a concurrent writer moved the token between the caller's read (a *separate* autocommit transaction) and this write; the whole transaction rolls back and the existing `ConflictError` is raised carrying the fresh row.
+
+Both layers exist on purpose and cover different failures: the HWM prevents **identical tokens** on a content revert; the CAS prevents a **lost update** between two concurrent writers that read the same version. The token format `{seq}:{hash}` is **unchanged**, so clients are unaffected.

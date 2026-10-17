@@ -40,6 +40,8 @@ Escalation  { id, version, deleted_at, task_id, reason, control_diff,
 
 **`Escalation.control_diff`** is `{ control_id, old_value, new_value, reduces_control } | null` — `null` when the escalation proposes no control change. `reduces_control` flags a change that *weakens* a guardrail; it is the field an approval queue prioritizes on.
 
+**`version` — producer vs. consumer (clarified 2026-10-16).** The token stays opaque *to consumers*: they compare it for equality only and never parse or order it. The one exception is the **minting authority** — the store that produced the token may read the `seq` prefix of tokens *it* minted to seed or restore its own monotonic counter (see storage doc §5: the persisted `seq_hwm`). This producer-side read is not a consumer contract, and the `{seq}:{hash}` shape remains an implementation detail.
+
 ---
 
 ## 2. State enum (AMENDED)
