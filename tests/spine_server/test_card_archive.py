@@ -189,7 +189,7 @@ def test_forced_put_failure_leaves_no_audit_row_and_no_state_change():
         try:
             # Force a failure BETWEEN append_archive_audit(commit=False) and the put:
             # the staged ledger insert must die with the transaction, never commit alone.
-            def boom(entity):
+            def boom(entity, **_kwargs):  # accept put's expect= CAS kwarg
                 raise RuntimeError("forced put failure")
             spine.store.tasks.put = boom
             assert_raises(

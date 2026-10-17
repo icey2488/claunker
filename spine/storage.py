@@ -75,6 +75,23 @@ ARCHIVE_AUDIT_TABLE = "archive_audit"
 # tool reads it (record-now-render-later, v1).
 EDIT_AUDIT_TABLE = "edit_audit"
 
+# The PERSISTED monotonic-seq home (fix/spine-seq-hwm-cas, 2026-10-16). A tiny
+# key/value side table holding one row: the seq HIGH-WATER MARK. Before this, the
+# seq counter lived only in memory and ``Store.__init__`` reset it to 0 on every
+# open — and since every writer opens a fresh Store per call (``with Store(...)``),
+# a content revert A→B→A re-minted the IDENTICAL token (seq restarted at 1 each
+# time), so a stale writer's ``expected_version`` could coincide with a later,
+# numerically-equal token and its lost-update slipped through (the ABA hazard the
+# read-only repro job claunker.spine-aba-verify-20261016-syjhcgcm proved). Seeding
+# the HWM from the max existing token prefix and incrementing it inside the write
+# transaction makes seq monotonic ACROSS processes, so tokens never repeat.
+META_TABLE = "meta"
+SEQ_HWM_KEY = "seq_hwm"
+
+# SQLite stores signed 64-bit integers; cap the seeded HWM at the ceiling so a
+# malformed/huge token prefix can never seed an un-representable value.
+_SEQ_MAX = (1 << 63) - 1
+
 
 def _max_entity_seq(blob: Dict[str, Any]) -> int:
     """The highest ``seq`` prefix among a dump envelope's entity version tokens
@@ -92,7 +109,7 @@ def _max_entity_seq(blob: Dict[str, Any]) -> int:
                 continue
             head = token.split(":", 1)[0]
             try:
-                max_seq = max(max_seq, int(head))
+                max_seq = max(max_seq, min(int(head), _SEQ_MAX))
             except ValueError:
                 continue
     return max_seq
@@ -146,15 +163,62 @@ class EntityStore:
         return [e for e in self.list_all() if getattr(e, "deleted_at", None) is None]
 
     # ── writes ───────────────────────────────────────────────────────────────
-    def put(self, entity: _Entity) -> _Entity:
-        """INSERT OR REPLACE the entity, stamping a fresh version token first. The
-        bumped ``seq`` guarantees the token changes on every put; the content hash
-        makes it content-addressable. Returns the (now-versioned) entity."""
-        entity.version = make_version(self._store._next_seq(), entity.content())  # type: ignore[attr-defined]
-        self._conn.execute(
-            f"INSERT OR REPLACE INTO {self._table} (id, data) VALUES (?, ?)",
-            (entity.id, json.dumps(entity.to_dict(), default=str)),  # type: ignore[attr-defined]
-        )
+    def put(self, entity: _Entity, *, expect: Optional[str] = None) -> _Entity:
+        """Write the entity, stamping a fresh version token first. Returns the
+        (now-versioned) entity.
+
+        The token is minted from the store's PERSISTED, monotonic seq high-water
+        mark (``_store._next_seq`` — a read-modify-write of the ``meta`` table that
+        auto-begins ``BEGIN IMMEDIATE``), so it strictly increases on every put even
+        across the separate processes that each open their own ``Store`` per call,
+        and a content revert A→B→A can NEVER reproduce an earlier token. That closes
+        the ABA hazard: a stale writer's ``expected_version`` can no longer coincide
+        with a later, numerically-equal token.
+
+        ``expect`` is the optimistic-concurrency COMPARE-AND-SWAP value — the version
+        token the caller believes the row currently carries, threaded from the
+        guarded card-write paths. When supplied, the write is a CAS:
+        ``UPDATE ... WHERE id=? AND json_extract(data,'$.version')=expect``. If no row
+        matches — another writer moved the token between the caller's read and this
+        write, a TOCTOU window the application-level ``_guard_mutable`` check cannot
+        close because its read ran in a SEPARATE (autocommit) transaction — the whole
+        transaction is rolled back (discarding the HWM bump and any staged audit rows)
+        and ``ConflictError`` is raised carrying the fresh row. When ``expect`` is
+        None the write keeps the original last-write-wins ``INSERT OR REPLACE``
+        semantics, so creates, forced writes, and the internal
+        (``expected_version``-less) callers are UNCHANGED.
+
+        Both guards exist on purpose and cover different failures: the persisted HWM
+        prevents identical tokens on a content revert; the CAS prevents a lost update
+        between two concurrent writers that happened to read the same version."""
+        new_seq = self._store._next_seq()  # auto-begins BEGIN IMMEDIATE; holds the write lock
+        entity.version = make_version(new_seq, entity.content())  # type: ignore[attr-defined]
+        blob = json.dumps(entity.to_dict(), default=str)  # type: ignore[attr-defined]
+        if expect is None:
+            self._conn.execute(
+                f"INSERT OR REPLACE INTO {self._table} (id, data) VALUES (?, ?)",
+                (entity.id, blob),  # type: ignore[attr-defined]
+            )
+        else:
+            cur = self._conn.execute(
+                f"UPDATE {self._table} SET data = ? "
+                f"WHERE id = ? AND json_extract(data, '$.version') = ?",
+                (blob, entity.id, expect),  # type: ignore[attr-defined]
+            )
+            if cur.rowcount == 0:
+                self._conn.rollback()  # discard the HWM bump + any audit rows staged in this txn
+                # Re-sync the in-memory seq to the rolled-back persisted HWM so dump()
+                # never reports a seq the DB did not actually mint.
+                hwm = self._conn.execute(
+                    f"SELECT value FROM {META_TABLE} WHERE key = ?", (SEQ_HWM_KEY,)
+                ).fetchone()
+                if hwm is not None:
+                    self._store.seq = int(hwm[0])
+                from .spine import ConflictError  # local import: avoids a storage<->spine cycle
+                current = self.get(entity.id)  # type: ignore[attr-defined]
+                if current is None:  # row vanished entirely — no hard-delete path exists today
+                    raise KeyError(f"{self._table[:-1]} {entity.id!r} does not exist")  # type: ignore[attr-defined]
+                raise ConflictError(current)
         self._conn.commit()
         return entity
 
@@ -181,6 +245,13 @@ class Store:
 
     def __init__(self, path: str) -> None:
         self._conn = sqlite3.connect(path)
+        # BEGIN IMMEDIATE before every write transaction (the first DML statement
+        # auto-begins it): writers acquire the reserved lock up front and SERIALIZE,
+        # so the persisted seq HWM read-modify-write (``_next_seq``) and the entity
+        # compare-and-swap (``EntityStore.put``) are atomic across the separate
+        # processes that each open their own Store. Plain reads (SELECT) stay in
+        # autocommit and never take the lock, so read tools are unaffected.
+        self._conn.isolation_level = "IMMEDIATE"
         self._conn.execute("PRAGMA journal_mode=WAL")  # no-op ('memory') on :memory:
         for table in TABLES:
             self._conn.execute(
@@ -202,20 +273,77 @@ class Store:
         self._conn.execute(
             f"CREATE TABLE IF NOT EXISTS {EDIT_AUDIT_TABLE} (id TEXT PRIMARY KEY, data TEXT NOT NULL)"
         )
+        # The PERSISTED seq high-water mark (fix/spine-seq-hwm-cas, 2026-10-16). One
+        # key/value row survives across opens so the monotonic counter is no longer
+        # reset to 0 on every fresh Store — see ``_seed_and_load_seq_hwm`` and the
+        # ``META_TABLE`` note above.
+        self._conn.execute(
+            f"CREATE TABLE IF NOT EXISTS {META_TABLE} (key TEXT PRIMARY KEY, value TEXT)"
+        )
         self._conn.commit()
 
         # Monotonic change counter — the version-token prefix and the merge clock.
-        # In-memory (fresh open starts at 0); carried across the sync seam by
-        # dump()/load(), not by the raw .db file (see module docstring).
-        self.seq = 0
+        # Loaded from the PERSISTED high-water mark (seeded once from the max existing
+        # token prefix), so it is monotonic across processes rather than restarting at
+        # 0 on each open. ``self.seq`` holds the LAST-USED value (``_next_seq``
+        # pre-increments). Still carried across the sync seam by dump()/load() too.
+        self.seq = self._seed_and_load_seq_hwm()
 
         self.projects = EntityStore(self, "projects", Project.from_dict)
         self.tasks = EntityStore(self, "tasks", Task.from_dict)
         self.artifacts = EntityStore(self, "artifacts", Artifact.from_dict)
         self.escalations = EntityStore(self, "escalations", Escalation.from_dict)
 
+    def _seed_and_load_seq_hwm(self) -> int:
+        """Load the persisted seq high-water mark, seeding it ONCE on first sight.
+
+        A DB that predates this table has no ``seq_hwm`` row: seed it from the max
+        seq prefix across every entity token currently stored (so a legacy board
+        full of ``1:...`` tokens — like production, where 97% of tasks carry seq=1 —
+        restores the counter to its TRUE maximum, not 0), capped at the SQLite
+        INTEGER ceiling. A DB that already has the row just loads it. Returns the
+        LAST-USED seq (the HWM; ``_next_seq`` pre-increments)."""
+        row = self._conn.execute(
+            f"SELECT value FROM {META_TABLE} WHERE key = ?", (SEQ_HWM_KEY,)
+        ).fetchone()
+        if row is not None:
+            return int(row[0])
+        seed = min(self._max_table_seq(), _SEQ_MAX)
+        self._conn.execute(
+            f"INSERT OR REPLACE INTO {META_TABLE} (key, value) VALUES (?, ?)",
+            (SEQ_HWM_KEY, str(seed)),
+        )
+        self._conn.commit()
+        return seed
+
+    def _max_table_seq(self) -> int:
+        """Max seq prefix over the version tokens currently in the entity tables —
+        the live-DB analogue of ``_max_entity_seq`` (which reads a dump envelope),
+        used to seed the persisted HWM. Shapes the stored rows into the same
+        envelope so the one parsing helper is reused (and inherits its cap and its
+        tolerance of missing/malformed tokens)."""
+        blob: Dict[str, Any] = {}
+        for table in TABLES:
+            rows = self._conn.execute(f"SELECT data FROM {table}").fetchall()
+            blob[table] = [json.loads(r[0]) for r in rows]
+        return _max_entity_seq(blob)
+
     def _next_seq(self) -> int:
-        self.seq += 1
+        """Mint the next monotonic seq by incrementing the PERSISTED high-water mark
+        under the write lock. The ``UPDATE`` auto-begins ``BEGIN IMMEDIATE`` (the
+        connection's isolation level), so concurrent writers — each opening their own
+        Store — serialize here and every mint reads a value no other writer has used;
+        this is what makes seq monotonic across processes. Called from
+        ``EntityStore.put`` so the HWM bump, the version mint, and the entity write
+        all land in ONE immediate transaction (and roll back together on a CAS miss)."""
+        self._conn.execute(
+            f"UPDATE {META_TABLE} SET value = CAST(value AS INTEGER) + 1 WHERE key = ?",
+            (SEQ_HWM_KEY,),
+        )
+        row = self._conn.execute(
+            f"SELECT value FROM {META_TABLE} WHERE key = ?", (SEQ_HWM_KEY,)
+        ).fetchone()
+        self.seq = int(row[0])
         return self.seq
 
     @classmethod
@@ -355,4 +483,16 @@ class Store:
                     (entity_blob["id"], json.dumps(entity_blob, default=str)),
                 )
         self.seq = max(self.seq, _max_entity_seq(blob))
+        # BACKSTOP: advance the persisted HWM to the recomputed seq so a load that
+        # carries tokens minted higher than our counter (a replica merge, a restore)
+        # can never let a subsequent mint collide with a token already in the DB. The
+        # persisted HWM only ever moves forward — never regress it below what is stored.
+        persisted = self._conn.execute(
+            f"SELECT value FROM {META_TABLE} WHERE key = ?", (SEQ_HWM_KEY,)
+        ).fetchone()
+        if persisted is None or self.seq > int(persisted[0]):
+            self._conn.execute(
+                f"INSERT OR REPLACE INTO {META_TABLE} (key, value) VALUES (?, ?)",
+                (SEQ_HWM_KEY, str(self.seq)),
+            )
         self._conn.commit()

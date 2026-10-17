@@ -318,7 +318,7 @@ class Spine:
             raise ValueError(f"unknown task state {state!r}")
         task = self._guard_mutable(task_id, expected_version=expected_version, force=force)
         task.state = state
-        return self.store.tasks.put(task)
+        return self.store.tasks.put(task, expect=self._cas_expect(expected_version, force))
 
     def assign_tier(self, task_id: str, tier: int) -> Task:
         task = self._require_task(task_id)
@@ -511,7 +511,7 @@ class Spine:
                 "ts": now,
             }, commit=False)
 
-        return self.store.tasks.put(task)
+        return self.store.tasks.put(task, expect=self._cas_expect(expected_version, force))
 
     def move_task(
         self,
@@ -538,7 +538,7 @@ class Spine:
         task.state = to_state
         if order is not None:
             task.order = order
-        return self.store.tasks.put(task)
+        return self.store.tasks.put(task, expect=self._cas_expect(expected_version, force))
 
     def soft_delete_task(self, task_id: str, *, expected_version: Optional[str] = None) -> Task:
         """Tombstone a task (soft delete): stamp ``deleted_at`` and re-put, so the row
@@ -568,7 +568,7 @@ class Spine:
             "actor": EDIT_ACTOR,
             "ts": now,
         }, commit=False)
-        return self.store.tasks.put(task)
+        return self.store.tasks.put(task, expect=self._cas_expect(expected_version))
 
     # ── governed re-tier (audited control) ─────────────────────────────────────
     def retier_task(
@@ -640,7 +640,7 @@ class Spine:
         # ONE transaction — the audit row can never diverge from the tier it records.
         self.store.append_tier_audit(audit_row, commit=False)
         task.tier = new_tier
-        return self.store.tasks.put(task)
+        return self.store.tasks.put(task, expect=self._cas_expect(expected_version))
 
     # ── governed archive / unarchive (audited controls) ────────────────────────
     def archive_task(
@@ -706,7 +706,7 @@ class Spine:
         # in ONE transaction — mirroring retier_task's idiom precisely.
         self.store.append_archive_audit(audit_row, commit=False)
         task.archived_at = utcnow_iso()
-        return self.store.tasks.put(task)
+        return self.store.tasks.put(task, expect=self._cas_expect(expected_version))
 
     def unarchive_task(
         self,
@@ -745,7 +745,7 @@ class Spine:
         }
         self.store.append_archive_audit(audit_row, commit=False)
         task.archived_at = None
-        return self.store.tasks.put(task)
+        return self.store.tasks.put(task, expect=self._cas_expect(expected_version))
 
     def _has_open_escalation(self, task_id: str) -> bool:
         """True iff the task has a live, unresolved Escalation — the archive gate's
@@ -893,6 +893,20 @@ class Spine:
         if not force and expected_version is not None and task.version != expected_version:
             raise ConflictError(task)  # optimistic-concurrency mismatch
         return task
+
+    @staticmethod
+    def _cas_expect(expected_version: Optional[str], force: bool = False) -> Optional[str]:
+        """The compare-and-swap token to hand ``EntityStore.put`` for a guarded write.
+
+        ``_guard_mutable`` compares the version in Python, but its SELECT ran in a
+        SEPARATE (autocommit) transaction, so a concurrent writer can still move the
+        token before the put commits. Handing the same ``expected_version`` back to
+        put as its CAS value closes that window atomically (put rolls back + raises
+        ``ConflictError`` on a miss). Returns None — selecting put's unchanged
+        last-write-wins path — when no optimistic check applies: a ``force`` overwrite
+        or the internal/test caller that supplied no ``expected_version`` (exactly the
+        two cases ``_guard_mutable`` already skips), so their semantics are preserved."""
+        return None if (force or expected_version is None) else expected_version
 
     def _require_live_parent(self, task_id: str) -> Task:
         """MI-1 gate: the parent task must exist and not be tombstoned."""
