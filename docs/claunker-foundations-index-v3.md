@@ -55,6 +55,15 @@
 
 ---
 
+## Reconciliation records
+
+Dated reconciliation records (per `claunker-amendment-governance.md` §2), newest first:
+
+- **2026-10-16** — [`claunker-spine-reconciliation-2026-10-16.md`](claunker-spine-reconciliation-2026-10-16.md): the seq ABA lost-update hazard — a "ratified-harmless" premise (in-memory `seq` reset) proven false; persisted seq high-water mark + write-time CAS (commits `6bf0040`/`ec0142e`). MATERIAL.
+- **2026-06-28** — [`claunker-spine-reconciliation-2026-06-28.md`](claunker-spine-reconciliation-2026-06-28.md): the five build-vs-ratified-doc divergences (persistence, entity model, lifecycle states, column render, escalation render) that founded this governance practice.
+
+---
+
 ## Terminology (resolved in Document 00)
 
 The brand stays whole; the architecture gained a named substrate. Disambiguate only when it matters:

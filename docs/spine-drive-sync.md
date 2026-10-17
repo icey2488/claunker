@@ -111,6 +111,21 @@ could hand the local store a `seq` lower than tokens it already minted,
 producing colliding version tokens on the next `put`. Recomputing from the
 entities themselves closes that gap.
 
+**Amended 2026-10-16:** the in-memory `seq` this section describes is no
+longer the whole story. `seq` is now backed by a persisted high-water mark —
+a `meta` table row under key `seq_hwm` — seeded once from the max entity
+token and incremented inside each write's transaction (the ABA fix landed in
+6bf0040/ec0142e; see `claunker-spine-storage-ratified.md` §5). `Store.load()`
+still runs the recompute above (`storage.py::Store.load`, via
+`storage.py::_max_entity_seq`) as a backstop, but now also advances the
+persisted `meta.seq_hwm` to the recomputed value — and never regresses it
+below what is already persisted, only ever forward. That backstop is what
+keeps a Drive-merge load honest: even if a merged blob somehow carried
+entity tokens ahead of this store's persisted HWM, `load()` raises the HWM
+to match before any further `put` runs, so a post-merge write can never mint
+a token the write-time compare-and-swap would later misjudge — the merge
+seam cannot undercut the CAS invariant the persisted HWM exists to enforce.
+
 ---
 
 ## 4. Setup (Erick's moves — not done as part of this card)
